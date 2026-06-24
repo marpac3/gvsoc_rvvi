@@ -1,0 +1,6 @@
+[submodule "gvsoc"]
+	path = gvsoc
+	url = https://github.com/FondazioneChipsIT/gvsoc.git
+[submodule "RVVI"]
+	path = RVVI
+	url = git@github.com:riscv-verification/RVVI.git
