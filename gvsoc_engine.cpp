@@ -82,7 +82,7 @@ static std::unordered_map<uint32_t, iss_reg_t *> g_csr_value_map;
 /* Stepping state */
 static uint64_t      g_step_count    = 0;
 static iss_reg_t     g_retired_pc    = 0;  /* PC of last retired instruction */
-static uint32_t      g_retired_opcode = 0; /* opcode of last retired instruction */
+static uint32_t      g_retired_opcode = 0; /* always 0: opcode not captured in DPI mode */
 static FILE         *g_iss_trace_fp  = nullptr;  /* ISS-side trace file */
 
 /* --------------------------------------------------------------------------
@@ -789,7 +789,14 @@ int gvsoc_engine_get_csr(uint32_t csr_addr, uint32_t *value)
     {
         raw = 0;
     }
-    if (csr_addr == 0x7A8 || csr_addr == 0x7AA)  /* mcontext/scontext - not supported, read 0 */
+
+    /* mcontext (0x7A8) / scontext (0x7AA): no-op, never reached. These are NOT
+     * in g_csr_value_map above, so get_csr already returned at the not-found
+     * check before here. Kept only as documentation: CV32E40P does not implement
+     * them (access raises illegal-instruction; scontext is S-mode and this core
+     * is M-mode only), so the ISS has no value to model and they are never
+     * compared (ref_init enables only the CSRs the ISS actually models). */
+    if (csr_addr == 0x7A8 || csr_addr == 0x7AA)
     {
         raw = 0;
     }
@@ -987,23 +994,14 @@ void gvsoc_engine_settle_irq(void)
 }
 
 /* --------------------------------------------------------------------------
- * Informed IRQ injection (OVPSim-style "deferint" oracle handoff).
+ * Informed IRQ injection (OVPSim-style "deferint"). Contract in the header.
  *
- * Unlike the reactive resync in rvvi_api2gvsoc.cpp (which COPIES the DUT trap
- * state into the ISS), this tells the ISS to TAKE interrupt `mcause_irq_id`
- * now and lets Irq::check() compute the entry itself (mepc = interrupted PC,
- * mstatus.MIE -> MPIE, mcause = (1<<31)|id, current_insn = the vectored trap
- * entry). The bridge then compares the ISS-computed state against the DUT in
- * the normal step-n-compare: the ISS is the calculator, the DUT is the oracle
- * for WHICH interrupt and WHEN.
- *
- * Normally the engine keeps iss.exec.skip_irq_check asserted on every step, so
- * the ISS never takes interrupts on its own. Here we lower it (and the
- * engine-level g_dpi_skip_irq) for exactly one gvsoc_engine_step(): with
- * g_dpi_skip_irq false the step loop does not re-assert the guard, so the IRQ
- * stays armed until taken (PC changes, the loop returns). Both flags are
- * restored right after, so the next step is back under the normal guard. A
- * residual WFI is force-cleared so the live fetch can redirect to the vector.
+ * Impl detail (the one-step window): the engine keeps iss.exec.skip_irq_check
+ * asserted on every step, so the ISS never takes interrupts on its own. Here we
+ * lower it (and the engine-level g_dpi_skip_irq) for exactly ONE
+ * gvsoc_engine_step() - with g_dpi_skip_irq false the step loop does not
+ * re-assert the guard, so the IRQ stays armed until taken - then restore both.
+ * A residual WFI is force-cleared so the live fetch can redirect to the vector.
  * ---------------------------------------------------------------------- */
 int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
 {
@@ -1050,13 +1048,10 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
      * (current_insn=mtvec, mepc/mstatus/mcause updated). PC changes -> retire. */
     int rc = gvsoc_engine_step();
 
-    /* Restore mip to its pre-inject net-driven value. The mask above made mip a
+    /* Restore mip to its pre-inject net-driven value: the mask above was a
      * transient single-bit arm for this one step. mip is MRO in CV32E40P (it
-     * mirrors the DUT irq_i; the authoritative source is the net path
-     * net_pop -> gvsoc_engine_set_irq). One step pulls no new net update and
-     * check() does not write mip, so old_mip is still current -- restore it so
-     * a later `csrr mip` reads what irq_i drives, not this step's transient
-     * arm. */
+     * mirrors DUT irq_i via the net path), so a later `csrr mip` must read what
+     * irq_i drives, not this step's transient arm. */
     g_wrapper->iss.csr.mip.value = old_mip;
 
     /* Re-assert the defense: the next normal step() must not take IRQs. */

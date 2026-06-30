@@ -44,12 +44,15 @@
 
 #include <rvviApi.h>
 #include "gvsoc_engine.hpp"
+#include "rvvi_text_writer.hpp"
 #include <stdio.h>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include <cstring>
 #include <unistd.h>
+#include <sys/stat.h>   /* stat() - RVVI-TEXT dir-vs-file env detection */
 #include <chrono>
 #include <exception>
 #include <vpi_user.h>   /* vpi_printf - prints to simulator transcript */
@@ -89,6 +92,39 @@ static FILE       *g_dut_trace_fp  = nullptr;
 static std::string g_dut_trace_path;
 static std::string g_tmp_config_path;
 static bool        g_dut_trace_enabled = false;
+
+/* --------------------------------------------------------------------------
+ * RVVI-TEXT emitter (additive, env-gated, default OFF).
+ *
+ * When RVVI_TEXT_TRACE is set, writes two RVVI-TEXT v0.4 files per run:
+ *   dut.rvvi - DUT architectural state (values pushed by the testbench)
+ *   ref.rvvi - reference (GVSOC ISS) state for the SAME write-set, with the
+ *              ISS's PC and values
+ * One line per retire, so `diff dut.rvvi ref.rvvi` localises a divergence and
+ * RVVI/source/host/rvvi/rvviTextChecker.py validates each side. Independent of
+ * the PASS/FAIL semantics: the step-n-compare result is unchanged.
+ *
+ * Gate (read once in rvviRefInit, like GVSOC_DUT_TRACE):
+ *   RVVI_TEXT_TRACE=<existing dir> -> <dir>/dut.rvvi, <dir>/ref.rvvi
+ *   RVVI_TEXT_TRACE=1              -> ./dut.rvvi, ./ref.rvvi (cwd)
+ *   unset / empty / 0             -> disabled, zero hot-path overhead
+ * ---------------------------------------------------------------------- */
+static bool   g_rvvi_text_enabled = false;
+static FILE  *g_rvvi_text_dut_fp  = nullptr;
+static FILE  *g_rvvi_text_ref_fp  = nullptr;
+static uint64_t g_rvvi_text_count = 0;  /* retire counter for periodic fflush; reset in rvviRefInit */
+/* RVVI-TEXT v0.4 header params (PARAMS line). File-scope const = constant-init,
+ * no function-local guard. FLEN 32 is cosmetic for now (CV32E40P F single-
+ * precision); deriving it from the CFG (0 when no-FPU) lands with the UX work. */
+static const RvviTextParams g_rvvi_text_params = {
+    /*vendor*/ "gvsoc_rvvi",
+    /*ilen*/ 32, /*xlen*/ 32, /*flen*/ 32,
+    /*vlen*/ 0,  /*nhart*/ 1, /*retire*/ 1
+};
+/* CSR addresses written in the current retire (per-retire, like the GPR/FPR
+ * masks). Filled by rvviDutCsrSet, emitted+cleared once per retire inside
+ * rvviRefRetireAndCompare. Populated only when g_rvvi_text_enabled. */
+static std::vector<uint32_t> g_dut_csr_written;
 
 /* Per-function ns accumulators, dumped at shutdown.  Enabled via
  * CV_RVVI_BRIDGE_PROFILE=1; gated at each call site so disabled cost is nil. */
@@ -141,6 +177,14 @@ static uint32_t g_dut_gprs_written_mask = 0;
 /* Bitmask of FPRs written in the current retire cycle */
 static uint32_t g_dut_fprs_written_mask = 0;
 
+/* Emit-only snapshot of the two masks above, taken by record_dut_event BEFORE
+ * it zeroes them mid-retire.  The RVVI-TEXT line is emitted later this retire
+ * (rvviRefRetireAndCompare / rvviDutTrap), when the compare masks are already 0;
+ * the emit reads these snapshots so the X/F columns reflect this retire's
+ * GPR/FPR writes.  Kept separate so the compare path is byte-identical. */
+static uint32_t g_emit_gpr_mask = 0;
+static uint32_t g_emit_fpr_mask = 0;
+
 /* True when the current retire carries rvfi_trap=1.  On trap retires
  * RVFI does NOT report exception CSR updates in the same cycle; those
  * arrive on the following (handler) retire.  Comparison of these CSRs
@@ -157,7 +201,7 @@ static bool g_dut_is_trap = false;
  * Fix: at rvviDutTrap, snapshot the exception CSR values; for the first
  * handler retire, compare against the snapshot instead of g_dut_csr.  The
  * snapshot is consumed (cleared) in rvviRefCsrsCompare once the handler-retire
- * comparison completes.  The SV sync bridge pushes mepc/mcause/mtval via
+ * comparison completes.  rvvi_trace2api pushes mepc/mcause/mtval via
  * rvviDutCsrSet before rvviDutTrap, so the snapshot is correct regardless of
  * csr_wb timing.
  * ---------------------------------------------------------------------- */
@@ -286,6 +330,11 @@ static std::string create_temp_config(const char *template_path,
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
+    if (fsize < 0) {   /* ftell error: a negative size would alloc a huge string */
+        fclose(f);
+        BRIDGE_ERR("ftell failed on config template: %s", template_path);
+        return "";
+    }
     std::string content(fsize, '\0');
     if (fread(&content[0], 1, fsize, f) != (size_t)fsize) {
         fclose(f);
@@ -357,9 +406,16 @@ static inline bool throttle_check(uint64_t &counter, const char *category)
  * ========================================================================== */
 
 /* Common bookkeeping for both normal retires and trap retires.
- * Resets the written-GPR mask and logs to the DUT retire trace file. */
+ * Snapshots the GPR/FPR write masks for the RVVI-TEXT emit, then resets them;
+ * also logs to the DUT retire trace file. */
 static void record_dut_event(uint64_t dutPc, uint64_t dutInsBin, bool is_trap)
 {
+    /* Snapshot the write masks for the RVVI-TEXT emit BEFORE zeroing them: the
+     * emit runs later this retire, when these compare masks are already 0.
+     * Cheap unconditional copy; g_emit_* is only read on the emit path, so the
+     * step-n-compare path is unaffected. */
+    g_emit_gpr_mask = g_dut_gprs_written_mask;
+    g_emit_fpr_mask = g_dut_fprs_written_mask;
     g_dut_gprs_written_mask = 0;
     g_dut_fprs_written_mask = 0;
     g_dut_pc_prev = g_dut_pc;          /* remember previous retire's DUT PC (phase-shift catch-up) */
@@ -378,6 +434,59 @@ static void record_dut_event(uint64_t dutPc, uint64_t dutInsBin, bool is_trap)
         if ((dut_retire_count % 1000) == 0)
             fflush(g_dut_trace_fp);
     }
+}
+
+/* Emit one RVVI-TEXT v0.4 line for the current retire on the given side.
+ * Single shared formatter so dut.rvvi and ref.rvvi are byte-format-identical
+ * (only the values/PC differ): a diff then shows exactly where they diverge.
+ *
+ * dut_side=true  -> DUT values  (g_dut_pc / g_dut_gpr / g_dut_fpr / g_dut_csr)
+ * dut_side=false -> REF values  (gvsoc_engine_get_pc / _gpr / _fpr / _csr) for
+ *                   the SAME write-set the DUT reported this retire.
+ *
+ * Called on both the normal-retire path and the trap path (rvviDutTrap);
+ * g_dut_is_trap selects RET vs TRAP in the output. */
+static void emit_rvvi_text_line(FILE *fp, bool dut_side)
+{
+    if (!fp)
+        return;
+
+    /* Build a plain-data write-set, then delegate to the shared formatter
+     * (rvvi_text_writer). dut_side picks the DUT-reported values;
+     * ref picks the ISS value for the SAME architectural write-set.
+     * ws{} zero-inits all 32 GPR/FPR slots; only masked indices are written
+     * below and read by the formatter (no read of an uninitialised slot). */
+    RvviTextWriteSet ws{};
+    ws.pc       = dut_side ? g_dut_pc : gvsoc_engine_get_pc();
+    ws.insn     = g_dut_insn;
+    ws.is_trap  = g_dut_is_trap;
+    ws.has_mode = false;   /* no MODE column on bridge-emitted lines */
+
+    ws.gpr_mask = g_emit_gpr_mask;
+    for (int i = 0; i < 32; i++)
+        if (g_emit_gpr_mask & (1u << i))
+            ws.gpr[i] = dut_side ? g_dut_gpr[i] : gvsoc_engine_get_gpr((uint32_t)i);
+
+    ws.fpr_mask = g_emit_fpr_mask;
+    for (int i = 0; i < 32; i++)
+        if (g_emit_fpr_mask & (1u << i))
+            ws.fpr[i] = dut_side ? g_dut_fpr[i] : gvsoc_engine_get_fpr((uint32_t)i);
+
+    /* CSR deltas collected this retire by rvviDutCsrSet. If the ISS does not
+     * map a CSR, emit 0x0 (not omit) so dut/ref column counts match 1:1. */
+    for (uint32_t addr : g_dut_csr_written) {
+        uint32_t v;
+        if (dut_side) {
+            auto it = g_dut_csr.find(addr);
+            v = (it != g_dut_csr.end()) ? it->second : 0u;
+        } else {
+            if (!gvsoc_engine_get_csr(addr, &v))
+                v = 0u;
+        }
+        ws.csr.push_back({addr, v});
+    }
+
+    rvvi_text_write_line(fp, ws);
 }
 
 extern "C" {
@@ -423,6 +532,15 @@ bool_t rvviRefInit(const char *programPath)
                                strcmp(trace_env, "0") != 0);
     }
 
+    /* RVVI-TEXT emitter gate (default OFF). Same read-once pattern as above.
+     * Value is a target directory or "1" (cwd); the files are opened below. */
+    {
+        const char *rt_env = getenv("RVVI_TEXT_TRACE");
+        g_rvvi_text_enabled = (rt_env != nullptr &&
+                               rt_env[0] != '\0' &&
+                               strcmp(rt_env, "0") != 0);
+    }
+
     /* PROFILING: read per-function profiling gate once at init (default OFF).
      * Enable with CV_RVVI_BRIDGE_PROFILE=1 to accumulate ns counters per
      * rvviRef* call. Results are dumped in the shutdown performance summary. */
@@ -456,6 +574,12 @@ bool_t rvviRefInit(const char *programPath)
     g_force_resync_count  = 0;
 
     if (programPath && strlen(programPath) > 0) {
+        /* Drop any temp config from a previous init so a re-init does not leak
+         * /tmp/gvsoc_cv32_<pid>.json. */
+        if (!g_tmp_config_path.empty()) {
+            remove(g_tmp_config_path.c_str());
+            g_tmp_config_path.clear();
+        }
         std::string tmp = create_temp_config(template_path, programPath);
         if (!tmp.empty())
             g_tmp_config_path = tmp;
@@ -470,6 +594,44 @@ bool_t rvviRefInit(const char *programPath)
         g_dut_trace_fp = fopen(dut_path, "w");
         if (!g_dut_trace_fp)
             BRIDGE_ERR("cannot open DUT trace: %s", dut_path);
+    }
+
+    /* Open the two RVVI-TEXT files and write their headers (once per run).
+     * RVVI_TEXT_TRACE points at a directory (-> <dir>/{dut,ref}.rvvi) or is "1"
+     * (-> cwd). On any fopen failure, disable the emitter so the hot path stays
+     * a no-op rather than half-writing. */
+    if (g_rvvi_text_enabled) {
+        const char *rt_env = getenv("RVVI_TEXT_TRACE");
+        std::string dir;
+        struct stat st;
+        if (rt_env && strcmp(rt_env, "1") != 0 &&
+            stat(rt_env, &st) == 0 && S_ISDIR(st.st_mode)) {
+            dir = rt_env;
+            if (!dir.empty() && dir.back() != '/')
+                dir += '/';
+        }
+        std::string dut_rvvi = dir + "dut.rvvi";
+        std::string ref_rvvi = dir + "ref.rvvi";
+        /* Close any handles left open by a previous rvviRefInit (multi-run vsim
+         * session) so a re-init does not leak FILE*, and reset the flush counter. */
+        if (g_rvvi_text_dut_fp) { fclose(g_rvvi_text_dut_fp); g_rvvi_text_dut_fp = nullptr; }
+        if (g_rvvi_text_ref_fp) { fclose(g_rvvi_text_ref_fp); g_rvvi_text_ref_fp = nullptr; }
+        g_rvvi_text_count = 0;
+        g_rvvi_text_dut_fp = fopen(dut_rvvi.c_str(), "w");
+        g_rvvi_text_ref_fp = fopen(ref_rvvi.c_str(), "w");
+        if (!g_rvvi_text_dut_fp || !g_rvvi_text_ref_fp) {
+            BRIDGE_ERR("cannot open RVVI-TEXT files (%s / %s) - disabling",
+                       dut_rvvi.c_str(), ref_rvvi.c_str());
+            if (g_rvvi_text_dut_fp) { fclose(g_rvvi_text_dut_fp); g_rvvi_text_dut_fp = nullptr; }
+            if (g_rvvi_text_ref_fp) { fclose(g_rvvi_text_ref_fp); g_rvvi_text_ref_fp = nullptr; }
+            g_rvvi_text_enabled = false;
+        } else {
+            /* RVVI-TEXT v0.4 header via the shared formatter (params at file
+             * scope, g_rvvi_text_params). */
+            rvvi_text_write_header(g_rvvi_text_dut_fp, g_rvvi_text_params);
+            rvvi_text_write_header(g_rvvi_text_ref_fp, g_rvvi_text_params);
+            BRIDGE_LOG("RVVI-TEXT -> %s , %s", dut_rvvi.c_str(), ref_rvvi.c_str());
+        }
     }
 
     if (!g_tmp_config_path.empty()) {
@@ -500,6 +662,8 @@ bool_t rvviRefShutdown(void)
         g_dut_trace_fp = nullptr;
         BRIDGE_LOG("shutdown: DUT retire trace -> %s", g_dut_trace_path.c_str());
     }
+    if (g_rvvi_text_dut_fp) { fclose(g_rvvi_text_dut_fp); g_rvvi_text_dut_fp = nullptr; }
+    if (g_rvvi_text_ref_fp) { fclose(g_rvvi_text_ref_fp); g_rvvi_text_ref_fp = nullptr; }
     if (!g_tmp_config_path.empty()) {
         remove(g_tmp_config_path.c_str());
         g_tmp_config_path.clear();
@@ -676,6 +840,10 @@ void rvviDutFprSet(uint32_t /*hartId*/, uint32_t fprIndex, uint64_t value)
 void rvviDutCsrSet(uint32_t /*hartId*/, uint32_t csrIndex, uint64_t value)
 {
     g_dut_csr[csrIndex] = (uint32_t)value;
+    /* Record this retire's CSR write-set for the RVVI-TEXT emitter (off by
+     * default - no list growth when the emitter is disabled). */
+    if (__builtin_expect(g_rvvi_text_enabled, 0))
+        g_dut_csr_written.push_back(csrIndex);
 }
 
 void rvviDutBusWrite(uint32_t /*hartId*/, uint64_t /*address*/,
@@ -691,7 +859,7 @@ void rvviDutRetire(uint32_t /*hartId*/, uint64_t dutPc,
     g_metric_retires++;
     g_dut_is_trap = false;
     record_dut_event(dutPc, dutInsBin, /*is_trap=*/false);
-    /* Do NOT clear g_pending_handler here: sync_bridge calls rvviDutRetire
+    /* Do NOT clear g_pending_handler here: rvvi_trace2api calls rvviDutRetire
      * before rvviRefCsrsCompare, so the trap-CSR snapshot must stay active for
      * the comparison.  It is cleared in rvviRefCsrsCompare after consumption. */
 }
@@ -713,6 +881,33 @@ void rvviDutTrap(uint32_t /*hartId*/, uint64_t dutPc, uint64_t dutInsBin)
             g_trap_csr_snapshot[addr] = it->second;
     }
     g_pending_handler = true;
+
+    /* RVVI-TEXT: a trap retire bypasses rvviRefRetireAndCompare (the SV batch
+     * call is gated on !trap), so we emit its line HERE.  Per RVVI-TRACE a
+     * synchronous exception is a TRAP event: the faulting instruction does not
+     * retire its register writes (record_dut_event above zeroed g_dut_*_mask,
+     * so no X/F tokens) and the line carries the trap-entry CSRs
+     * (mstatus/mepc/mcause/mtval) the SV pushed before this call.  g_dut_is_trap
+     * is true -> the formatter prints TRAP.  The ref-side line uses DUT
+     * data (dut_side=true) because the ISS has not taken the trap yet at this
+     * seam (it consumes the faulting step only at the rvviRefEventStep that the
+     * SV calls next).  Emit BEFORE clearing the write-set so the CSRs are in. */
+    if (__builtin_expect(g_rvvi_text_enabled, 0)) {
+        /* DPI cannot propagate exceptions (would crash the simulator);
+         * emit_rvvi_text_line allocates (vector push_back).  Contain any throw
+         * and disable the best-effort trace rather than cross the DPI boundary. */
+        try {
+            emit_rvvi_text_line(g_rvvi_text_dut_fp, /*dut_side=*/true);
+            emit_rvvi_text_line(g_rvvi_text_ref_fp, /*dut_side=*/true);  /* DUT data at the trap seam */
+            g_dut_csr_written.clear();
+        } catch (const std::exception &e) {
+            BRIDGE_LOG("RVVI-TEXT: trap-line emit failed (%s) - disabling", e.what());
+            g_rvvi_text_enabled = false;
+        } catch (...) {
+            BRIDGE_LOG("RVVI-TEXT: trap-line emit failed (unknown) - disabling");
+            g_rvvi_text_enabled = false;
+        }
+    }
 
     /* No force-resync here.  rvviDutTrap fires only for synchronous exceptions
      * (rvfi_trap=1); async interrupts do NOT set rvfi_trap and are handled by
@@ -1093,7 +1288,7 @@ bool_t rvviRefCsrCompare(uint32_t /*hartId*/, uint32_t csrIndex)
 
     /* For the first handler retire after a trap, use the snapshot for the
      * exception CSRs.  The snapshot was populated by rvviDutTrap from values
-     * pushed explicitly by sync_bridge before the CSR write-back timing could
+     * pushed explicitly by rvvi_trace2api before the CSR write-back timing could
      * corrupt them. */
     uint32_t dut_val = 0;
     if (g_pending_handler && is_trap_csr(csrIndex)) {
@@ -1258,13 +1453,15 @@ const char *rvviErrorGet(void)                                             { ret
 
 /* Batched DPI path - one SV->C crossing per retire instead of six.
  * Combines EventStep + PcCompare + GprsCompare + CsrsCompare + FprsCompare.
- * rvviDutRetire is NOT called here: the SV sync_bridge already invokes it
+ * rvviDutRetire is NOT called here: rvvi_trace2api already invokes it
  * earlier in the retire flow (unconditionally, outside the USE_GVSOC ifdef);
  * calling it again would double-count g_metric_retires and duplicate
  * record_dut_event entries.
  *
  * Returns a bitmask:
  *   0x01=step ok, 0x02=pc, 0x04=gpr, 0x08=csr, 0x10=fpr, 0x20=runaway.
+ * Each compare bit is set on PASS or when not applicable (e.g. fpr on a no-FPU
+ * build), so the SV side can treat 0x1F as a clean retire.
  * 0x1F = full match, 0 = step failed. The 0x20 bit is set (in addition to
  * the compare bits) once the ISS runaway detector has latched: the ISS is
  * permanently diverged and stuck, so the SV side aborts with a clean FAIL
@@ -1284,8 +1481,13 @@ int rvviRefRetireAndCompare(
     /* DPI boundary guard: a C++ exception must never cross into the simulator.
      * DPI cannot propagate exceptions, so catch everything and return 0. */
     try {
-        if (!rvviRefEventStep(hart_id))
+        if (!rvviRefEventStep(hart_id)) {
+            /* Clear the per-retire CSR write-set even on the step-fail early
+             * return, so it never spills into the next retire. */
+            if (__builtin_expect(g_rvvi_text_enabled, 0))
+                g_dut_csr_written.clear();
             return 0;
+        }
 
         int result = 0x01;  /* step OK */
         if (rvviRefPcCompare(hart_id))                      result |= 0x02;
@@ -1297,6 +1499,21 @@ int rvviRefRetireAndCompare(
          * bit so the SV side aborts deterministically (clean FAIL) rather
          * than waiting for the OS timeout to reap a crawling sim. */
         if (gvsoc_engine_is_runaway())                      result |= 0x20;
+
+        /* RVVI-TEXT emit (off by default): one line per retire to each file,
+         * with the write-set CSRs collected this retire, then clear the list.
+         * This is the last call of the retire, after all rvviDutCsrSet and
+         * rvviDutTrap, so the CSR set is complete for both normal and trap
+         * retires. */
+        if (__builtin_expect(g_rvvi_text_enabled, 0)) {
+            emit_rvvi_text_line(g_rvvi_text_dut_fp, /*dut_side=*/true);
+            emit_rvvi_text_line(g_rvvi_text_ref_fp, /*dut_side=*/false);
+            g_dut_csr_written.clear();
+            if ((++g_rvvi_text_count % 1000) == 0) {
+                fflush(g_rvvi_text_dut_fp);
+                fflush(g_rvvi_text_ref_fp);
+            }
+        }
 
         return result;
     } catch (const std::exception &e) {

@@ -5,7 +5,7 @@
 #
 # Target:
 #   make gvsoc               build GVSOC + the CV32E40P ISA models (6 variants)
-#   make            (= all)  build libgvsoc_rvvi.so + libgvsoc_rvvi_zfinx.so
+#   make            (= all)  build libgvsoc_rvvi.so / _zfinx.so / librvvi_text.so
 #   make config BINARY=...   generate gvsoc_config.json (gvrun prepare)
 #   make trace  BINARY=...   standalone GVSOC with instruction trace → $(TRACE)
 #   make clean / distclean
@@ -98,18 +98,30 @@ endif
 
 TARGET       := libgvsoc_rvvi.so
 TARGET_ZFINX := libgvsoc_rvvi_zfinx.so
-OBJS         := rvvi_api2gvsoc.o gvsoc_engine.o
-OBJS_ZFINX   := rvvi_api2gvsoc.o gvsoc_engine_zfinx.o
+TARGET_TEXT  := librvvi_text.so
+OBJS         := rvvi_api2gvsoc.o gvsoc_engine.o rvvi_text_writer.o
+OBJS_ZFINX   := rvvi_api2gvsoc.o gvsoc_engine_zfinx.o rvvi_text_writer.o
+OBJS_TEXT    := rvvi_text_dpi.o rvvi_text_writer.o
 
 # Installed gvrun: it sets LD_LIBRARY_PATH/PATH/PYTHONPATH/USE_GVRUN/--platform by itself.
 GVRUN := timeout 10s $(INSTALLDIR)/bin/gvrun
 
-.PHONY: all gvsoc config trace clean distclean
+.PHONY: all gvsoc config trace clean distclean test
 
-all: $(TARGET) $(TARGET_ZFINX)
+all: $(TARGET) $(TARGET_ZFINX) $(TARGET_TEXT)
 
 # Separate compilation: rvvi_api2gvsoc.cpp with the base flags, gvsoc_engine.cpp with the ISS flags.
-rvvi_api2gvsoc.o: rvvi_api2gvsoc.cpp gvsoc_engine.hpp
+rvvi_api2gvsoc.o: rvvi_api2gvsoc.cpp gvsoc_engine.hpp rvvi_text_writer.hpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# rvvi_text_writer.cpp — standalone RVVI-TEXT formatter: pure C++, no ISS
+# define/include, so it builds with the base flags only.
+rvvi_text_writer.o: rvvi_text_writer.cpp rvvi_text_writer.hpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# rvvi_text_dpi.cpp — DPI shim around the formatter (RTL-only tracer entry points).
+# Pure C++, base flags, no ISS define/include.
+rvvi_text_dpi.o: rvvi_text_dpi.cpp rvvi_text_dpi.hpp rvvi_text_writer.hpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 gvsoc_engine.o: gvsoc_engine.cpp gvsoc_engine.hpp
@@ -126,6 +138,19 @@ $(TARGET_ZFINX): $(OBJS_ZFINX)
 	$(CXX) -shared $(OBJS_ZFINX) $(LDFLAGS) -o $@
 	@echo "OK → $(TARGET_ZFINX)"
 
+# librvvi_text.so — standalone RVVI-TEXT writer for RTL-only sims (no GVSOC dep,
+# so it links without libpulpvp / the embedded engine).
+$(TARGET_TEXT): $(OBJS_TEXT)
+	$(CXX) -shared $(OBJS_TEXT) -o $@
+	@echo "OK → $(TARGET_TEXT)"
+
+# make test — deterministic unit test of the RVVI-TEXT formatter.
+# Pure C++, no GVSOC/ISS, no Questa license: checks the RET/TRAP/X/F/C/MODE line
+# grammar byte-for-byte. Reuses rvvi_text_writer.o (base flags).
+test: rvvi_text_writer.o rvvi_text_dpi.o
+	$(CXX) $(CXXFLAGS_BASE) -I$(CURDIR) test/test_rvvi_text_writer.cpp rvvi_text_writer.o rvvi_text_dpi.o -o test/test_rvvi_text_writer
+	./test/test_rvvi_text_writer
+
 # make gvsoc — build GVSOC + the CV32E40P ISA models. The target:param=val
 # syntax is handled by gvrun; USE_GVRUN=1 is forced by the GVSOC CMake (with
 # gapy the inline parameters would not be injected).
@@ -137,7 +162,7 @@ CV32E40P_TARGETS := cv32e40p-standalone \
                     cv32e40p-standalone:corev_pulp=True,fpu=True,zfinx=True
 
 gvsoc:
-	make -C $(GVSOC_HOME) \
+	$(MAKE) -C $(GVSOC_HOME) \
 		TARGETS="$(CV32E40P_TARGETS)" \
 		BUILDDIR=$(BUILDDIR) \
 		INSTALLDIR=$(INSTALLDIR) \
@@ -181,7 +206,7 @@ endif
 		run > $(TRACE) 2>&1
 
 clean:
-	rm -f $(TARGET) $(TARGET_ZFINX) $(OBJS) gvsoc_engine_zfinx.o
+	rm -f $(TARGET) $(TARGET_ZFINX) $(TARGET_TEXT) $(OBJS) gvsoc_engine_zfinx.o rvvi_text_dpi.o test/test_rvvi_text_writer
 	rm -rf $(WORK_DIR)
 
 distclean: clean

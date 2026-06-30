@@ -243,8 +243,8 @@ module rvvi_trace2api
                         end else begin
                             consecutive_mismatch++;
                             if (consecutive_mismatch >= max_consecutive_mismatch) begin
-                                $error("RVVI Bridge: step-and-compare diverged for %0d consecutive retires (last retire #%0d, DUT PC=0x%08x) - aborting",
-                                       consecutive_mismatch, retire_count, rvvi.pc_rdata[h][r]);
+                                $error("RVVI Bridge: step-and-compare diverged for %0d consecutive retires (last retire #%0d, DUT PC=0x%08x, cmp_result=0x%02x [b1=PC b2=GPR b3=CSR b4=FPR]) - aborting",
+                                       consecutive_mismatch, retire_count, rvvi.pc_rdata[h][r], cmp_result);
                                 $finish;
                             end
                         end
