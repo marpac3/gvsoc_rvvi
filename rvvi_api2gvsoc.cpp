@@ -118,10 +118,11 @@ static bool   g_rvvi_text_ref_only = false;
 static FILE  *g_rvvi_text_dut_fp  = nullptr;
 static FILE  *g_rvvi_text_ref_fp  = nullptr;
 static uint64_t g_rvvi_text_count = 0;  /* retire counter for periodic fflush; reset in rvviRefInit */
-/* RVVI-TEXT v0.4 header params (PARAMS line). File-scope const = constant-init,
- * no function-local guard. FLEN 32 is cosmetic for now (CV32E40P F single-
- * precision); deriving it from the CFG (0 when no-FPU) lands with the UX work. */
-static const RvviTextParams g_rvvi_text_params = {
+/* RVVI-TEXT v0.4 header params (PARAMS line). File-scope = constant-init, no
+ * function-local guard. FLEN is pushed by rvviBridgeSetFlen() before
+ * rvviRefInit() writes the header (0 = no FPU, 32 = F/Zfinx); the 32 here is
+ * only the fallback for a caller that never pushes it. */
+static RvviTextParams g_rvvi_text_params = {
     /*vendor*/ "gvsoc_rvvi",
     /*ilen*/ 32, /*xlen*/ 32, /*flen*/ 32,
     /*vlen*/ 0,  /*nhart*/ 1, /*retire*/ 1
@@ -633,10 +634,14 @@ bool_t rvviRefInit(const char *programPath)
         }
         std::string ref_rvvi = dir + "ref.rvvi";
         /* Close any handles left open by a previous rvviRefInit (multi-run vsim
-         * session) so a re-init does not leak FILE*, and reset the flush counter. */
+         * session) so a re-init does not leak FILE*, and reset the flush counter
+         * plus the per-retire emitter state (write-set, DUT mode) so a re-init
+         * cannot start from a stale entry. */
         if (g_rvvi_text_dut_fp) { fclose(g_rvvi_text_dut_fp); g_rvvi_text_dut_fp = nullptr; }
         if (g_rvvi_text_ref_fp) { fclose(g_rvvi_text_ref_fp); g_rvvi_text_ref_fp = nullptr; }
         g_rvvi_text_count = 0;
+        g_dut_csr_written.clear();
+        g_dut_mode = 0;
         std::string dut_rvvi;
         if (!g_rvvi_text_ref_only) {
             dut_rvvi = dir + "dut.rvvi";
@@ -869,19 +874,13 @@ void rvviDutCsrSet(uint32_t /*hartId*/, uint32_t csrIndex, uint64_t value)
 {
     g_dut_csr[csrIndex] = (uint32_t)value;
     /* Record this retire's CSR write-set for the RVVI-TEXT emitter (off by
-     * default - no list growth when the emitter is disabled). The same addr
-     * can be pushed twice in one retire (e.g. a trap: the generic csr_wb scan
-     * catches mstatus/mepc/mcause, then rvvi_trace2api.sv re-pushes all four
-     * trap CSRs explicitly) - dedup on insert so the emitted line carries one
-     * C token per address, value = the latest write (g_dut_csr above already
-     * holds it). */
-    if (__builtin_expect(g_rvvi_text_enabled, 0)) {
-        bool already = false;
-        for (uint32_t addr : g_dut_csr_written)
-            if (addr == csrIndex) { already = true; break; }
-        if (!already)
-            g_dut_csr_written.push_back(csrIndex);
-    }
+     * default - no list growth when the emitter is disabled). Duplicates are
+     * fine (e.g. a trap: the generic csr_wb scan and rvvi_trace2api.sv's
+     * explicit trap-CSR push both report mstatus/mepc/mcause): the formatter
+     * emits one C token per address, and g_dut_csr above always holds the
+     * latest value. */
+    if (__builtin_expect(g_rvvi_text_enabled, 0))
+        g_dut_csr_written.push_back(csrIndex);
 }
 
 /* Custom extension, not part of the vendored RVVI API (declared inline in
@@ -899,6 +898,15 @@ void rvviBridgeSetMode(uint32_t mode)
 void rvviBridgeSetRefOnly(uint8_t refOnly)
 {
     g_rvvi_text_ref_only = (refOnly != 0);
+}
+
+/* Custom extension: pushes the CFG-derived FLEN (0 = no FPU, 32 = F/Zfinx)
+ * for the RVVI-TEXT PARAMS header. Called by gvsoc_wrap's ref_init BEFORE
+ * rvviRefInit(), where the header is written; without it the header keeps a
+ * hardcoded FLEN 32 and diverges from the tracer's dut.rvvi on no-FPU CFGs. */
+void rvviBridgeSetFlen(uint32_t flen)
+{
+    g_rvvi_text_params.flen = flen;
 }
 
 void rvviDutBusWrite(uint32_t /*hartId*/, uint64_t /*address*/,
@@ -958,9 +966,11 @@ void rvviDutTrap(uint32_t /*hartId*/, uint64_t dutPc, uint64_t dutInsBin)
         } catch (const std::exception &e) {
             BRIDGE_LOG("RVVI-TEXT: trap-line emit failed (%s) - disabling", e.what());
             g_rvvi_text_enabled = false;
+            g_dut_csr_written.clear();
         } catch (...) {
             BRIDGE_LOG("RVVI-TEXT: trap-line emit failed (unknown) - disabling");
             g_rvvi_text_enabled = false;
+            g_dut_csr_written.clear();
         }
     }
 

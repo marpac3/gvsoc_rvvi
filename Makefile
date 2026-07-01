@@ -115,9 +115,11 @@ rvvi_api2gvsoc.o: rvvi_api2gvsoc.cpp gvsoc_engine.hpp rvvi_text_writer.hpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # rvvi_text_writer.cpp — standalone RVVI-TEXT formatter: pure C++, no ISS
-# define/include, so it builds with the base flags only.
+# define/include, so it builds with the base flags only. -fvisibility=hidden:
+# the formatter is internal to each .so, and dual-trace loads both libraries
+# in one simulation — exported copies could interpose on a partial rebuild.
 rvvi_text_writer.o: rvvi_text_writer.cpp rvvi_text_writer.hpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -fvisibility=hidden -c $< -o $@
 
 # rvvi_text_dpi.cpp — DPI shim around the formatter (RTL-only tracer entry points).
 # Pure C++, base flags, no ISS define/include.

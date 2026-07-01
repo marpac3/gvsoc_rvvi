@@ -89,6 +89,24 @@ int main() {
     check("RET+X+C+MODE order", emit_line(wcomb),
           "RET 0x80 0x197 X 1 0xabc C 0x300 0x1800 MODE 0x3\n");
 
+    /* Full column order: X then F then C then MODE */
+    RvviTextWriteSet wall{};
+    wall.pc = 0x90; wall.insn = 0x197;
+    wall.gpr_mask = (1u << 2); wall.gpr[2] = 0x1;
+    wall.fpr_mask = (1u << 4); wall.fpr[4] = 0x2;
+    wall.csr = {{0x305, 0x88}};
+    wall.has_mode = true; wall.mode = 3;
+    check("RET+X+F+C+MODE order", emit_line(wall),
+          "RET 0x90 0x197 X 2 0x1 F 4 0x2 C 0x305 0x88 MODE 0x3\n");
+
+    /* Duplicate CSR address on a TRAP (the csr_wb scan and the explicit
+     * trap-CSR push both report it): one C token, first position, last value */
+    RvviTextWriteSet wd{};
+    wd.pc = 0x1010; wd.insn = 0x9002; wd.is_trap = true;
+    wd.csr = {{0x300, 0x1800}, {0x341, 0x1010}, {0x300, 0x3800}};
+    check("TRAP dedup C", emit_line(wd),
+          "TRAP 0x1010 0x9002 C 0x300 0x3800 C 0x341 0x1010\n");
+
     /* DPI shim (rvvi_text_dpi) end-to-end: open -> set* -> write -> close ->
      * read the file back.  Covers the RTL-only tracer path: header, the
      * per-retire write-set accumulation, RET vs TRAP, and the reset between
@@ -108,6 +126,35 @@ int main() {
               "RET 0x84 0xf8018193 X 10 0x23408\n"
               "TRAP 0x1000 0x73 C 0x300 0x1800 MODE 0x3\n");
         remove(path);
+    }
+
+    /* DPI shim: duplicate CSR pushes collapse to one token, last value wins */
+    {
+        const char *path = "test/.dpi_dedup.rvvi";
+        rvviTextOpen(path, 32, 32, 0, 0, 1, 1);
+        rvviTextSetCsr(0x300, 0x1800);
+        rvviTextSetCsr(0x341, 0x1010);
+        rvviTextSetCsr(0x300, 0x3800);
+        rvviTextWrite(0x1010, 0x9002, 1);
+        rvviTextClose();
+        check("DPI dedup C", read_file(path),
+              "VERSION 0 1\nVENDOR \"gvsoc_rvvi\" 0 1\n"
+              "PARAMS 6 ILEN 32 XLEN 32 FLEN 0 VLEN 0 NHART 1 RETIRE 1\n"
+              "TRAP 0x1010 0x9002 C 0x300 0x3800 C 0x341 0x1010\n");
+        remove(path);
+    }
+
+    /* DPI shim: a failed open reports it, and later calls are safe no-ops */
+    {
+        if (rvviTextOpen("test/no_such_dir/x.rvvi", 32, 32, 0, 0, 1, 1) != 0) {
+            printf("FAIL DPI open-fail status\n  got: 1\n  exp: [0]\n");
+            fails++;
+        } else {
+            printf("PASS DPI open-fail status\n");
+        }
+        rvviTextSetGpr(1, 0x1);
+        rvviTextWrite(0x0, 0x13, 0);   /* nothing open: must not crash */
+        rvviTextClose();
     }
 
     printf("\n%s (%d failure%s)\n", fails ? "FAILURES" : "ALL PASS", fails, fails == 1 ? "" : "s");

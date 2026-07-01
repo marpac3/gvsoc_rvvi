@@ -18,23 +18,28 @@
 namespace {
     FILE             *g_fp = nullptr;   /* dut.rvvi, owned here */
     RvviTextWriteSet  g_cur;            /* write-set accumulated for this retire */
+    uint64_t          g_lines = 0;      /* emitted lines, for the periodic flush */
 }
 
 extern "C" {
 
-void rvviTextOpen(const char *path, uint32_t ilen, uint32_t xlen, uint32_t flen,
-                  uint32_t vlen, uint32_t nhart, uint32_t retire)
+int rvviTextOpen(const char *path, uint32_t ilen, uint32_t xlen, uint32_t flen,
+                 uint32_t vlen, uint32_t nhart, uint32_t retire)
 {
-    if (g_fp || !path)
-        return;
+    if (g_fp)
+        return 1;
+    if (!path)
+        return 0;
     g_fp = fopen(path, "w");
     if (!g_fp) {
         fprintf(stderr, "[rvvi_text] cannot open %s\n", path);
-        return;
+        return 0;
     }
     RvviTextParams p{"gvsoc_rvvi", ilen, xlen, flen, vlen, nhart, retire};
     rvvi_text_write_header(g_fp, p);
-    g_cur = RvviTextWriteSet{};
+    g_cur   = RvviTextWriteSet{};
+    g_lines = 0;
+    return 1;
 }
 
 void rvviTextSetGpr(uint32_t idx, uint64_t value)
@@ -55,16 +60,9 @@ void rvviTextSetFpr(uint32_t idx, uint64_t value)
 
 void rvviTextSetCsr(uint32_t addr, uint64_t value)
 {
-    /* Same addr can be pushed twice in one retire (e.g. a trap: the tracer's
-     * generic csr_wb scan catches mstatus/mepc/mcause, then explicitly
-     * re-pushes all four trap CSRs) - dedup on insert, last write wins, so the
-     * emitted line carries one C token per address. */
-    for (auto &c : g_cur.csr) {
-        if (c.addr == addr) {
-            c.value = (uint32_t)value;
-            return;
-        }
-    }
+    /* Duplicate pushes of one address are fine (e.g. a trap: the tracer's
+     * generic csr_wb scan and its explicit trap-CSR push both report
+     * mstatus/mepc/mcause): the formatter emits one C token per address. */
     try {
         g_cur.csr.push_back({addr, (uint32_t)value});
     } catch (...) {
@@ -89,6 +87,11 @@ void rvviTextWrite(uint64_t pc, uint64_t insn, uint8_t isTrap)
     g_cur.is_trap = (isTrap != 0);
     rvvi_text_write_line(g_fp, g_cur);
     g_cur = RvviTextWriteSet{};   /* reset for the next retire */
+    /* Periodic flush, same 1000-retire cadence as the DPI bridge: the final
+     * block does not run when the simulation is killed, and an unflushed
+     * tail is lost exactly where the trace matters most. */
+    if ((++g_lines % 1000) == 0)
+        fflush(g_fp);
 }
 
 void rvviTextClose(void)

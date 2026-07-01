@@ -25,7 +25,7 @@
 struct RvviTextParams {
     const char *vendor;   /* e.g. "gvsoc_rvvi" — no hyphen (checker STRING rule) */
     uint32_t    ilen;     /* instruction length, bits (32) */
-    uint32_t    xlen;     /* GPR width (32 or 64) */
+    uint32_t    xlen;     /* GPR width (32 -- the write-set carries 32-bit values) */
     uint32_t    flen;     /* FPR width: 0 (no FPU), 32, 64, 128 */
     uint32_t    vlen;     /* vector width: 0 if none */
     uint32_t    nhart;    /* number of harts (1) */
@@ -57,7 +57,10 @@ struct RvviTextWriteSet {
                                 * holds the low 32 bits — ok for F/Zfinx, D later) */
     uint32_t fpr[32];
 
-    std::vector<RvviTextCsr> csr;   /* CSR deltas this retire (addr + value) */
+    std::vector<RvviTextCsr> csr;   /* CSR deltas this retire (addr + value).
+                                     * Duplicate addresses are allowed: the line
+                                     * carries one C token per address, at its
+                                     * first position, with the last value. */
 };
 
 /* Write the 3-line RVVI-TEXT header (VERSION / VENDOR / PARAMS). Call once per

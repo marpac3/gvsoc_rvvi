@@ -15,11 +15,13 @@
 
 extern "C" {
 
-/* Open the trace file and write the 3-line header.  flen/vlen come from the CFG
- * (flen 0 = no FPU).  No-op if already open, if path is null, or if the file
- * cannot be created. */
-void rvviTextOpen(const char *path, uint32_t ilen, uint32_t xlen, uint32_t flen,
-                  uint32_t vlen, uint32_t nhart, uint32_t retire);
+/* Open the trace file and write the 3-line header.  flen/vlen come from the
+ * CFG (flen 0 = no FPU).  Returns 1 on success (also when already open), 0
+ * when path is null or the file cannot be created -- the writer then stays
+ * disabled and every later call is a safe no-op, so the caller must raise
+ * the error itself (a silently missing trace looks like a passing run). */
+int rvviTextOpen(const char *path, uint32_t ilen, uint32_t xlen, uint32_t flen,
+                 uint32_t vlen, uint32_t nhart, uint32_t retire);
 
 /* Accumulate one written register / CSR / privilege mode for the current retire.
  * value is uint64_t for DPI compatibility (SV longint unsigned); the high 32 bits

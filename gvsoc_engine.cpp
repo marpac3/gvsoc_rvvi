@@ -790,16 +790,8 @@ int gvsoc_engine_get_csr(uint32_t csr_addr, uint32_t *value)
         raw = 0;
     }
 
-    /* mcontext (0x7A8) / scontext (0x7AA): no-op, never reached. These are NOT
-     * in g_csr_value_map above, so get_csr already returned at the not-found
-     * check before here. Kept only as documentation: CV32E40P does not implement
-     * them (access raises illegal-instruction; scontext is S-mode and this core
-     * is M-mode only), so the ISS has no value to model and they are never
-     * compared (ref_init enables only the CSRs the ISS actually models). */
-    if (csr_addr == 0x7A8 || csr_addr == 0x7AA)
-    {
-        raw = 0;
-    }
+    /* mcontext (0x7A8) / scontext (0x7AA) are not modelled: not in
+     * g_csr_value_map, so get_csr already returned not-found above. */
 
     *value = (uint32_t)raw;
     return 1;
