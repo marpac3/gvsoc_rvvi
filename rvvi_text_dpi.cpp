@@ -55,6 +55,16 @@ void rvviTextSetFpr(uint32_t idx, uint64_t value)
 
 void rvviTextSetCsr(uint32_t addr, uint64_t value)
 {
+    /* Same addr can be pushed twice in one retire (e.g. a trap: the tracer's
+     * generic csr_wb scan catches mstatus/mepc/mcause, then explicitly
+     * re-pushes all four trap CSRs) - dedup on insert, last write wins, so the
+     * emitted line carries one C token per address. */
+    for (auto &c : g_cur.csr) {
+        if (c.addr == addr) {
+            c.value = (uint32_t)value;
+            return;
+        }
+    }
     try {
         g_cur.csr.push_back({addr, (uint32_t)value});
     } catch (...) {

@@ -110,6 +110,11 @@ static bool        g_dut_trace_enabled = false;
  *   unset / empty / 0             -> disabled, zero hot-path overhead
  * ---------------------------------------------------------------------- */
 static bool   g_rvvi_text_enabled = false;
+/* Set once via rvviBridgeSetRefOnly(), called by gvsoc_wrap's ref_init task
+ * BEFORE rvviRefInit() -- see rvviBridgeSetRefOnly below.
+ * When true (dual-trace mode: RVVI_TRACE also active), the SV tracer is the sole
+ * dut.rvvi producer: this bridge opens/writes ref.rvvi only. */
+static bool   g_rvvi_text_ref_only = false;
 static FILE  *g_rvvi_text_dut_fp  = nullptr;
 static FILE  *g_rvvi_text_ref_fp  = nullptr;
 static uint64_t g_rvvi_text_count = 0;  /* retire counter for periodic fflush; reset in rvviRefInit */
@@ -170,6 +175,9 @@ static uint32_t g_dut_gpr[32] = {};
 static uint32_t g_dut_fpr[32] = {};
 static uint32_t g_dut_insn    = 0;   /* DUT instruction binary for the current retire (opcode comparison) */
 static std::unordered_map<uint32_t, uint32_t> g_dut_csr;
+/* DUT privilege mode (rvvi.mode), pushed once per retire by rvviBridgeSetMode.
+ * Only consumed by the RVVI-TEXT emitter (ref-only MODE column). */
+static uint32_t g_dut_mode    = 0;
 
 /* Bitmask of GPRs written in the current retire cycle */
 static uint32_t g_dut_gprs_written_mask = 0;
@@ -460,7 +468,15 @@ static void emit_rvvi_text_line(FILE *fp, bool dut_side)
     ws.pc       = dut_side ? g_dut_pc : gvsoc_engine_get_pc();
     ws.insn     = g_dut_insn;
     ws.is_trap  = g_dut_is_trap;
-    ws.has_mode = false;   /* no MODE column on bridge-emitted lines */
+    /* MODE column: emitted only in ref-only mode, where ref.rvvi is diffed
+     * line-for-line against a dut.rvvi produced by the SV tracer (which always
+     * emits MODE). Gate on which FILE is being written (fp == ref fp), not on
+     * dut_side: on a trap retire this function runs with dut_side=true for
+     * both lines, so dut_side cannot tell the files apart. g_dut_mode is the
+     * DUT-reported mode -- the ISS has not necessarily reconverged privilege
+     * mode at this exact retire boundary. */
+    ws.has_mode = g_rvvi_text_ref_only && (fp == g_rvvi_text_ref_fp);
+    ws.mode     = g_dut_mode;
 
     ws.gpr_mask = g_emit_gpr_mask;
     for (int i = 0; i < 32; i++)
@@ -596,10 +612,15 @@ bool_t rvviRefInit(const char *programPath)
             BRIDGE_ERR("cannot open DUT trace: %s", dut_path);
     }
 
-    /* Open the two RVVI-TEXT files and write their headers (once per run).
+    /* Open the RVVI-TEXT file(s) and write their header(s) (once per run).
      * RVVI_TEXT_TRACE points at a directory (-> <dir>/{dut,ref}.rvvi) or is "1"
      * (-> cwd). On any fopen failure, disable the emitter so the hot path stays
-     * a no-op rather than half-writing. */
+     * a no-op rather than half-writing.
+     *
+     * Ref-only (g_rvvi_text_ref_only, set by rvviBridgeSetRefOnly() before this
+     * call - dual-trace mode): the SV tracer is the sole dut.rvvi producer, so
+     * this bridge must NOT also open it - two independent FILE* truncating the
+     * same path would corrupt the tracer's output. Only ref.rvvi is opened. */
     if (g_rvvi_text_enabled) {
         const char *rt_env = getenv("RVVI_TEXT_TRACE");
         std::string dir;
@@ -610,27 +631,34 @@ bool_t rvviRefInit(const char *programPath)
             if (!dir.empty() && dir.back() != '/')
                 dir += '/';
         }
-        std::string dut_rvvi = dir + "dut.rvvi";
         std::string ref_rvvi = dir + "ref.rvvi";
         /* Close any handles left open by a previous rvviRefInit (multi-run vsim
          * session) so a re-init does not leak FILE*, and reset the flush counter. */
         if (g_rvvi_text_dut_fp) { fclose(g_rvvi_text_dut_fp); g_rvvi_text_dut_fp = nullptr; }
         if (g_rvvi_text_ref_fp) { fclose(g_rvvi_text_ref_fp); g_rvvi_text_ref_fp = nullptr; }
         g_rvvi_text_count = 0;
-        g_rvvi_text_dut_fp = fopen(dut_rvvi.c_str(), "w");
+        std::string dut_rvvi;
+        if (!g_rvvi_text_ref_only) {
+            dut_rvvi = dir + "dut.rvvi";
+            g_rvvi_text_dut_fp = fopen(dut_rvvi.c_str(), "w");
+        }
         g_rvvi_text_ref_fp = fopen(ref_rvvi.c_str(), "w");
-        if (!g_rvvi_text_dut_fp || !g_rvvi_text_ref_fp) {
-            BRIDGE_ERR("cannot open RVVI-TEXT files (%s / %s) - disabling",
-                       dut_rvvi.c_str(), ref_rvvi.c_str());
+        bool dut_ok = g_rvvi_text_ref_only || g_rvvi_text_dut_fp;
+        if (!dut_ok || !g_rvvi_text_ref_fp) {
+            BRIDGE_ERR("cannot open RVVI-TEXT file(s) (%s%s%s) - disabling",
+                       dut_rvvi.c_str(), dut_rvvi.empty() ? "" : " / ", ref_rvvi.c_str());
             if (g_rvvi_text_dut_fp) { fclose(g_rvvi_text_dut_fp); g_rvvi_text_dut_fp = nullptr; }
             if (g_rvvi_text_ref_fp) { fclose(g_rvvi_text_ref_fp); g_rvvi_text_ref_fp = nullptr; }
             g_rvvi_text_enabled = false;
         } else {
             /* RVVI-TEXT v0.4 header via the shared formatter (params at file
              * scope, g_rvvi_text_params). */
-            rvvi_text_write_header(g_rvvi_text_dut_fp, g_rvvi_text_params);
+            if (g_rvvi_text_dut_fp)
+                rvvi_text_write_header(g_rvvi_text_dut_fp, g_rvvi_text_params);
             rvvi_text_write_header(g_rvvi_text_ref_fp, g_rvvi_text_params);
-            BRIDGE_LOG("RVVI-TEXT -> %s , %s", dut_rvvi.c_str(), ref_rvvi.c_str());
+            BRIDGE_LOG("RVVI-TEXT -> %s%s%s (ref-only=%d)",
+                       dut_rvvi.c_str(), dut_rvvi.empty() ? "" : " , ",
+                       ref_rvvi.c_str(), g_rvvi_text_ref_only ? 1 : 0);
         }
     }
 
@@ -841,9 +869,36 @@ void rvviDutCsrSet(uint32_t /*hartId*/, uint32_t csrIndex, uint64_t value)
 {
     g_dut_csr[csrIndex] = (uint32_t)value;
     /* Record this retire's CSR write-set for the RVVI-TEXT emitter (off by
-     * default - no list growth when the emitter is disabled). */
-    if (__builtin_expect(g_rvvi_text_enabled, 0))
-        g_dut_csr_written.push_back(csrIndex);
+     * default - no list growth when the emitter is disabled). The same addr
+     * can be pushed twice in one retire (e.g. a trap: the generic csr_wb scan
+     * catches mstatus/mepc/mcause, then rvvi_trace2api.sv re-pushes all four
+     * trap CSRs explicitly) - dedup on insert so the emitted line carries one
+     * C token per address, value = the latest write (g_dut_csr above already
+     * holds it). */
+    if (__builtin_expect(g_rvvi_text_enabled, 0)) {
+        bool already = false;
+        for (uint32_t addr : g_dut_csr_written)
+            if (addr == csrIndex) { already = true; break; }
+        if (!already)
+            g_dut_csr_written.push_back(csrIndex);
+    }
+}
+
+/* Custom extension, not part of the vendored RVVI API (declared inline in
+ * rvvi_trace2api.sv, same pattern as rvviRefRetireAndCompare) - pushes the
+ * DUT privilege mode once per retire for the RVVI-TEXT emitter. */
+void rvviBridgeSetMode(uint32_t mode)
+{
+    g_dut_mode = mode;
+}
+
+/* Custom extension: called once by gvsoc_wrap's ref_init task,
+ * BEFORE rvviRefInit(), when RVVI_TRACE is also compiled in (dual-trace). Program
+ * order within that task guarantees this runs before rvviRefInit()'s file-open
+ * decision, so there is no initial-block race with the SV tracer's own setup. */
+void rvviBridgeSetRefOnly(uint8_t refOnly)
+{
+    g_rvvi_text_ref_only = (refOnly != 0);
 }
 
 void rvviDutBusWrite(uint32_t /*hartId*/, uint64_t /*address*/,
@@ -1510,17 +1565,29 @@ int rvviRefRetireAndCompare(
             emit_rvvi_text_line(g_rvvi_text_ref_fp, /*dut_side=*/false);
             g_dut_csr_written.clear();
             if ((++g_rvvi_text_count % 1000) == 0) {
-                fflush(g_rvvi_text_dut_fp);
-                fflush(g_rvvi_text_ref_fp);
+                /* dut_fp is null in ref-only mode; guard it like every
+                 * other site in this file (rvviRefInit/rvviRefShutdown) does --
+                 * fflush(NULL) is defined but flushes every open stream in the
+                 * process, a silent cross-.so side effect worth avoiding. */
+                if (g_rvvi_text_dut_fp) fflush(g_rvvi_text_dut_fp);
+                if (g_rvvi_text_ref_fp) fflush(g_rvvi_text_ref_fp);
             }
         }
 
         return result;
     } catch (const std::exception &e) {
         BRIDGE_LOG("batched DPI: std::exception in rvviRefRetireAndCompare: %s", e.what());
+        /* Same containment as rvviDutTrap's catch: an exception here can only
+         * come from the RVVI-TEXT emit (the rest of this function doesn't
+         * allocate), so disable it and drop the write-set rather than risk a
+         * stale g_dut_csr_written spilling into the next retire's line. */
+        g_rvvi_text_enabled = false;
+        g_dut_csr_written.clear();
         return 0;
     } catch (...) {
         BRIDGE_LOG("batched DPI: unknown exception in rvviRefRetireAndCompare");
+        g_rvvi_text_enabled = false;
+        g_dut_csr_written.clear();
         return 0;
     }
 }

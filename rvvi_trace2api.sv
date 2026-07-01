@@ -55,6 +55,11 @@ module rvvi_trace2api
         input int unsigned hartId,
         input int unsigned mcause);
 
+    // Privilege MODE push: forwards rvvi.mode so the ref-only bridge
+    // (dual-trace mode - see rvviBridgeSetRefOnly) can emit MODE on ref.rvvi
+    // and match the dut.rvvi MODE column the SV tracer already emits.
+    import "DPI-C" function void rvviBridgeSetMode(input int unsigned mode);
+
     // Enable the informed-injection path in the C bridge iff the plusarg is set.
     bit informed_irq_en = 1'b0;
     initial begin
@@ -120,6 +125,11 @@ module rvvi_trace2api
                                 end
                             end
                         end
+
+                        // 3b. Push privilege MODE for the RVVI-TEXT ref-only
+                        // emitter (otherwise a cheap store into an unused C++
+                        // global).
+                        rvviBridgeSetMode(rvvi.mode[h][r]);
 
                     end // architectural retire guard
 
