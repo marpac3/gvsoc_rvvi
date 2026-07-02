@@ -104,7 +104,14 @@ OBJS_ZFINX   := rvvi_api2gvsoc.o gvsoc_engine_zfinx.o rvvi_text_writer.o
 OBJS_TEXT    := rvvi_text_dpi.o rvvi_text_writer.o
 
 # Installed gvrun: it sets LD_LIBRARY_PATH/PATH/PYTHONPATH/USE_GVRUN/--platform by itself.
-GVRUN := timeout 10s $(INSTALLDIR)/bin/gvrun
+# gvrun needs the Python env (see README): wrap it in 'micromamba run' when
+# micromamba is available, so the caller's shell does not have to activate it.
+GVSOC_PY_ENV ?= gvsoc_env_3_12
+MICROMAMBA   := $(shell command -v micromamba 2>/dev/null)
+ifneq ($(MICROMAMBA),)
+  GVRUN_ENV := $(MICROMAMBA) run -n $(GVSOC_PY_ENV)
+endif
+GVRUN := $(GVRUN_ENV) timeout 10s $(INSTALLDIR)/bin/gvrun
 
 .PHONY: all gvsoc config trace clean distclean test
 
