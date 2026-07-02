@@ -20,6 +20,10 @@ gvsoc_rvvi/
 ├── rvvi_api2gvsoc.cpp   ← C++ DPI bridge: implements the RVVI API on top of the GVSOC engine (RVVI-API → GVSOC)
 ├── gvsoc_engine.cpp  ← embedded GVSOC engine: ISS instance, retire-based stepping,
 ├── gvsoc_engine.hpp  ←   PC/GPR/CSR/mip access, IRQ and debug injection
+├── rvvi_text_writer.cpp/.hpp ← canonical RVVI-TEXT trace formatter (shared by bridge and shim)
+├── rvvi_text_dpi.cpp/.hpp    ← DPI shim around the formatter for RTL-only tracing
+├── test/             ← deterministic formatter unit test (make test)
+├── docs/             ← architecture guides + RVVI-TEXT tracing guide
 ├── Makefile          ← build targets (see below)
 └── .gitmodules       ← gvsoc + RVVI submodule definitions
 ```
@@ -106,16 +110,17 @@ generated file is gitignored.
 make            # same as 'make all'
 ```
 
-Produces **two** libraries:
+Produces **three** libraries:
 
-| Library | Variant |
+| Library | Role |
 |---|---|
-| `libgvsoc_rvvi.so` | standard (FP with `fregs[]`) |
-| `libgvsoc_rvvi_zfinx.so` | ZFINX — compiled with `ISS_SINGLE_REGFILE=1` to match the ZFINX ISS regfile layout |
+| `libgvsoc_rvvi.so` | bridge, standard variant (FP with `fregs[]`) |
+| `libgvsoc_rvvi_zfinx.so` | bridge, ZFINX — compiled with `ISS_SINGLE_REGFILE=1` to match the ZFINX ISS regfile layout |
+| `librvvi_text.so` | RVVI-TEXT writer for RTL-only tracing — no GVSOC dependency (see `docs/RVVI_TEXT_TRACING.md`) |
 
-Both link `install/lib/libpulpvp.so` with an embedded rpath (no `LD_LIBRARY_PATH`
-needed at runtime). The DPI test selects the correct variant via `GVSOC_RVVI_MODEL`
-in `mk/Common.mk`.
+The two bridge libraries link `install/lib/libpulpvp.so` with an embedded rpath
+(no `LD_LIBRARY_PATH` needed at runtime). The DPI test selects the correct variant
+via `GVSOC_RVVI_MODEL` in `mk/Common.mk`.
 
 > For C++ debugging (gdb / VS Code): `make DEBUG=1 ...` adds `-g -O0`.
 
