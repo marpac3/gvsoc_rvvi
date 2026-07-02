@@ -203,8 +203,8 @@ make test TEST=hello-world RVVI_TRACE=YES USE_ISS=NO
 ```
 
 `dut.rvvi` lands in the run directory. Redirect with `RVVI_TEXT_TRACE=<dir>`
-on the make line — `vsim.mk` wires it to the tracer's `+rvvi_text_dut=<path>`
-plusarg.
+on the make line — `vsim.mk` creates the directory if missing and wires it to
+the tracer's `+rvvi_text_dut=<path>` plusarg.
 
 **Bridge-emit mode** — DPI co-simulation; the bridge writes both files:
 
