@@ -172,22 +172,31 @@ with a real GUI kernel (`vsim -gui`, driven headlessly under Xvfb): there,
 `debug_on` succeeds and `bp -c rvviRefRetireAndCompare` is accepted and
 resolves to a real address — no vopt/QIS flag change needed.
 
-**Open issue: the breakpoint is accepted but never actually stops the
-sim.** With a real GUI kernel, both `cdbg debug_on` and `bp -c
-rvviRefRetireAndCompare` succeed, but `run -all` then produces a stream of
-generic `error from C debugger` messages (hundreds, roughly one per
-retired instruction) and the simulation runs straight through to
-`$finish` without ever halting at the breakpoint. This reproduces
-identically with the Questa-bundled gdb (`external/gdb-102`, the version
-Questa is tested against) and with a newer local gdb 12.1 — so it is not a
-gdb-version mismatch. `/proc/sys/kernel/yama/ptrace_scope` is `0`
-(unrestricted) on this host, ruling out the usual ptrace-scope cause. The
-headless test harness used to reproduce this has **no controlling TTY**
-(`tty` → "not a tty"); cdbg's gdb integration may depend on a real
-interactive terminal that a scripted/headless session doesn't provide —
-this is the one variable not yet ruled out. **Not yet confirmed whether
-this also happens in a genuine interactive terminal session** — if you hit
-the same `error from C debugger` spam there, C Debug is not usable for
-DPI-C breakpoints on this Questa/host combination and the attach gate
-(§2) is the reliable path; if it does stop cleanly there, this note should
-be updated.
+**Confirmed: the breakpoint is accepted but never actually stops the
+sim.** With a real GUI kernel and a bridge built with `DEBUG=1` (so the
+breakpoint target has `-g` symbols — without them `bp -c` fails outright
+with `Unable to set breakpoint, location not executable ... compiled with
+-g`), `cdbg debug_on` and `bp -c gvsoc_engine_init` both succeed. Using
+`gvsoc_engine_init` instead of `rvviRefRetireAndCompare` isolates the
+question from per-retire noise, since it is called exactly once, early,
+before the DUT program runs. `run -all` then emits a bounded burst of
+`Couldn't write extended state status: Bad address.` / `error from C
+debugger` pairs (84 in the run this was verified with, not one per
+retired instruction) and the simulation proceeds to completion unimpeded
+-- full UVM report, `$finish`, zero errors -- as if the breakpoint had
+never been set. `Couldn't write extended state status: Bad address` is
+gdb's message for a failed `PTRACE_SETREGSET`/XSAVE write (`EFAULT`) when
+it tries to install the breakpoint's register state on the traced
+process; after enough failed attempts gdb gives up silently and execution
+continues. This reproduces identically with the Questa-bundled gdb
+(`external/gdb-102`, the version Questa is tested against) and with a
+newer local gdb 12.1 -- not a gdb-version mismatch --
+`/proc/sys/kernel/yama/ptrace_scope` is `0` (unrestricted), ruling out the
+usual ptrace-scope cause, and the failure is independent of which
+function is targeted. The one variable this was not able to rule out is
+that the reproduction environment has no controlling TTY (`tty` → "not a
+tty"); cdbg's gdb integration may behave differently attached to a real
+interactive terminal. Until proven otherwise on this Questa/host
+combination, **treat Questa's native C Debug as not usable for DPI-C
+breakpoints and use the attach gate (§2) instead** -- it does not depend
+on `cdbg` and has been validated end-to-end.
