@@ -52,6 +52,8 @@
 #include <vector>
 #include <cstring>
 #include <unistd.h>
+#include <signal.h>     /* raise(SIGTRAP) - GDB attach gate */
+#include <cstdlib>
 #include <sys/stat.h>   /* stat() - RVVI-TEXT dir-vs-file env detection */
 #include <chrono>
 #include <exception>
@@ -522,8 +524,54 @@ bool_t rvviVersionCheck(uint32_t version)
     return RVVI_TRUE;
 }
 
+/* True while a debugger is ptrace-attached (TracerPid in /proc/self/status). */
+static bool debugger_attached(void)
+{
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f)
+        return false;
+    long tracer = 0;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "TracerPid: %ld", &tracer) == 1)
+            break;
+    }
+    fclose(f);
+    return tracer != 0;
+}
+
+/* GDB attach gate (default OFF).  GVSOC_RVVI_GDB_WAIT=<seconds> pauses the
+ * simulation here, at the very start of rvviRefInit, until a debugger
+ * attaches (or the timeout expires).  On attach it raises SIGTRAP, so the
+ * debugger stops exactly at this point with every .so already loaded:
+ * set breakpoints in the bridge, gvsoc_engine or GVSOC itself, then
+ * 'continue'.  See docs/DEBUG_COSIM.md. */
+static void gdb_attach_gate(void)
+{
+    const char *env = getenv("GVSOC_RVVI_GDB_WAIT");
+    if (!env || env[0] == '\0' || strcmp(env, "0") == 0)
+        return;
+    long timeout_s = strtol(env, nullptr, 10);
+    if (timeout_s <= 0)
+        timeout_s = 300;
+    BRIDGE_LOG("GDB attach gate: waiting up to %lds for   gdb -p %ld",
+               timeout_s, (long)getpid());
+    for (long tick = 0; tick < timeout_s * 10; tick++) {
+        if (debugger_attached()) {
+            BRIDGE_LOG("debugger attached - stopping in rvviRefInit "
+                       "(set breakpoints, then 'continue')");
+            raise(SIGTRAP);
+            return;
+        }
+        usleep(100 * 1000);
+    }
+    BRIDGE_LOG("no debugger after %lds, continuing without one", timeout_s);
+}
+
 bool_t rvviRefInit(const char *programPath)
 {
+    gdb_attach_gate();
+
     const char *template_path = getenv("GVSOC_CONFIG");
     if (!template_path) {
         BRIDGE_ERR("GVSOC_CONFIG env var not set");

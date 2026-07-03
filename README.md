@@ -9,6 +9,7 @@ step-and-compare co-simulation of CV32E40P.
 > API: `gvsoc/engine/engine/include/gv/gvsoc.hpp` — `gvsoc_new` + `GvsocConf.config_path` + `open`/`step`.
 > Full architectural detail (engine, bridge, RVVI conformance, fragilities, future levers): [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 > Deep dive on the GVSOC system itself (`gvsoc.hpp` API, TimeEngine, ISS hookup, gdbserver, GVSOC-side improvements): [`docs/GVSOC_ENGINE.md`](docs/GVSOC_ENGINE.md).
+> Source-level debugging of the bridge/engine/GVSOC while a DPI co-simulation runs (gdb attach gate, symbols, breakpoints): [`docs/DEBUG_COSIM.md`](docs/DEBUG_COSIM.md).
 
 ## Repository layout
 
