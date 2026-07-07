@@ -129,6 +129,12 @@ Single entry point: `gvsoc_engine_init()`, called from `rvviRefInit()`. Three ph
 
 Shutdown (`gvsoc_engine_shutdown` from `rvviRefShutdown`), each call wrapped in
 try/catch (DPI does not propagate exceptions): `stop() → quit(0) → join() → close()`.
+The graceful sequence runs **only when the sim finished on its own** (`g_finished`):
+on an abnormal termination (mismatch-watchdog abort, UVM timeout) it is skipped
+entirely — in sync mode `Controller::start()` leaves the engine mutex owned by
+the external loop and only the internal sim-finished path releases it, so
+`stop()` would self-deadlock on the relock and `join()` would resume the
+simulation. The process is exiting anyway; the OS reclaims the engine.
 
 `BridgeUser` overrides **only** two callbacks: `has_ended(status)` (the exit device
 ended the sim → sets `g_finished`) and `has_stopped()` (no-op: we drive stepping by
@@ -235,7 +241,7 @@ fragility (§12).
 | `rvviRefPcCompare`/`GprsCompare`/`CsrsCompare`/`FprsCompare` | DUT state vs ISS readback |
 | `rvviRefCsrSetVolatile`/`Mask` | configure the compare (CSRs the ISS does not model cycle-by-cycle) |
 | `rvviRefGprSet`/`FprSet`/`CsrSet` | **direct injection into the ISS** (used in `ref_init`, e.g. mtvec) |
-| `rvviRefRetireAndCompare` | **GVSOC-only batch** (§10) |
+| `rvviRefRetireAndCompare` | **GVSOC-only batch** (§10); also syncs performance-counter CSR reads — after the step, the ISS rd of a cycle/instret/hpm read is overwritten with the DUT rd value, so counter-dependent control flow (e.g. printing a cycle delta) cannot fork the sides. `CV_RVVI_VOLATILE_CSR_SYNC=0` disables |
 | `rvviRefInjectIrq` / `rvviRefSetInformedIrq` | informed-injection (§8) |
 | ~25 vector/memory/conn functions | **stub** (N/A for CV32E40P) |
 
@@ -394,7 +400,7 @@ and our deviation is forced, not an avoidable choice.
 | **`get_next_event_time()` + `was_updated`** → adaptive stepping | in the step loop, jump to the next event instead of polling 2000 cycles → kills the root cause of the runaway on WFI/far events | medium (risk: breaking the retire-detect if mis-calibrated → prototype + mandatory FAST2 regression) | **P1** |
 | **`wire_bind()` on the IRQ line** | would replace the direct `mip` write with the GVSOC channel intended for "raw signals (pads, interrupts, registers)" | medium — **to be validated, caveat** ↓ | **P1 (spike)** |
 | **CSR read-fixup/write-mask as a data table** | centralizes the ISS↔bridge CSR drift, today scattered inline | low | **P1** |
-| **`terminate()` before `join()`** in error paths | robust shutdown, does not hang if the sim wedges | low | **P2** |
+| **`terminate()` before `join()`** in error paths | robust shutdown, does not hang if the sim wedges | low | **DONE** — abnormal termination skips the graceful teardown (see §4); aborted runs exit in seconds with complete RVVI-TEXT files |
 | **RVVI-TEXT for trace logging / golden** | standard textual trace output → comparison against external goldens + interop with RVVI tools | — | **DONE** — 3 modes (RTL-only, bridge-emit, dual-trace) implemented and validated, see `RVVI_TEXT_TRACING.md` |
 | shadowed RVVI `state[]`, RVVI-VVP, `step_until` time-sync, proxy socket | "purity" alignment | high / no value for us | **P3 — skip** |
 
