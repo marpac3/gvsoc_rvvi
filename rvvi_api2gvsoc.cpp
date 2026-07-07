@@ -252,6 +252,19 @@ static uint64_t g_force_resync_count = 0;   /* diagnostic: resyncs applied */
 static bool g_informed_irq_enabled = false;
 static uint64_t g_informed_irq_count = 0;   /* diagnostic: injections applied */
 
+/* Volatile-counter read sync (ImperasDV-style informed handling) - default ON.
+ * A functional ISS cannot predict the RTL's performance counters: cycle counts
+ * depend on pipeline stalls and memory latencies the instruction-level model
+ * does not have. The counter VALUE is therefore excluded from verification,
+ * but a program that consumes it (matmul prints its cycle delta) would fork
+ * the two sides as soon as the value shapes control flow (printf digit loops).
+ * After a retire whose instruction is a CSR read of a performance counter,
+ * overwrite the ISS rd with the DUT rd value so downstream control flow stays
+ * in lockstep. Reads only - counter writes are illegal on the RTL and trap.
+ * Disable with CV_RVVI_VOLATILE_CSR_SYNC=0. */
+static bool g_volatile_sync_enabled = true;
+static uint64_t g_volatile_sync_count = 0;  /* diagnostic: syncs applied */
+
 /* --------------------------------------------------------------------------
  * Phase-shift re-alignment on synchronous exceptions.
  *
@@ -604,10 +617,20 @@ bool_t rvviRefInit(const char *programPath)
         gvsoc_engine_skip_irq(g_force_trap_enabled);
     }
 
+    /* Volatile-counter read sync.
+     * Default: enabled (1). Set CV_RVVI_VOLATILE_CSR_SYNC=0 to disable. */
+    {
+        const char *vs_env = getenv("CV_RVVI_VOLATILE_CSR_SYNC");
+        g_volatile_sync_enabled = (!vs_env || strcmp(vs_env, "0") != 0);
+        BRIDGE_LOG("volatile-counter read sync: %s",
+                   g_volatile_sync_enabled ? "ENABLED" : "DISABLED");
+    }
+
     /* Reset phase-shift re-alignment state for this run. */
     g_dut_pc_prev         = 0;
     g_phase_realign_count = 0;
     g_force_resync_count  = 0;
+    g_volatile_sync_count = 0;
 
     if (programPath && strlen(programPath) > 0) {
         /* Drop any temp config from a previous init so a re-init does not leak
@@ -716,6 +739,8 @@ bool_t rvviRefShutdown(void)
         BRIDGE_LOG("  IRQ resyncs    : %llu", (unsigned long long)g_force_resync_count);
     if (g_phase_realign_count > 0)
         BRIDGE_LOG("  phase realigns : %llu", (unsigned long long)g_phase_realign_count);
+    if (g_volatile_sync_count > 0)
+        BRIDGE_LOG("  volatile syncs : %llu", (unsigned long long)g_volatile_sync_count);
 
     if (g_bridge_profile) {
         BRIDGE_LOG("--- per-function profile (CV_RVVI_BRIDGE_PROFILE=1) ---");
@@ -1521,6 +1546,47 @@ const char *rvviDasmInsBin(uint32_t /*hartId*/, uint64_t /*address*/,
                              uint64_t /*insBin*/)                          { return ""; }
 const char *rvviErrorGet(void)                                             { return ""; }
 
+/* Performance-counter CSR addresses: cycle/instret/hpmcounter3..31 in the
+ * machine (0xB0x) and user (0xC0x) banks, low and high halves. */
+static inline bool csr_is_perf_counter(uint32_t addr)
+{
+    uint32_t base = addr & ~0x080u;  /* fold the *h bank onto the low one */
+    return (base >= 0xB00 && base <= 0xB1F) ||
+           (base >= 0xC00 && base <= 0xC1F);
+}
+
+/* Volatile-counter read sync (see g_volatile_sync_enabled above). Runs after
+ * the ISS stepped the current retire, before the compares and the RVVI-TEXT
+ * emit, so both observe the synced value. Decodes the DUT instruction: any
+ * CSR read form (csrrw needs rd!=x0, csrrs/csrrc/immediates always read) of a
+ * performance counter with a DUT-reported rd write gets the DUT value. */
+static void sync_volatile_counter_read(void)
+{
+    if (!g_volatile_sync_enabled)
+        return;
+    uint32_t insn = g_dut_insn;
+    if ((insn & 0x7f) != 0x73)       /* SYSTEM opcode (CSR ops are never compressed) */
+        return;
+    uint32_t funct3 = (insn >> 12) & 0x7;
+    if (funct3 == 0 || funct3 == 4)  /* ecall/ebreak/xret class, not a CSR op */
+        return;
+    uint32_t csr = insn >> 20;
+    if (!csr_is_perf_counter(csr))
+        return;
+    uint32_t rd = (insn >> 7) & 0x1f;
+    if (rd == 0 || !(g_emit_gpr_mask & (1u << rd)))
+        return;                      /* no rd write reported by the DUT */
+    uint32_t iss_val = gvsoc_engine_get_gpr(rd);
+    if (iss_val == g_dut_gpr[rd])
+        return;
+    gvsoc_engine_set_gpr(rd, g_dut_gpr[rd]);
+    g_volatile_sync_count++;
+    BRIDGE_LOG_HOT("volatile counter CSR[0x%03x] read @ PC=0x%08x: "
+                   "x%u ISS=0x%08x -> DUT=0x%08x (sync #%llu)",
+                   csr, g_dut_pc, rd, iss_val, g_dut_gpr[rd],
+                   (unsigned long long)g_volatile_sync_count);
+}
+
 /* Batched DPI path - one SV->C crossing per retire instead of six.
  * Combines EventStep + PcCompare + GprsCompare + CsrsCompare + FprsCompare.
  * rvviDutRetire is NOT called here: rvvi_trace2api already invokes it
@@ -1560,6 +1626,7 @@ int rvviRefRetireAndCompare(
         }
 
         int result = 0x01;  /* step OK */
+        sync_volatile_counter_read();
         if (rvviRefPcCompare(hart_id))                      result |= 0x02;
         if (rvviRefGprsCompareWritten(hart_id, RVVI_TRUE))  result |= 0x04;
         if (rvviRefCsrsCompare(hart_id))                    result |= 0x08;
