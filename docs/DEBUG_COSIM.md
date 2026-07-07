@@ -192,10 +192,10 @@ continues. This reproduces identically with the Questa-bundled gdb
 newer local gdb 12.1 -- not a gdb-version mismatch --
 `/proc/sys/kernel/yama/ptrace_scope` is `0` (unrestricted), ruling out the
 usual ptrace-scope cause, and the failure is independent of which
-function is targeted. The one variable this was not able to rule out is
-that the reproduction environment has no controlling TTY (`tty` → "not a
-tty"); cdbg's gdb integration may behave differently attached to a real
-interactive terminal. Until proven otherwise on this Questa/host
+function is targeted. It also reproduces with a controlling PTY on the
+whole process tree (the verified run was wrapped in `script`), ruling
+out a missing controlling terminal; the only configuration not tried is
+a human-driven GUI session on a real display. On this Questa/host
 combination, **treat Questa's native C Debug as not usable for DPI-C
 breakpoints and use the attach gate (§2) instead** -- it does not depend
 on `cdbg` and has been validated end-to-end.
