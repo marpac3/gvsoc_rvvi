@@ -87,13 +87,7 @@ static std::unordered_map<std::string, uint64_t> g_net_index_map;
 static std::unordered_map<uint64_t, uint64_t>    g_net_value_map;
 static uint64_t g_next_net_index = 0;
 
-/* DUT retire trace file for offline debugging.  Gated by g_dut_trace_enabled
- * (default OFF, opt-in via GVSOC_DUT_TRACE=1): when disabled, record_dut_event
- * skips the fprintf and g_dut_trace_fp is never opened. */
-static FILE       *g_dut_trace_fp  = nullptr;
-static std::string g_dut_trace_path;
 static std::string g_tmp_config_path;
-static bool        g_dut_trace_enabled = false;
 
 /* --------------------------------------------------------------------------
  * RVVI-TEXT emitter (additive, env-gated, default OFF).
@@ -106,7 +100,7 @@ static bool        g_dut_trace_enabled = false;
  * RVVI/source/host/rvvi/rvviTextChecker.py validates each side. Independent of
  * the PASS/FAIL semantics: the step-n-compare result is unchanged.
  *
- * Gate (read once in rvviRefInit, like GVSOC_DUT_TRACE):
+ * Gate (read once in rvviRefInit):
  *   RVVI_TEXT_TRACE=<existing dir> -> <dir>/dut.rvvi, <dir>/ref.rvvi
  *   RVVI_TEXT_TRACE=1              -> ./dut.rvvi, ./ref.rvvi (cwd)
  *   unset / empty / 0             -> disabled, zero hot-path overhead
@@ -417,8 +411,7 @@ static inline bool throttle_check(uint64_t &counter, const char *category)
  * ========================================================================== */
 
 /* Common bookkeeping for both normal retires and trap retires.
- * Snapshots the GPR/FPR write masks for the RVVI-TEXT emit, then resets them;
- * also logs to the DUT retire trace file. */
+ * Snapshots the GPR/FPR write masks for the RVVI-TEXT emit, then resets them. */
 static void record_dut_event(uint64_t dutPc, uint64_t dutInsBin, bool is_trap)
 {
     /* Snapshot the write masks for the RVVI-TEXT emit BEFORE zeroing them: the
@@ -432,19 +425,6 @@ static void record_dut_event(uint64_t dutPc, uint64_t dutInsBin, bool is_trap)
     g_dut_pc_prev = g_dut_pc;          /* remember previous retire's DUT PC (phase-shift catch-up) */
     g_dut_pc = (uint32_t)dutPc;
     g_dut_insn = (uint32_t)dutInsBin;  /* save for the opcode comparison in rvviRefInsBinCompare */
-
-    /* Trace file disabled by default (opt-in via GVSOC_DUT_TRACE=1).
-     * Branch marked unlikely so the common case is a single load+test+ret. */
-    if (__builtin_expect(!g_dut_trace_enabled, 1))
-        return;
-    if (g_dut_trace_fp) {
-        fprintf(g_dut_trace_fp, is_trap ? "0x%08x T\n" : "0x%08x\n",
-                (uint32_t)dutPc);
-        static uint64_t dut_retire_count = 0;
-        dut_retire_count++;
-        if ((dut_retire_count % 1000) == 0)
-            fflush(g_dut_trace_fp);
-    }
 }
 
 /* Emit one RVVI-TEXT v0.4 line for the current retire on the given side.
@@ -588,15 +568,6 @@ bool_t rvviRefInit(const char *programPath)
                             strcmp(verbose_env, "0") != 0);
     }
 
-    /* Read DUT-trace gate once at init (default OFF).
-     * Enable with GVSOC_DUT_TRACE=1 to capture the per-retire PC trace. */
-    {
-        const char *trace_env = getenv("GVSOC_DUT_TRACE");
-        g_dut_trace_enabled = (trace_env != nullptr &&
-                               trace_env[0] != '\0' &&
-                               strcmp(trace_env, "0") != 0);
-    }
-
     /* RVVI-TEXT emitter gate (default OFF). Same read-once pattern as above.
      * Value is a target directory or "1" (cwd); the files are opened below. */
     {
@@ -648,17 +619,6 @@ bool_t rvviRefInit(const char *programPath)
         std::string tmp = create_temp_config(template_path, programPath);
         if (!tmp.empty())
             g_tmp_config_path = tmp;
-    }
-
-    /* Open DUT retire trace file for offline debugging.
-     * Only when explicitly enabled - default OFF to save hot-path I/O. */
-    char dut_path[128];
-    snprintf(dut_path, sizeof(dut_path), "/tmp/dut_trace_%d.log", (int)getpid());
-    g_dut_trace_path = dut_path;
-    if (g_dut_trace_enabled) {
-        g_dut_trace_fp = fopen(dut_path, "w");
-        if (!g_dut_trace_fp)
-            BRIDGE_ERR("cannot open DUT trace: %s", dut_path);
     }
 
     /* Open the RVVI-TEXT file(s) and write their header(s) (once per run).
@@ -724,8 +684,6 @@ bool_t rvviRefInit(const char *programPath)
         BRIDGE_LOG("engine initialized in-process");
         BRIDGE_LOG("  ELF    : %s", programPath ? programPath : "<none>");
         BRIDGE_LOG("  Config : %s", g_tmp_config_path.c_str());
-        if (g_dut_trace_enabled)
-            BRIDGE_LOG("  DUT trace -> %s", dut_path);
     } else {
         BRIDGE_LOG("no config generated, running in stub mode");
     }
@@ -738,11 +696,6 @@ bool_t rvviRefShutdown(void)
 {
     gvsoc_engine_shutdown();
 
-    if (g_dut_trace_fp) {
-        fclose(g_dut_trace_fp);
-        g_dut_trace_fp = nullptr;
-        BRIDGE_LOG("shutdown: DUT retire trace -> %s", g_dut_trace_path.c_str());
-    }
     if (g_rvvi_text_dut_fp) { fclose(g_rvvi_text_dut_fp); g_rvvi_text_dut_fp = nullptr; }
     if (g_rvvi_text_ref_fp) { fclose(g_rvvi_text_ref_fp); g_rvvi_text_ref_fp = nullptr; }
     if (!g_tmp_config_path.empty()) {

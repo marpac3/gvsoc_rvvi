@@ -92,7 +92,6 @@ All read once in `rvviRefInit`:
 | Env var | Effect |
 |---------|--------|
 | `CV_RVVI_BRIDGE_VERBOSE=1` | per-call bridge logging in the transcript |
-| `GVSOC_DUT_TRACE=1` | per-retire DUT PC trace |
 | `RVVI_TEXT_TRACE=<dir>` | RVVI-TEXT `dut.rvvi`/`ref.rvvi` (see RVVI_TEXT_TRACING.md) |
 | `CV_RVVI_BRIDGE_PROFILE=1` | ns counters per `rvviRef*` call, dumped at shutdown |
 | `GVSOC_FORCE_TRAP_CSR=0` | disable force-resync on IRQ traps |
