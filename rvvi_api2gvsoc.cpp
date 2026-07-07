@@ -694,8 +694,9 @@ bool_t rvviRefInit(const char *programPath)
 
 bool_t rvviRefShutdown(void)
 {
-    gvsoc_engine_shutdown();
-
+    /* Close the RVVI-TEXT files BEFORE any engine teardown: if the engine
+     * shutdown wedges (see the abnormal-termination note in
+     * gvsoc_engine_shutdown), the trace tails must already be on disk. */
     if (g_rvvi_text_dut_fp) { fclose(g_rvvi_text_dut_fp); g_rvvi_text_dut_fp = nullptr; }
     if (g_rvvi_text_ref_fp) { fclose(g_rvvi_text_ref_fp); g_rvvi_text_ref_fp = nullptr; }
     if (!g_tmp_config_path.empty()) {
@@ -737,6 +738,9 @@ bool_t rvviRefShutdown(void)
         BRIDGE_LOG("  -- TOTAL (measured)       : %9.2f ms (%5.1f%% of wall-clock)",
                    total_ns / 1.0e6, total_pct);
     }
+
+    /* Engine teardown last: everything above is already flushed/reported. */
+    gvsoc_engine_shutdown();
 
     return RVVI_TRUE;
 }

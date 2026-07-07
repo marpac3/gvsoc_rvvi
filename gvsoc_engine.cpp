@@ -463,11 +463,31 @@ void gvsoc_engine_shutdown(void)
 
     if (g_gvsoc)
     {
-        engine_call_safe("stop",  [](){ g_gvsoc->stop();   });
-        engine_call_safe("quit",  [](){ g_gvsoc->quit(0);  });
-        engine_call_safe("join",  [](){ g_gvsoc->join();   });
-        engine_call_safe("close", [](){ g_gvsoc->close();  });
-        g_gvsoc = nullptr;
+        if (!g_finished)
+        {
+            /* Abnormal termination: the sim did not finish on its own (SV-side
+             * abort - consecutive-mismatch watchdog, runaway, UVM timeout).
+             * The graceful teardown MUST be skipped here:
+             * - stop() self-deadlocks: in sync mode Controller::start() takes
+             *   the engine mutex and the external loop (us) owns it until the
+             *   internal sim-finished path releases it, which never ran; the
+             *   stop() -> engine_lock() relock on the same non-recursive mutex
+             *   hangs the simulator forever (observed: 35+ min "hangs" that
+             *   were really this deadlock until an external kill).
+             * - join() would RESUME the simulation: its sync branch loops on
+             *   run_sync() until is_sim_finished.
+             * The process is exiting anyway; the OS reclaims the engine. */
+            ENGINE_LOG("abnormal shutdown (sim not finished) - skipping engine stop/join");
+            g_gvsoc = nullptr;
+        }
+        else
+        {
+            engine_call_safe("stop",  [](){ g_gvsoc->stop();   });
+            engine_call_safe("quit",  [](){ g_gvsoc->quit(0);  });
+            engine_call_safe("join",  [](){ g_gvsoc->join();   });
+            engine_call_safe("close", [](){ g_gvsoc->close();  });
+            g_gvsoc = nullptr;
+        }
     }
 
     g_wrapper  = nullptr;
