@@ -38,8 +38,8 @@ module rvvi_trace2api
     end
 
 `ifdef USE_GVSOC
-    // GVSOC-specific batch DPI: collapses step + 4 compares into one crossing.
-    // Returns a bitmask: 0x01=step 0x02=PC 0x04=GPR 0x08=CSR 0x10=FPR 0x20=runaway.
+    // GVSOC-specific batch DPI: collapses step + 5 compares into one crossing.
+    // Returns a bitmask of the CMP_* localparams below.
     import "DPI-C" function int rvviRefRetireAndCompare(
         input int unsigned  hartId,
         input longint unsigned dutPc,
@@ -68,10 +68,39 @@ module rvvi_trace2api
     end
 `endif
 
-    // Debug counters
+    // rvviRefRetireAndCompare result bits. A compare bit is set on PASS or
+    // when not applicable, so CMP_ALL is a clean retire. Must match the
+    // bitmask in rvvi_api2gvsoc.cpp.
+    localparam int unsigned CMP_STEP    = 32'h01;
+    localparam int unsigned CMP_PC      = 32'h02;
+    localparam int unsigned CMP_GPR     = 32'h04;
+    localparam int unsigned CMP_CSR     = 32'h08;
+    localparam int unsigned CMP_FPR     = 32'h10;
+    localparam int unsigned CMP_RUNAWAY = 32'h20;
+    // NOTE: the insn compare is vacuous today - the DPI engine does not
+    // capture the retired opcode (returns 0, compare skips) - wired now so it
+    // goes live when opcode capture lands.
+    localparam int unsigned CMP_INSN    = 32'h40;
+    localparam int unsigned CMP_ALL     = CMP_STEP | CMP_PC | CMP_GPR |
+                                          CMP_CSR | CMP_FPR | CMP_INSN;
+
+    // Exception CSRs pushed explicitly on a trap retire (step 5 below).
+    // Must match is_trap_csr() / TRAP_CSR_* in rvvi_api2gvsoc.cpp.
+    localparam logic [11:0] CSR_MSTATUS = 12'h300;
+    localparam logic [11:0] CSR_MEPC    = 12'h341;
+    localparam logic [11:0] CSR_MCAUSE  = 12'h342;
+    localparam logic [11:0] CSR_MTVAL   = 12'h343;
+
+    // Debug counters: one error budget per compare category, so one noisy
+    // category cannot exhaust the log and hide the others.
     longint unsigned retire_count = 0;
-    int unsigned err_count = 0;
     localparam int unsigned MAX_ERR_LOG = 10;
+    int unsigned err_step_count = 0;
+    int unsigned err_pc_count   = 0;
+    int unsigned err_gpr_count  = 0;
+    int unsigned err_csr_count  = 0;
+    int unsigned err_fpr_count  = 0;
+    int unsigned err_insn_count = 0;
 
     // Consecutive-mismatch watchdog bound (see the compare block below).
     // Override on the command line with +rvvi_max_consecutive_mismatch=<n>.
@@ -168,10 +197,10 @@ module rvvi_trace2api
                         // combinatorially-stable rvvi.csr values, which use the
                         // RVVI_SET_TRAP_CSR macro (wdata direct when wmask==0) to give
                         // the correct value even on the first exception.
-                        rvviDutCsrSet(h, 12'h300, rvvi.csr[h][r][12'h300]);  // mstatus (MPIE/MIE updated on trap)
-                        rvviDutCsrSet(h, 12'h341, rvvi.csr[h][r][12'h341]);  // mepc   (trap-CSR macro)
-                        rvviDutCsrSet(h, 12'h342, rvvi.csr[h][r][12'h342]);  // mcause (trap-CSR macro)
-                        rvviDutCsrSet(h, 12'h343, rvvi.csr[h][r][12'h343]);  // mtval
+                        rvviDutCsrSet(h, CSR_MSTATUS, rvvi.csr[h][r][CSR_MSTATUS]);  // MPIE/MIE updated on trap
+                        rvviDutCsrSet(h, CSR_MEPC,    rvvi.csr[h][r][CSR_MEPC]);
+                        rvviDutCsrSet(h, CSR_MCAUSE,  rvvi.csr[h][r][CSR_MCAUSE]);
+                        rvviDutCsrSet(h, CSR_MTVAL,   rvvi.csr[h][r][CSR_MTVAL]);
                         rvviDutTrap(h, rvvi.pc_rdata[h][r], rvvi.insn[h][r]);
                         // GVSOC models exceptions as two ISS steps: (1) faulting
                         // instruction, (2) jump to mtvec.  Consume step 1 silently here;
@@ -199,8 +228,8 @@ module rvvi_trace2api
                         // (base + cause*4) and the ISS has not already taken it (ISS MIE==1).
                         // A stale mcause[31] lingering in normal code is rejected because the
                         // DUT PC there is not the trap vector.
-                        if (informed_irq_en && rvvi.csr[h][r][12'h342][31])
-                            rvviRefInjectIrq(h, rvvi.csr[h][r][12'h342]);
+                        if (informed_irq_en && rvvi.csr[h][r][CSR_MCAUSE][31])
+                            rvviRefInjectIrq(h, rvvi.csr[h][r][CSR_MCAUSE]);
 `endif
                     end
 
@@ -215,32 +244,37 @@ module rvvi_trace2api
                             rvvi.pc_rdata[h][r],
                             rvvi.insn[h][r],
                             rvvi.debug_mode[h][r]);
-                        if (!(cmp_result & 32'h01)) begin
-                            if (err_count < MAX_ERR_LOG) begin
+                        if (!(cmp_result & CMP_STEP)) begin
+                            if (err_step_count < MAX_ERR_LOG) begin
                                 $error("RVVI Bridge: rvviRefEventStep FAILED for hart %0d at retire #%0d (PC=0x%08x)",
                                        h, retire_count, rvvi.pc_rdata[h][r]);
-                                err_count++;
+                                err_step_count++;
                             end
                         end else begin
-                            if (!(cmp_result & 32'h02) && err_count < MAX_ERR_LOG) begin
+                            if (!(cmp_result & CMP_PC) && err_pc_count < MAX_ERR_LOG) begin
                                 $error("RVVI Mismatch: PC at retire #%0d order=%0d (DUT PC=0x%08x)",
                                        retire_count, rvvi.order[h][r], rvvi.pc_rdata[h][r]);
-                                err_count++;
+                                err_pc_count++;
                             end
-                            if (!(cmp_result & 32'h04) && err_count < MAX_ERR_LOG) begin
+                            if (!(cmp_result & CMP_GPR) && err_gpr_count < MAX_ERR_LOG) begin
                                 $error("RVVI Mismatch: GPR at retire #%0d order=%0d (DUT PC=0x%08x)",
                                        retire_count, rvvi.order[h][r], rvvi.pc_rdata[h][r]);
-                                err_count++;
+                                err_gpr_count++;
                             end
-                            if (!(cmp_result & 32'h08) && err_count < MAX_ERR_LOG) begin
+                            if (!(cmp_result & CMP_CSR) && err_csr_count < MAX_ERR_LOG) begin
                                 $error("RVVI Mismatch: CSR at retire #%0d order=%0d (DUT PC=0x%08x)",
                                        retire_count, rvvi.order[h][r], rvvi.pc_rdata[h][r]);
-                                err_count++;
+                                err_csr_count++;
                             end
-                            if (!(cmp_result & 32'h10) && err_count < MAX_ERR_LOG) begin
+                            if (!(cmp_result & CMP_FPR) && err_fpr_count < MAX_ERR_LOG) begin
                                 $error("RVVI Mismatch: FPR at retire #%0d order=%0d (DUT PC=0x%08x)",
                                        retire_count, rvvi.order[h][r], rvvi.pc_rdata[h][r]);
-                                err_count++;
+                                err_fpr_count++;
+                            end
+                            if (!(cmp_result & CMP_INSN) && err_insn_count < MAX_ERR_LOG) begin
+                                $error("RVVI Mismatch: INSN at retire #%0d order=%0d (DUT PC=0x%08x)",
+                                       retire_count, rvvi.order[h][r], rvvi.pc_rdata[h][r]);
+                                err_insn_count++;
                             end
                         end
 
@@ -252,7 +286,7 @@ module rvvi_trace2api
                         // point. The 0x20 bit converts that hang into a clean,
                         // deterministic FAIL. Fires regardless of the per-bit
                         // mismatch logging above.
-                        if (cmp_result & 32'h20) begin
+                        if (cmp_result & CMP_RUNAWAY) begin
                             $error("RVVI Bridge: GVSOC ISS runaway (diverged + stuck) at retire #%0d (DUT PC=0x%08x) - aborting", retire_count, rvvi.pc_rdata[h][r]);
                             $finish;
                         end
@@ -265,12 +299,12 @@ module rvvi_trace2api
                         // reconverge-on-mismatch re-syncs instead, but this
                         // open-source bridge only sees DUT write-backs, so it
                         // bounds-and-aborts.
-                        if ((cmp_result & 32'h1F) == 32'h1F) begin
+                        if ((cmp_result & CMP_ALL) == CMP_ALL) begin
                             consecutive_mismatch = 0;
                         end else begin
                             consecutive_mismatch++;
                             if (consecutive_mismatch >= max_consecutive_mismatch) begin
-                                $error("RVVI Bridge: step-and-compare diverged for %0d consecutive retires (last retire #%0d, DUT PC=0x%08x, cmp_result=0x%02x [b1=PC b2=GPR b3=CSR b4=FPR]) - aborting",
+                                $error("RVVI Bridge: step-and-compare diverged for %0d consecutive retires (last retire #%0d, DUT PC=0x%08x, cmp_result=0x%02x [b1=PC b2=GPR b3=CSR b4=FPR b6=INSN]) - aborting",
                                        consecutive_mismatch, retire_count, rvvi.pc_rdata[h][r], cmp_result);
                                 $finish;
                             end
