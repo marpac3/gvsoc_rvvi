@@ -79,11 +79,27 @@ module rvvi_trace2api
     int unsigned max_consecutive_mismatch = 50;
     initial void'($value$plusargs("rvvi_max_consecutive_mismatch=%d", max_consecutive_mismatch));
 
+    // A trap entry flushes the killed pipeline slot and RVFI reports it as one
+    // bogus row: pc_rdata=0 with insn = the synthesized jump to the handler.
+    // The artifact is recognized by state -- it is the row immediately following
+    // a trap row -- not by value, so a genuine retire at address 0 (test
+    // trampolines) is not confused with it.
+    logic post_trap_flush [NHART] = '{default: 1'b0};
+    int unsigned flush_drop_count = 0;
+
     always @(posedge rvvi.clk) begin
         for (int h=0; h<NHART; h++) begin
             for (int r=0; r<RETIRE; r++) begin
                 if (rvvi.valid[h][r]) begin
+                    automatic bit is_flush_artifact = post_trap_flush[h] &&
+                        (rvvi.pc_rdata[h][r] == 0) && !rvvi.trap[h][r];
                     retire_count++;
+
+                    if (is_flush_artifact) begin
+                        flush_drop_count++;
+                        $display("[rvvi_trace2api] dropped trap-redirect flush row at retire #%0d (insn=0x%08x, dropped so far: %0d)",
+                                 retire_count, rvvi.insn[h][r], flush_drop_count);
+                    end
 
                     // Diagnostic heartbeat (opt-in): first 5 retires, then every 1000th.
                     // Enable with +rvvi_trace2api_verbose on the simulator command line.
@@ -93,9 +109,10 @@ module rvvi_trace2api
                                  retire_count, rvvi.pc_rdata[h][r], rvvi.insn[h][r],
                                  rvvi.trap[h][r], rvvi.order[h][r]);
 
-                    // Skip GPR/FPR/CSR push for pipeline-flush artifacts (PC=0x0).
-                    // Trap retires (trap=1, PC!=0) are always allowed through.
-                    if (rvvi.trap[h][r] || rvvi.pc_rdata[h][r] != 0) begin
+                    // Skip GPR/FPR/CSR push for the trap-redirect flush artifact
+                    // (see post_trap_flush above).  Trap retires and genuine
+                    // retires at address 0 (test trampolines) go through.
+                    if (!is_flush_artifact) begin
 
                         // 1. Push GPR changes from DUT to Bridge.
                         // x0 is hardwired to zero - skip it even if x_wb[0] is flagged.
@@ -163,7 +180,7 @@ module rvvi_trace2api
                         // mcause[31]=0).  External interrupts do NOT set rvfi_trap and
                         // are handled in the normal-retire path below (rvfi_intr).
                         void'(rvviRefEventStep(h));
-                    end else if (rvvi.pc_rdata[h][r] != 0) begin
+                    end else if (!is_flush_artifact) begin
                         rvviDutRetire(h, rvvi.pc_rdata[h][r], rvvi.insn[h][r], rvvi.debug_mode[h][r]);
 `ifdef USE_GVSOC
                         // Informed IRQ injection (gated +rvvi_informed_irq).  The first
@@ -188,8 +205,8 @@ module rvvi_trace2api
                     end
 
                     // 6. Step Reference Model + 7. Comparisons
-                    // Skipped on trap retires (handled above) and PC=0 flush artifacts.
-                    if (!rvvi.trap[h][r] && rvvi.pc_rdata[h][r] != 0) begin
+                    // Skipped on trap retires (handled above) and the flush artifact.
+                    if (!rvvi.trap[h][r] && !is_flush_artifact) begin
                         // Batch DPI: step + all compares in one crossing.
                         // Bit 0 (step) is checked first; if it fails the other bits
                         // are meaningless and only the step error is reported.
@@ -259,6 +276,9 @@ module rvvi_trace2api
                             end
                         end
                     end
+
+                    // Arm the filter: the row after a trap row is the flush artifact.
+                    post_trap_flush[h] = rvvi.trap[h][r];
                 end
             end
         end
