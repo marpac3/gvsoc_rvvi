@@ -123,11 +123,6 @@ static RvviTextParams g_rvvi_text_params = {
     /*ilen*/ 32, /*xlen*/ 32, /*flen*/ 32,
     /*vlen*/ 0,  /*nhart*/ 1, /*retire*/ 1
 };
-/* CSR addresses written in the current retire (per-retire, like the GPR/FPR
- * masks). Filled by rvviDutCsrSet, emitted+cleared once per retire inside
- * rvviRefRetireAndCompare. Populated only when g_rvvi_text_enabled. */
-static std::vector<uint32_t> g_dut_csr_written;
-
 /* Per-function ns accumulators, dumped at shutdown.  Enabled via
  * CV_RVVI_BRIDGE_PROFILE=1; gated at each call site so disabled cost is nil. */
 static bool     g_bridge_profile = false;
@@ -166,35 +161,57 @@ struct ProfGuard {
 };
 #define PROF_SCOPE(ns_var, cnt_var) ProfGuard _prof_guard((ns_var), (cnt_var))
 
-/* DUT architectural state pushed by the UVM testbench before each retire */
-static uint32_t g_dut_pc      = 0;
+/* --------------------------------------------------------------------------
+ * The retire lifecycle.
+ *
+ * Two structures with one owner each:
+ *
+ *   PendingWriteback - the write-back set being ACCUMULATED for the retire in
+ *   flight. Written only by the rvviDut*Set push functions.
+ *
+ *   RetireEvent - the snapshot of the last COMMITTED retire. Written only by
+ *   take_retire_event() (called from rvviDutRetire / rvviDutTrap); every
+ *   consumer - compare, volatile sync, RVVI-TEXT emit, informed inject -
+ *   reads it and nobody else writes it.
+ *
+ * Ordering contract (why this is race-free): rvvi_trace2api.sv drives the
+ * whole retire from a single always block and DPI calls are synchronous, so
+ * within one retire the sequence is strictly
+ *   push (Dut*Set) -> take (DutRetire/DutTrap) -> inject -> batch compare/emit
+ * and the pushes of retire N+1 cannot start before the batch of retire N has
+ * returned. */
+struct PendingWriteback {
+    uint32_t gpr_mask = 0;
+    uint32_t fpr_mask = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> csr_writes;  /* (addr, value), push order */
+};
+
+struct RetireEvent {
+    uint32_t pc      = 0;
+    uint32_t pc_prev = 0;   /* DUT PC of the previous retire (phase-shift catch-up) */
+    uint32_t insn    = 0;
+    /* True when this retire carries rvfi_trap=1. On trap retires RVFI does
+     * NOT report exception CSR updates in the same cycle; those arrive on the
+     * following (handler) retire, so trap-CSR comparison is suppressed here. */
+    bool     is_trap = false;
+    uint32_t gpr_mask = 0;
+    uint32_t fpr_mask = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> csr_writes;
+};
+
+static PendingWriteback g_pending;
+static RetireEvent      g_retire;
+
+/* Sticky architectural mirrors of the DUT state, accumulated across retires.
+ * Distinct from the per-retire structures above: the force-resync path needs
+ * the full GPR/FPR file and the CSR compare is state-based (a CSR pushed once
+ * stays comparable forever). */
 static uint32_t g_dut_gpr[32] = {};
 static uint32_t g_dut_fpr[32] = {};
-static uint32_t g_dut_insn    = 0;   /* DUT instruction binary for the current retire (opcode comparison) */
 static std::unordered_map<uint32_t, uint32_t> g_dut_csr;
 /* DUT privilege mode (rvvi.mode), pushed once per retire by rvviBridgeSetMode.
  * Only consumed by the RVVI-TEXT emitter (ref-only MODE column). */
 static uint32_t g_dut_mode    = 0;
-
-/* Bitmask of GPRs written in the current retire cycle */
-static uint32_t g_dut_gprs_written_mask = 0;
-
-/* Bitmask of FPRs written in the current retire cycle */
-static uint32_t g_dut_fprs_written_mask = 0;
-
-/* Emit-only snapshot of the two masks above, taken by record_dut_event BEFORE
- * it zeroes them mid-retire.  The RVVI-TEXT line is emitted later this retire
- * (rvviRefRetireAndCompare / rvviDutTrap), when the compare masks are already 0;
- * the emit reads these snapshots so the X/F columns reflect this retire's
- * GPR/FPR writes.  Kept separate so the compare path is byte-identical. */
-static uint32_t g_emit_gpr_mask = 0;
-static uint32_t g_emit_fpr_mask = 0;
-
-/* True when the current retire carries rvfi_trap=1.  On trap retires
- * RVFI does NOT report exception CSR updates in the same cycle; those
- * arrive on the following (handler) retire.  Comparison of these CSRs
- * is suppressed while g_dut_is_trap is true. */
-static bool g_dut_is_trap = false;
 
 /* --------------------------------------------------------------------------
  * Trap-CSR snapshot mechanism.
@@ -213,7 +230,10 @@ static bool g_dut_is_trap = false;
 static bool     g_pending_handler = false;
 static std::unordered_map<uint32_t, uint32_t> g_trap_csr_snapshot;
 
-/* Exception CSRs requiring snapshot protection across the trap->handler boundary */
+/* Exception CSRs requiring snapshot protection across the trap->handler
+ * boundary.  Contract: this list must match the explicit trap-CSR pushes in
+ * rvvi_trace2api.sv (CSR_MSTATUS/MEPC/MCAUSE/MTVAL, step 5) - the snapshot in
+ * rvviDutTrap and the force-resync in rvviRefEventStep both iterate it. */
 static const uint32_t TRAP_CSR_MEPC   = 0x341U;
 static const uint32_t TRAP_CSR_MCAUSE  = 0x342U;
 static const uint32_t TRAP_CSR_MTVAL   = 0x343U;
@@ -272,12 +292,9 @@ static uint64_t g_volatile_sync_count = 0;  /* diagnostic: syncs applied */
  * retire BEHIND the DUT on the SAME control-flow path: GVSOC models the
  * exception as an extra step, while the async-IRQ resync above does NOT fire
  * (both MIE end at 0 for a sync trap, so is_new_irq is false).  When that
- * happens, the ISS PC equals the DUT's PREVIOUS retire PC (g_dut_pc_prev),
- * not the current one (g_dut_pc).  That is a provable 1-retire lag on the
- * same path -> give the ISS one catch-up step to re-align.  g_dut_pc_prev is
- * the DUT PC of the immediately preceding retire, saved in record_dut_event
- * before g_dut_pc is overwritten. */
-static uint32_t g_dut_pc_prev        = 0;   /* DUT PC of the previous retire */
+ * happens, the ISS PC equals the DUT's PREVIOUS retire PC (g_retire.pc_prev),
+ * not the current one (g_retire.pc).  That is a provable 1-retire lag on the
+ * same path -> give the ISS one catch-up step to re-align. */
 static uint64_t g_phase_realign_count = 0;  /* diagnostic: catch-up steps applied */
 
 /* CSR comparison configuration */
@@ -302,7 +319,7 @@ static uint64_t g_gprw_mismatch_count = 0;
 static uint64_t g_fpr_mismatch_count  = 0;
 static uint64_t g_csr_mismatch_count  = 0;
 static uint64_t g_insn_mismatch_count = 0;  /* instruction binary mismatch throttle */
-static bool     g_insbin_compare_called = false;  /* set when rvviRefInsBinCompare is first called */
+static uint64_t g_order_mismatch_count = 0; /* retire-ordering tripwire throttle */
 
 /* Wall-clock start time recorded at rvviRefInit for CPI/throughput metrics */
 static std::chrono::steady_clock::time_point g_init_time;
@@ -423,33 +440,36 @@ static inline bool throttle_check(uint64_t &counter, const char *category)
  * SECTION 4 - DUT retire event recording
  * ========================================================================== */
 
-/* Common bookkeeping for both normal retires and trap retires.
- * Snapshots the GPR/FPR write masks for the RVVI-TEXT emit, then resets them. */
-static void record_dut_event(uint64_t dutPc, uint64_t dutInsBin, bool is_trap)
+/* Commit the accumulated write-back set as the current retire. The single
+ * point where g_retire is written and g_pending is cleared: everything the
+ * rest of the retire reads (compares, volatile sync, emit, inject) comes from
+ * g_retire. The vector swap keeps both capacities alive, so the steady state
+ * allocates nothing. */
+static void take_retire_event(uint64_t dutPc, uint64_t dutInsBin, bool is_trap)
 {
-    /* Snapshot the write masks for the RVVI-TEXT emit BEFORE zeroing them: the
-     * emit runs later this retire, when these compare masks are already 0.
-     * Cheap unconditional copy; g_emit_* is only read on the emit path, so the
-     * step-n-compare path is unaffected. */
-    g_emit_gpr_mask = g_dut_gprs_written_mask;
-    g_emit_fpr_mask = g_dut_fprs_written_mask;
-    g_dut_gprs_written_mask = 0;
-    g_dut_fprs_written_mask = 0;
-    g_dut_pc_prev = g_dut_pc;          /* remember previous retire's DUT PC (phase-shift catch-up) */
-    g_dut_pc = (uint32_t)dutPc;
-    g_dut_insn = (uint32_t)dutInsBin;  /* save for the opcode comparison in rvviRefInsBinCompare */
+    g_retire.pc_prev  = g_retire.pc;
+    g_retire.pc       = (uint32_t)dutPc;
+    g_retire.insn     = (uint32_t)dutInsBin;
+    g_retire.is_trap  = is_trap;
+    g_retire.gpr_mask = g_pending.gpr_mask;
+    g_retire.fpr_mask = g_pending.fpr_mask;
+    g_retire.csr_writes.swap(g_pending.csr_writes);
+
+    g_pending.gpr_mask = 0;
+    g_pending.fpr_mask = 0;
+    g_pending.csr_writes.clear();
 }
 
 /* Emit one RVVI-TEXT v0.4 line for the current retire on the given side.
  * Single shared formatter so dut.rvvi and ref.rvvi are byte-format-identical
  * (only the values/PC differ): a diff then shows exactly where they diverge.
  *
- * dut_side=true  -> DUT values  (g_dut_pc / g_dut_gpr / g_dut_fpr / g_dut_csr)
+ * dut_side=true  -> DUT values  (g_retire.pc / g_dut_gpr / g_dut_fpr mirrors)
  * dut_side=false -> REF values  (gvsoc_engine_get_pc / _gpr / _fpr / _csr) for
  *                   the SAME write-set the DUT reported this retire.
  *
  * Called on both the normal-retire path and the trap path (rvviDutTrap);
- * g_dut_is_trap selects RET vs TRAP in the output. */
+ * g_retire.is_trap selects RET vs TRAP in the output. */
 static void emit_rvvi_text_line(FILE *fp, bool dut_side)
 {
     if (!fp)
@@ -461,9 +481,9 @@ static void emit_rvvi_text_line(FILE *fp, bool dut_side)
      * ws{} zero-inits all 32 GPR/FPR slots; only masked indices are written
      * below and read by the formatter (no read of an uninitialised slot). */
     RvviTextWriteSet ws{};
-    ws.pc       = dut_side ? g_dut_pc : gvsoc_engine_get_pc();
-    ws.insn     = g_dut_insn;
-    ws.is_trap  = g_dut_is_trap;
+    ws.pc       = dut_side ? g_retire.pc : gvsoc_engine_get_pc();
+    ws.insn     = g_retire.insn;
+    ws.is_trap  = g_retire.is_trap;
     /* MODE column: emitted only in ref-only mode, where ref.rvvi is diffed
      * line-for-line against a dut.rvvi produced by the SV tracer (which always
      * emits MODE). Gate on which FILE is being written (fp == ref fp), not on
@@ -474,31 +494,53 @@ static void emit_rvvi_text_line(FILE *fp, bool dut_side)
     ws.has_mode = g_rvvi_text_ref_only && (fp == g_rvvi_text_ref_fp);
     ws.mode     = g_dut_mode;
 
-    ws.gpr_mask = g_emit_gpr_mask;
+    ws.gpr_mask = g_retire.gpr_mask;
     for (int i = 0; i < 32; i++)
-        if (g_emit_gpr_mask & (1u << i))
+        if (g_retire.gpr_mask & (1u << i))
             ws.gpr[i] = dut_side ? g_dut_gpr[i] : gvsoc_engine_get_gpr((uint32_t)i);
 
-    ws.fpr_mask = g_emit_fpr_mask;
+    ws.fpr_mask = g_retire.fpr_mask;
     for (int i = 0; i < 32; i++)
-        if (g_emit_fpr_mask & (1u << i))
+        if (g_retire.fpr_mask & (1u << i))
             ws.fpr[i] = dut_side ? g_dut_fpr[i] : gvsoc_engine_get_fpr((uint32_t)i);
 
-    /* CSR deltas collected this retire by rvviDutCsrSet. If the ISS does not
-     * map a CSR, emit 0x0 (not omit) so dut/ref column counts match 1:1. */
-    for (uint32_t addr : g_dut_csr_written) {
-        uint32_t v;
-        if (dut_side) {
-            auto it = g_dut_csr.find(addr);
-            v = (it != g_dut_csr.end()) ? it->second : 0u;
-        } else {
-            if (!gvsoc_engine_get_csr(addr, &v))
-                v = 0u;
-        }
-        ws.csr.push_back({addr, v});
+    /* CSR deltas of this retire. If the ISS does not map a CSR, emit 0x0
+     * (not omit) so dut/ref column counts match 1:1. */
+    for (const auto &w : g_retire.csr_writes) {
+        uint32_t v = w.second;
+        if (!dut_side && !gvsoc_engine_get_csr(w.first, &v))
+            v = 0u;
+        ws.csr.push_back({w.first, v});
     }
 
     rvvi_text_write_line(fp, ws);
+}
+
+/* Emit the dut.rvvi and ref.rvvi lines for the committed retire (g_retire).
+ * ref_from_dut=true is the trap seam: the ISS has not consumed the trap yet,
+ * so the ref line is built from DUT data too. DPI cannot propagate exceptions
+ * (would crash the simulator) and the formatter allocates: contain any throw
+ * and disable the best-effort trace instead. */
+static void emit_retire_lines(bool ref_from_dut)
+{
+    if (!__builtin_expect(g_rvvi_text_enabled, 0))
+        return;
+    try {
+        emit_rvvi_text_line(g_rvvi_text_dut_fp, /*dut_side=*/true);
+        emit_rvvi_text_line(g_rvvi_text_ref_fp, /*dut_side=*/ref_from_dut);
+    } catch (const std::exception &e) {
+        BRIDGE_LOG("RVVI-TEXT: line emit failed (%s) - disabling", e.what());
+        g_rvvi_text_enabled = false;
+    } catch (...) {
+        BRIDGE_LOG("RVVI-TEXT: line emit failed (unknown) - disabling");
+        g_rvvi_text_enabled = false;
+    }
+}
+
+static void close_text_files(void)
+{
+    if (g_rvvi_text_dut_fp) { fclose(g_rvvi_text_dut_fp); g_rvvi_text_dut_fp = nullptr; }
+    if (g_rvvi_text_ref_fp) { fclose(g_rvvi_text_ref_fp); g_rvvi_text_ref_fp = nullptr; }
 }
 
 extern "C" {
@@ -561,6 +603,16 @@ static void gdb_attach_gate(void)
     BRIDGE_LOG("no debugger after %lds, continuing without one", timeout_s);
 }
 
+/* Boolean env-var gate: unset or empty -> the gate's default; "0" -> off;
+ * any other value -> on (so =1 and =true both work). */
+static bool env_flag(const char *name, bool def)
+{
+    const char *v = getenv(name);
+    if (!v || v[0] == '\0')
+        return def;
+    return strcmp(v, "0") != 0;
+}
+
 bool_t rvviRefInit(const char *programPath)
 {
     gdb_attach_gate();
@@ -571,63 +623,37 @@ bool_t rvviRefInit(const char *programPath)
         return RVVI_FALSE;
     }
 
-    /* Read hot-path verbose gate once at init (default OFF).
-     * Enable with CV_RVVI_BRIDGE_VERBOSE=1.  Any non-"0" non-empty value
-     * enables logging so users can pass CV_RVVI_BRIDGE_VERBOSE=true too. */
-    {
-        const char *verbose_env = getenv("CV_RVVI_BRIDGE_VERBOSE");
-        g_bridge_verbose = (verbose_env != nullptr &&
-                            verbose_env[0] != '\0' &&
-                            strcmp(verbose_env, "0") != 0);
-    }
-
-    /* RVVI-TEXT emitter gate (default OFF). Same read-once pattern as above.
-     * Value is a target directory or "1" (cwd); the files are opened below. */
-    {
-        const char *rt_env = getenv("RVVI_TEXT_TRACE");
-        g_rvvi_text_enabled = (rt_env != nullptr &&
-                               rt_env[0] != '\0' &&
-                               strcmp(rt_env, "0") != 0);
-    }
-
-    /* PROFILING: read per-function profiling gate once at init (default OFF).
-     * Enable with CV_RVVI_BRIDGE_PROFILE=1 to accumulate ns counters per
-     * rvviRef* call. Results are dumped in the shutdown performance summary. */
-    {
-        const char *prof_env = getenv("CV_RVVI_BRIDGE_PROFILE");
-        g_bridge_profile = (prof_env != nullptr &&
-                            prof_env[0] != '\0' &&
-                            strcmp(prof_env, "0") != 0);
-    }
+    /* Read the boolean gates once at init.
+     * CV_RVVI_BRIDGE_VERBOSE: hot-path logging.
+     * RVVI_TEXT_TRACE: trace emitter; the value is also a target directory or
+     *   "1" (cwd), consumed at the file-open below.
+     * CV_RVVI_BRIDGE_PROFILE: per-function ns counters, dumped at shutdown. */
+    g_bridge_verbose    = env_flag("CV_RVVI_BRIDGE_VERBOSE", false);
+    g_rvvi_text_enabled = env_flag("RVVI_TEXT_TRACE", false);
+    g_bridge_profile    = env_flag("CV_RVVI_BRIDGE_PROFILE", false);
 
     BRIDGE_LOG("rvviRefInit: ELF=%s, config=%s",
                programPath ? programPath : "<null>", template_path);
 
     init_net_map();
 
-    /* Check if force-resync on IRQ traps is enabled.
-     * Default: enabled (1). Set GVSOC_FORCE_TRAP_CSR=0 to disable. */
-    {
-        const char *force_env = getenv("GVSOC_FORCE_TRAP_CSR");
-        g_force_trap_enabled = (!force_env || strcmp(force_env, "0") != 0);
-        BRIDGE_LOG("force-resync on IRQ traps (skip_irq): %s",
-                   g_force_trap_enabled ? "ENABLED" : "DISABLED");
-        /* Skip ISS IRQ checking only when force-resync is active, so that the
-         * ISS never takes interrupts on its own and is resynced to the DUT. */
-        gvsoc_engine_skip_irq(g_force_trap_enabled);
-    }
+    /* Force-resync on IRQ traps (default ON, GVSOC_FORCE_TRAP_CSR=0 disables).
+     * Skip ISS IRQ checking only when force-resync is active, so that the ISS
+     * never takes interrupts on its own and is resynced to the DUT. */
+    g_force_trap_enabled = env_flag("GVSOC_FORCE_TRAP_CSR", true);
+    BRIDGE_LOG("force-resync on IRQ traps (skip_irq): %s",
+               g_force_trap_enabled ? "ENABLED" : "DISABLED");
+    gvsoc_engine_skip_irq(g_force_trap_enabled);
 
-    /* Volatile-counter read sync.
-     * Default: enabled (1). Set CV_RVVI_VOLATILE_CSR_SYNC=0 to disable. */
-    {
-        const char *vs_env = getenv("CV_RVVI_VOLATILE_CSR_SYNC");
-        g_volatile_sync_enabled = (!vs_env || strcmp(vs_env, "0") != 0);
-        BRIDGE_LOG("volatile-counter read sync: %s",
-                   g_volatile_sync_enabled ? "ENABLED" : "DISABLED");
-    }
+    /* Volatile-counter read sync (default ON, CV_RVVI_VOLATILE_CSR_SYNC=0
+     * disables). */
+    g_volatile_sync_enabled = env_flag("CV_RVVI_VOLATILE_CSR_SYNC", true);
+    BRIDGE_LOG("volatile-counter read sync: %s",
+               g_volatile_sync_enabled ? "ENABLED" : "DISABLED");
 
-    /* Reset phase-shift re-alignment state for this run. */
-    g_dut_pc_prev         = 0;
+    /* Reset the retire lifecycle and diagnostic counters for this run. */
+    g_pending             = {};
+    g_retire              = {};
     g_phase_realign_count = 0;
     g_force_resync_count  = 0;
     g_volatile_sync_count = 0;
@@ -666,12 +692,10 @@ bool_t rvviRefInit(const char *programPath)
         std::string ref_rvvi = dir + "ref.rvvi";
         /* Close any handles left open by a previous rvviRefInit (multi-run vsim
          * session) so a re-init does not leak FILE*, and reset the flush counter
-         * plus the per-retire emitter state (write-set, DUT mode) so a re-init
-         * cannot start from a stale entry. */
-        if (g_rvvi_text_dut_fp) { fclose(g_rvvi_text_dut_fp); g_rvvi_text_dut_fp = nullptr; }
-        if (g_rvvi_text_ref_fp) { fclose(g_rvvi_text_ref_fp); g_rvvi_text_ref_fp = nullptr; }
+         * and DUT mode so a re-init cannot start from a stale entry (the retire
+         * lifecycle was already reset above). */
+        close_text_files();
         g_rvvi_text_count = 0;
-        g_dut_csr_written.clear();
         g_dut_mode = 0;
         std::string dut_rvvi;
         if (!g_rvvi_text_ref_only) {
@@ -683,8 +707,7 @@ bool_t rvviRefInit(const char *programPath)
         if (!dut_ok || !g_rvvi_text_ref_fp) {
             BRIDGE_ERR("cannot open RVVI-TEXT file(s) (%s%s%s) - disabling",
                        dut_rvvi.c_str(), dut_rvvi.empty() ? "" : " / ", ref_rvvi.c_str());
-            if (g_rvvi_text_dut_fp) { fclose(g_rvvi_text_dut_fp); g_rvvi_text_dut_fp = nullptr; }
-            if (g_rvvi_text_ref_fp) { fclose(g_rvvi_text_ref_fp); g_rvvi_text_ref_fp = nullptr; }
+            close_text_files();
             g_rvvi_text_enabled = false;
         } else {
             /* RVVI-TEXT v0.4 header via the shared formatter (params at file
@@ -720,8 +743,7 @@ bool_t rvviRefShutdown(void)
     /* Close the RVVI-TEXT files BEFORE any engine teardown: if the engine
      * shutdown wedges (see the abnormal-termination note in
      * gvsoc_engine_shutdown), the trace tails must already be on disk. */
-    if (g_rvvi_text_dut_fp) { fclose(g_rvvi_text_dut_fp); g_rvvi_text_dut_fp = nullptr; }
-    if (g_rvvi_text_ref_fp) { fclose(g_rvvi_text_ref_fp); g_rvvi_text_ref_fp = nullptr; }
+    close_text_files();
     if (!g_tmp_config_path.empty()) {
         remove(g_tmp_config_path.c_str());
         g_tmp_config_path.clear();
@@ -852,8 +874,8 @@ void rvviRefInjectIrq(uint32_t /*hartId*/, uint32_t mcause)
      *      normal code.
      * We use the DUT-PC-at-vector test (not a DUT-MIE test) because g_dut_csr
      * mirrors mstatus one delta-cycle late, which would miss a handler's mret and
-     * mis-fire on the next interrupt's pre-trap code.  g_dut_pc is this retire's
-     * DUT PC (set by rvviDutRetire, called by SV before this inject). */
+     * mis-fire on the next interrupt's pre-trap code.  g_retire.pc is this
+     * retire's DUT PC (committed by rvviDutRetire, called by SV before this). */
     uint32_t iss_mstatus = 0, mtvec = 0;
     gvsoc_engine_get_csr(TRAP_CSR_MSTATUS, &iss_mstatus);
     if (!((iss_mstatus >> 3) & 1u))
@@ -861,7 +883,7 @@ void rvviRefInjectIrq(uint32_t /*hartId*/, uint32_t mcause)
     gvsoc_engine_get_csr(CSR_MTVEC, &mtvec);
     uint32_t vbase = mtvec & ~(uint32_t)1u;
     uint32_t entry = (mtvec & 1u) ? (vbase + (uint32_t)irq_id * 4u) : vbase;
-    if (g_dut_pc != entry)
+    if (g_retire.pc != entry)
         return;                         /* DUT not at the trap vector -> not a genuine take */
 
     g_informed_irq_count++;
@@ -888,7 +910,7 @@ void rvviDutGprSet(uint32_t /*hartId*/, uint32_t gprIndex, uint64_t value)
 {
     if (gprIndex < 32) {
         g_dut_gpr[gprIndex] = (uint32_t)value;
-        g_dut_gprs_written_mask |= (1u << gprIndex);
+        g_pending.gpr_mask |= (1u << gprIndex);
     }
 }
 
@@ -896,21 +918,18 @@ void rvviDutFprSet(uint32_t /*hartId*/, uint32_t fprIndex, uint64_t value)
 {
     if (fprIndex < 32) {
         g_dut_fpr[fprIndex] = (uint32_t)value;
-        g_dut_fprs_written_mask |= (1u << fprIndex);
+        g_pending.fpr_mask |= (1u << fprIndex);
     }
 }
 
 void rvviDutCsrSet(uint32_t /*hartId*/, uint32_t csrIndex, uint64_t value)
 {
     g_dut_csr[csrIndex] = (uint32_t)value;
-    /* Record this retire's CSR write-set for the RVVI-TEXT emitter (off by
-     * default - no list growth when the emitter is disabled). Duplicates are
-     * fine (e.g. a trap: the generic csr_wb scan and rvvi_trace2api.sv's
-     * explicit trap-CSR push both report mstatus/mepc/mcause): the formatter
-     * emits one C token per address, and g_dut_csr above always holds the
-     * latest value. */
-    if (__builtin_expect(g_rvvi_text_enabled, 0))
-        g_dut_csr_written.push_back(csrIndex);
+    /* Duplicate pushes of one address in a retire are by design (a trap: the
+     * generic csr_wb scan and rvvi_trace2api.sv's explicit trap-CSR push both
+     * report mstatus/mepc/mcause); the RVVI-TEXT formatter deduplicates and
+     * the sticky mirror above always holds the latest value. */
+    g_pending.csr_writes.emplace_back(csrIndex, (uint32_t)value);
 }
 
 /* Custom extension, not part of the vendored RVVI API (declared inline in
@@ -950,8 +969,7 @@ void rvviDutRetire(uint32_t /*hartId*/, uint64_t dutPc,
 {
     PROF_SCOPE(g_prof_ns_dut_retire, g_prof_cnt_dut_retire);
     g_metric_retires++;
-    g_dut_is_trap = false;
-    record_dut_event(dutPc, dutInsBin, /*is_trap=*/false);
+    take_retire_event(dutPc, dutInsBin, /*is_trap=*/false);
     /* Do NOT clear g_pending_handler here: rvvi_trace2api calls rvviDutRetire
      * before rvviRefCsrsCompare, so the trap-CSR snapshot must stay active for
      * the comparison.  It is cleared in rvviRefCsrsCompare after consumption. */
@@ -961,8 +979,7 @@ void rvviDutTrap(uint32_t /*hartId*/, uint64_t dutPc, uint64_t dutInsBin)
 {
     g_metric_retires++;
     g_metric_traps++;
-    g_dut_is_trap = true;
-    record_dut_event(dutPc, dutInsBin, /*is_trap=*/true);
+    take_retire_event(dutPc, dutInsBin, /*is_trap=*/true);
 
     /* Snapshot the exception CSRs before the pipeline-flush retire (PC=0x0)
      * can corrupt them.  The sync bridge pushes these values into g_dut_csr
@@ -977,32 +994,14 @@ void rvviDutTrap(uint32_t /*hartId*/, uint64_t dutPc, uint64_t dutInsBin)
 
     /* RVVI-TEXT: a trap retire bypasses rvviRefRetireAndCompare (the SV batch
      * call is gated on !trap), so we emit its line HERE.  Per RVVI-TRACE a
-     * synchronous exception is a TRAP event: the faulting instruction does not
-     * retire its register writes (record_dut_event above zeroed g_dut_*_mask,
-     * so no X/F tokens) and the line carries the trap-entry CSRs
-     * (mstatus/mepc/mcause/mtval) the SV pushed before this call.  g_dut_is_trap
-     * is true -> the formatter prints TRAP.  The ref-side line uses DUT
-     * data (dut_side=true) because the ISS has not taken the trap yet at this
-     * seam (it consumes the faulting step only at the rvviRefEventStep that the
-     * SV calls next).  Emit BEFORE clearing the write-set so the CSRs are in. */
-    if (__builtin_expect(g_rvvi_text_enabled, 0)) {
-        /* DPI cannot propagate exceptions (would crash the simulator);
-         * emit_rvvi_text_line allocates (vector push_back).  Contain any throw
-         * and disable the best-effort trace rather than cross the DPI boundary. */
-        try {
-            emit_rvvi_text_line(g_rvvi_text_dut_fp, /*dut_side=*/true);
-            emit_rvvi_text_line(g_rvvi_text_ref_fp, /*dut_side=*/true);  /* DUT data at the trap seam */
-            g_dut_csr_written.clear();
-        } catch (const std::exception &e) {
-            BRIDGE_LOG("RVVI-TEXT: trap-line emit failed (%s) - disabling", e.what());
-            g_rvvi_text_enabled = false;
-            g_dut_csr_written.clear();
-        } catch (...) {
-            BRIDGE_LOG("RVVI-TEXT: trap-line emit failed (unknown) - disabling");
-            g_rvvi_text_enabled = false;
-            g_dut_csr_written.clear();
-        }
-    }
+     * synchronous exception is a TRAP event: the faulting instruction retires
+     * no register writes (RVFI flags none, so g_retire carries empty masks and
+     * no X/F tokens) and the line carries the trap-entry CSRs
+     * (mstatus/mepc/mcause/mtval) the SV pushed before this call.
+     * ref_from_dut: the ISS has not taken the trap yet at this seam (it
+     * consumes the faulting step only at the rvviRefEventStep the SV calls
+     * next), so the ref line is built from DUT data. */
+    emit_retire_lines(/*ref_from_dut=*/true);
 
     /* No force-resync here.  rvviDutTrap fires only for synchronous exceptions
      * (rvfi_trap=1); async interrupts do NOT set rvfi_trap and are handled by
@@ -1051,7 +1050,7 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
      * whether this is a new interrupt-take or a stuck WFI. */
     if ((rc == 1 || rc == 0) && g_force_trap_enabled) {
         uint32_t iss_pc = gvsoc_engine_get_pc();
-        if (iss_pc != g_dut_pc) {
+        if (iss_pc != g_retire.pc) {
             /* Detect a new interrupt-take: when the DUT takes an async IRQ,
              * mstatus.MIE goes 1->0 (saved to MPIE); with skip_irq_check the
              * ISS MIE stays 1.  This MIE divergence (DUT MIE=0, ISS MIE=1)
@@ -1081,14 +1080,14 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
                     BRIDGE_LOG_HOT("%s resync: ISS PC=0x%08x -> DUT PC=0x%08x "
                                    "(mcause=0x%08x, mstatus DUT=0x%08x ISS=0x%08x, resync #%llu)",
                                    is_wfi_stuck ? "WFI" : "IRQ",
-                                   iss_pc, g_dut_pc,
+                                   iss_pc, g_retire.pc,
                                    mc != g_dut_csr.end() ? mc->second : 0u,
                                    dut_mstatus, iss_mstatus,
                                    (unsigned long long)g_force_resync_count);
                 }
 
                 /* Force ISS PC to DUT handler entry */
-                gvsoc_engine_set_pc(g_dut_pc);
+                gvsoc_engine_set_pc(g_retire.pc);
 
                 /* Force trap CSRs from DUT state */
                 for (uint32_t addr : {TRAP_CSR_MEPC, TRAP_CSR_MCAUSE,
@@ -1122,8 +1121,8 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
                 }
 
                 /* Step the ISS from the forced PC so it actually retires the
-                 * instruction at g_dut_pc.  This keeps ISS and DUT at the same
-                 * retire count instead of leaving the ISS one step behind. */
+                 * instruction at g_retire.pc.  This keeps ISS and DUT at the
+                 * same retire count instead of leaving the ISS one step behind. */
                 rc = gvsoc_engine_step();
                 return (rc == 1) ? RVVI_TRUE : RVVI_FALSE;
             }
@@ -1136,25 +1135,25 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
      * models the trap entry as an extra ISS step, and the async-IRQ resync does
      * not trigger (both MIE are 0 for a sync trap).  Two adjacent forms:
      *
-     *  (a) Take-retire: the DUT reports the handler entry (g_dut_pc == handler)
-     *      with g_pending_handler set; the ISS only reached the trapping insn.
-     *      One more ISS step makes it take its own sync trap -- accepted only if
-     *      that step lands on g_dut_pc, so a real different-path divergence is
-     *      never masked.
+     *  (a) Take-retire: the DUT reports the handler entry (g_retire.pc ==
+     *      handler) with g_pending_handler set; the ISS only reached the
+     *      trapping insn.  One more ISS step makes it take its own sync trap --
+     *      accepted only if that step lands on g_retire.pc, so a real
+     *      different-path divergence is never masked.
      *  (b) Residual +1 lag: the ISS PC equals the DUT's PREVIOUS retire PC
-     *      (g_dut_pc_prev), provably one insn behind -> one catch-up step. */
+     *      (g_retire.pc_prev), provably one insn behind -> one catch-up step. */
     if (g_force_trap_enabled && rc == 1) {
         uint32_t iss_pc = gvsoc_engine_get_pc();
-        if (iss_pc != g_dut_pc && g_pending_handler) {
+        if (iss_pc != g_retire.pc && g_pending_handler) {
             /* (a) take-retire: let the ISS take its own sync trap, then confirm
              * it converged on the DUT handler entry before accepting. */
             int rc2 = gvsoc_engine_step();
             uint32_t iss_pc2 = gvsoc_engine_get_pc();
-            if (rc2 == 1 && iss_pc2 == g_dut_pc) {
+            if (rc2 == 1 && iss_pc2 == g_retire.pc) {
                 g_phase_realign_count++;
                 BRIDGE_LOG_HOT("phase-shift realign (trap-take): ISS 0x%08x -> 0x%08x "
                                "== DUT handler 0x%08x - catch-up step (#%llu)",
-                               iss_pc, iss_pc2, g_dut_pc,
+                               iss_pc, iss_pc2, g_retire.pc,
                                (unsigned long long)g_phase_realign_count);
             } else if (rc2 == 1) {
                 /* Extra step retired but did NOT converge on the DUT handler entry:
@@ -1163,16 +1162,16 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
                  * next compare will diverge).  rc=rc2 is preserved so the compare runs. */
                 BRIDGE_ERR("phase-shift realign: extra step ISS 0x%08x -> 0x%08x != "
                            "DUT 0x%08x (no convergence) -- possible 1-retire desync",
-                           iss_pc, iss_pc2, g_dut_pc);
+                           iss_pc, iss_pc2, g_retire.pc);
             }
             rc = rc2;
-        } else if (iss_pc != g_dut_pc && iss_pc == g_dut_pc_prev &&
-                   g_dut_pc_prev != 0) {
+        } else if (iss_pc != g_retire.pc && iss_pc == g_retire.pc_prev &&
+                   g_retire.pc_prev != 0) {
             /* (b) residual +1 lag on the same path. */
             g_phase_realign_count++;
             BRIDGE_LOG_HOT("phase-shift realign: ISS=0x%08x (==DUT_prev) one retire "
                            "behind DUT=0x%08x - catch-up step (#%llu)",
-                           iss_pc, g_dut_pc,
+                           iss_pc, g_retire.pc,
                            (unsigned long long)g_phase_realign_count);
             rc = gvsoc_engine_step();
         }
@@ -1202,7 +1201,7 @@ uint64_t rvviRefGprGet(uint32_t /*hartId*/, uint32_t gprIndex)
 
 uint32_t rvviRefGprsWrittenGet(uint32_t /*hartId*/)
 {
-    return g_dut_gprs_written_mask;
+    return g_retire.gpr_mask;
 }
 
 uint64_t rvviRefFprGet(uint32_t /*hartId*/, uint32_t fprIndex)
@@ -1236,20 +1235,14 @@ bool_t rvviRefPcCompare(uint32_t /*hartId*/)
         return RVVI_TRUE;
 
     g_metric_comparisons_pc++;
-    /* The TB checks the insbin comparison count in its final block but does
-     * not call rvviRefInsBinCompare.  Proxy-increment here, but only while
-     * InsBinCompare has never run, to avoid double-counting if the TB is later
-     * wired to call it. */
-    if (!g_insbin_compare_called)
-        g_metric_comparisons_insbin++;
     uint32_t iss_pc = gvsoc_engine_get_pc();
-    if (g_dut_pc != iss_pc) {
+    if (g_retire.pc != iss_pc) {
         g_metric_mismatches++;
         if (throttle_check(g_pc_mismatch_count, "PC")) {
             BRIDGE_ERR("PC mismatch #%llu @ retire #%llu: DUT=0x%08x ISS=0x%08x",
                        (unsigned long long)g_pc_mismatch_count,
                        (unsigned long long)g_metric_retires,
-                       g_dut_pc, iss_pc);
+                       g_retire.pc, iss_pc);
         }
         return RVVI_FALSE;
     }
@@ -1258,18 +1251,19 @@ bool_t rvviRefPcCompare(uint32_t /*hartId*/)
 
 bool_t rvviRefGprsCompare(uint32_t /*hartId*/)
 {
+    PROF_SCOPE(g_prof_ns_gpr_cmp, g_prof_cnt_gpr_cmp);
     if (!gvsoc_engine_is_running() || gvsoc_engine_finished())
         return RVVI_TRUE;
 
-    g_metric_comparisons_gpr++;
     bool_t pass = RVVI_TRUE;
     for (uint32_t i = 1; i < 32; i++) {
+        g_metric_comparisons_gpr++;
         uint32_t iss_val = gvsoc_engine_get_gpr(i);
         if (g_dut_gpr[i] != iss_val) {
             g_metric_mismatches++;
             if (throttle_check(g_gpr_mismatch_count, "GPR")) {
                 BRIDGE_ERR("GPR[x%u] mismatch @ retire #%llu: DUT=0x%08x ISS=0x%08x (PC=0x%08x)",
-                           i, (unsigned long long)g_metric_retires, g_dut_gpr[i], iss_val, g_dut_pc);
+                           i, (unsigned long long)g_metric_retires, g_dut_gpr[i], iss_val, g_retire.pc);
             }
             pass = RVVI_FALSE;
         }
@@ -1283,18 +1277,18 @@ bool_t rvviRefGprsCompareWritten(uint32_t /*hartId*/, bool_t ignX0)
     if (!gvsoc_engine_is_running() || gvsoc_engine_finished())
         return RVVI_TRUE;
 
-    g_metric_comparisons_gpr++;
     bool_t pass = RVVI_TRUE;
     uint32_t start = ignX0 ? 1 : 0;
     for (uint32_t i = start; i < 32; i++) {
-        if (!(g_dut_gprs_written_mask & (1u << i)))
+        if (!(g_retire.gpr_mask & (1u << i)))
             continue;
+        g_metric_comparisons_gpr++;
         uint32_t iss_val = gvsoc_engine_get_gpr(i);
         if (g_dut_gpr[i] != iss_val) {
             g_metric_mismatches++;
             if (throttle_check(g_gprw_mismatch_count, "GPR-written")) {
                 BRIDGE_ERR("GPR[x%u] mismatch (written) @ retire #%llu: DUT=0x%08x ISS=0x%08x (PC=0x%08x)",
-                           i, (unsigned long long)g_metric_retires, g_dut_gpr[i], iss_val, g_dut_pc);
+                           i, (unsigned long long)g_metric_retires, g_dut_gpr[i], iss_val, g_retire.pc);
             }
             pass = RVVI_FALSE;
         }
@@ -1308,18 +1302,18 @@ bool_t rvviRefFprsCompare(uint32_t hartId)
     if (!gvsoc_engine_is_running() || gvsoc_engine_finished() || !rvviRefFprsPresent(hartId))
         return RVVI_TRUE;
 
-    g_metric_comparisons_fpr++;
     bool_t pass = RVVI_TRUE;
     /* Only compare FPRs that were written this retire (mirrors the GPR logic) */
     for (uint32_t i = 0; i < 32; i++) {
-        if (!(g_dut_fprs_written_mask & (1u << i)))
+        if (!(g_retire.fpr_mask & (1u << i)))
             continue;
+        g_metric_comparisons_fpr++;
         uint32_t iss_val = gvsoc_engine_get_fpr(i);
         if (g_dut_fpr[i] != iss_val) {
             g_metric_mismatches++;
             if (throttle_check(g_fpr_mismatch_count, "FPR")) {
                 BRIDGE_ERR("FPR[f%u] mismatch @ retire #%llu: DUT=0x%08x ISS=0x%08x (PC=0x%08x)",
-                           i, (unsigned long long)g_metric_retires, g_dut_fpr[i], iss_val, g_dut_pc);
+                           i, (unsigned long long)g_metric_retires, g_dut_fpr[i], iss_val, g_retire.pc);
             }
             pass = RVVI_FALSE;
         }
@@ -1334,8 +1328,6 @@ bool_t rvviRefInsBinCompare(uint32_t /*hartId*/)
     if (!gvsoc_engine_is_running() || gvsoc_engine_finished())
         return RVVI_TRUE;
 
-    g_insbin_compare_called = true;  /* stop the proxy-increment in PcCompare */
-
     uint32_t iss_insn = gvsoc_engine_get_insn();
 
     g_metric_comparisons_insbin++;
@@ -1349,12 +1341,12 @@ bool_t rvviRefInsBinCompare(uint32_t /*hartId*/)
     /* Mask comparison to instruction size: RVC (compressed) instructions
      * are 16-bit, standard instructions are 32-bit.  RVC is identified
      * by bits [1:0] != 0b11. */
-    uint32_t mask = ((g_dut_insn & 0x3) != 0x3) ? 0x0000FFFF : 0xFFFFFFFF;
-    if ((g_dut_insn & mask) != (iss_insn & mask)) {
+    uint32_t mask = ((g_retire.insn & 0x3) != 0x3) ? 0x0000FFFF : 0xFFFFFFFF;
+    if ((g_retire.insn & mask) != (iss_insn & mask)) {
         g_metric_mismatches++;
         if (throttle_check(g_insn_mismatch_count, "INSN")) {
             BRIDGE_ERR("INSN mismatch @ retire #%llu: DUT=0x%08x ISS=0x%08x (PC=0x%08x)",
-                       (unsigned long long)g_metric_retires, g_dut_insn, iss_insn, g_dut_pc);
+                       (unsigned long long)g_metric_retires, g_retire.insn, iss_insn, g_retire.pc);
         }
         return RVVI_FALSE;
     }
@@ -1372,7 +1364,7 @@ bool_t rvviRefCsrCompare(uint32_t /*hartId*/, uint32_t csrIndex)
 
     /* On trap retires RVFI does not carry exception CSR updates in the same
      * cycle; skip them here.  They are compared at the handler retire. */
-    if (g_dut_is_trap && is_trap_csr(csrIndex))
+    if (g_retire.is_trap && is_trap_csr(csrIndex))
         return RVVI_TRUE;
 
     uint32_t iss_val = 0;
@@ -1411,7 +1403,7 @@ bool_t rvviRefCsrCompare(uint32_t /*hartId*/, uint32_t csrIndex)
         g_metric_mismatches++;
         if (throttle_check(g_csr_mismatch_count, "CSR")) {
             BRIDGE_ERR("CSR[0x%03x] mismatch @ retire #%llu: DUT=0x%08x ISS=0x%08x (PC=0x%08x)%s",
-                       csrIndex, (unsigned long long)g_metric_retires, dut_val, iss_val, g_dut_pc,
+                       csrIndex, (unsigned long long)g_metric_retires, dut_val, iss_val, g_retire.pc,
                        (g_pending_handler && is_trap_csr(csrIndex)) ? " [trap-snapshot]" : "");
         }
         return RVVI_FALSE;
@@ -1464,10 +1456,12 @@ bool_t rvviRefCsrSetVolatile(uint32_t /*hartId*/, uint32_t csrIndex)
     return RVVI_TRUE;
 }
 
+/* csrMask flags the VOLATILE bits (ImperasDV semantics: "mask of volatile
+ * bits" excluded from comparison), so the compare mask is its complement. */
 bool_t rvviRefCsrSetVolatileMask(uint32_t /*hartId*/, uint32_t csrIndex,
                                   uint64_t csrMask)
 {
-    g_csr_compare_mask[csrIndex] = csrMask;
+    g_csr_compare_mask[csrIndex] = ~csrMask;
     return RVVI_TRUE;
 }
 
@@ -1502,8 +1496,6 @@ void rvviRefFprSet(uint32_t /*hartId*/, uint32_t fprIndex, uint64_t fprValue)
 
 void     rvviRefVrSet(uint32_t /*hartId*/, uint32_t /*vrIndex*/,
                       uint32_t /*byteIndex*/, uint8_t /*data*/) {}
-void     rvviDutVrSet_ext(uint32_t /*hartId*/, uint32_t /*vrIndex*/,
-                          uint32_t /*byteIndex*/, uint8_t /*data*/) {}
 
 void rvviRefCsrSet(uint32_t /*hartId*/, uint32_t csrIndex, uint64_t value)
 {
@@ -1564,7 +1556,7 @@ static void sync_volatile_counter_read(void)
 {
     if (!g_volatile_sync_enabled)
         return;
-    uint32_t insn = g_dut_insn;
+    uint32_t insn = g_retire.insn;
     if ((insn & 0x7f) != 0x73)       /* SYSTEM opcode (CSR ops are never compressed) */
         return;
     uint32_t funct3 = (insn >> 12) & 0x7;
@@ -1574,7 +1566,7 @@ static void sync_volatile_counter_read(void)
     if (!csr_is_perf_counter(csr))
         return;
     uint32_t rd = (insn >> 7) & 0x1f;
-    if (rd == 0 || !(g_emit_gpr_mask & (1u << rd)))
+    if (rd == 0 || !(g_retire.gpr_mask & (1u << rd)))
         return;                      /* no rd write reported by the DUT */
     uint32_t iss_val = gvsoc_engine_get_gpr(rd);
     if (iss_val == g_dut_gpr[rd])
@@ -1583,32 +1575,33 @@ static void sync_volatile_counter_read(void)
     g_volatile_sync_count++;
     BRIDGE_LOG_HOT("volatile counter CSR[0x%03x] read @ PC=0x%08x: "
                    "x%u ISS=0x%08x -> DUT=0x%08x (sync #%llu)",
-                   csr, g_dut_pc, rd, iss_val, g_dut_gpr[rd],
+                   csr, g_retire.pc, rd, iss_val, g_dut_gpr[rd],
                    (unsigned long long)g_volatile_sync_count);
 }
 
 /* Batched DPI path - one SV->C crossing per retire instead of six.
- * Combines EventStep + PcCompare + GprsCompare + CsrsCompare + FprsCompare.
- * rvviDutRetire is NOT called here: rvvi_trace2api already invokes it
- * earlier in the retire flow (unconditionally, outside the USE_GVSOC ifdef);
- * calling it again would double-count g_metric_retires and duplicate
- * record_dut_event entries.
+ * Combines EventStep + PcCompare + GprsCompareWritten + CsrsCompare +
+ * FprsCompare + InsBinCompare.  rvviDutRetire is NOT called here:
+ * rvvi_trace2api already invokes it earlier in the retire flow
+ * (unconditionally, outside the USE_GVSOC ifdef); calling it again would
+ * double-count g_metric_retires and re-commit the retire event.
  *
  * Returns a bitmask:
- *   0x01=step ok, 0x02=pc, 0x04=gpr, 0x08=csr, 0x10=fpr, 0x20=runaway.
+ *   0x01=step ok, 0x02=pc, 0x04=gpr, 0x08=csr, 0x10=fpr, 0x20=runaway,
+ *   0x40=insn.
  * Each compare bit is set on PASS or when not applicable (e.g. fpr on a no-FPU
- * build), so the SV side can treat 0x1F as a clean retire.
- * 0x1F = full match, 0 = step failed. The 0x20 bit is set (in addition to
- * the compare bits) once the ISS runaway detector has latched: the ISS is
+ * build, insn when the ISS opcode is unavailable), so the SV side can treat
+ * 0x5F as a clean retire; 0 = step failed. The 0x20 bit is set (in addition
+ * to the compare bits) once the ISS runaway detector has latched: the ISS is
  * permanently diverged and stuck, so the SV side aborts with a clean FAIL
  * instead of letting the OS timeout reap the (crawling) simulation. We do
  * NOT call vpiFinish here - termination is left to the SV side so the test
  * surfaces a UVM-visible error (SIMULATION FAILED), not a silent finish.
  *
- * dutPc/dutInsn/debugMode are unused; kept for API symmetry with the SV import. */
+ * dutInsn/debugMode are unused; kept for API symmetry with the SV import. */
 int rvviRefRetireAndCompare(
     uint32_t /*hartId*/,
-    uint64_t /*dutPc*/,
+    uint64_t dutPc,
     uint32_t /*dutInsn*/,
     uint8_t  /*debugMode*/)
 {
@@ -1617,13 +1610,15 @@ int rvviRefRetireAndCompare(
     /* DPI boundary guard: a C++ exception must never cross into the simulator.
      * DPI cannot propagate exceptions, so catch everything and return 0. */
     try {
-        if (!rvviRefEventStep(hart_id)) {
-            /* Clear the per-retire CSR write-set even on the step-fail early
-             * return, so it never spills into the next retire. */
-            if (__builtin_expect(g_rvvi_text_enabled, 0))
-                g_dut_csr_written.clear();
+        /* Ordering-contract tripwire (see the retire-lifecycle comment above):
+         * the batch must run on the retire committed by rvviDutRetire. */
+        if (g_retire.pc != (uint32_t)dutPc &&
+            throttle_check(g_order_mismatch_count, "retire-ordering"))
+            BRIDGE_ERR("retire ordering broken: batch dutPc=0x%08llx but committed "
+                       "retire PC=0x%08x", (unsigned long long)dutPc, g_retire.pc);
+
+        if (!rvviRefEventStep(hart_id))
             return 0;
-        }
 
         int result = 0x01;  /* step OK */
         sync_volatile_counter_read();
@@ -1631,45 +1626,33 @@ int rvviRefRetireAndCompare(
         if (rvviRefGprsCompareWritten(hart_id, RVVI_TRUE))  result |= 0x04;
         if (rvviRefCsrsCompare(hart_id))                    result |= 0x08;
         if (rvviRefFprsCompare(hart_id))                    result |= 0x10;
+        if (rvviRefInsBinCompare(hart_id))                  result |= 0x40;
 
         /* Runaway: ISS permanently diverged and stuck. OR in the runaway
          * bit so the SV side aborts deterministically (clean FAIL) rather
          * than waiting for the OS timeout to reap a crawling sim. */
         if (gvsoc_engine_is_runaway())                      result |= 0x20;
 
-        /* RVVI-TEXT emit (off by default): one line per retire to each file,
-         * with the write-set CSRs collected this retire, then clear the list.
+        /* RVVI-TEXT emit (off by default): one line per retire to each file.
          * This is the last call of the retire, after all rvviDutCsrSet and
-         * rvviDutTrap, so the CSR set is complete for both normal and trap
-         * retires. */
-        if (__builtin_expect(g_rvvi_text_enabled, 0)) {
-            emit_rvvi_text_line(g_rvvi_text_dut_fp, /*dut_side=*/true);
-            emit_rvvi_text_line(g_rvvi_text_ref_fp, /*dut_side=*/false);
-            g_dut_csr_written.clear();
-            if ((++g_rvvi_text_count % 1000) == 0) {
-                /* dut_fp is null in ref-only mode; guard it like every
-                 * other site in this file (rvviRefInit/rvviRefShutdown) does --
-                 * fflush(NULL) is defined but flushes every open stream in the
-                 * process, a silent cross-.so side effect worth avoiding. */
-                if (g_rvvi_text_dut_fp) fflush(g_rvvi_text_dut_fp);
-                if (g_rvvi_text_ref_fp) fflush(g_rvvi_text_ref_fp);
-            }
+         * rvviDutTrap, so the write-set is complete. */
+        emit_retire_lines(/*ref_from_dut=*/false);
+        if (__builtin_expect(g_rvvi_text_enabled, 0) &&
+            (++g_rvvi_text_count % 1000) == 0) {
+            /* dut_fp is null in ref-only mode; guard it like every
+             * other site in this file (rvviRefInit/rvviRefShutdown) does --
+             * fflush(NULL) is defined but flushes every open stream in the
+             * process, a silent cross-.so side effect worth avoiding. */
+            if (g_rvvi_text_dut_fp) fflush(g_rvvi_text_dut_fp);
+            if (g_rvvi_text_ref_fp) fflush(g_rvvi_text_ref_fp);
         }
 
         return result;
     } catch (const std::exception &e) {
         BRIDGE_LOG("batched DPI: std::exception in rvviRefRetireAndCompare: %s", e.what());
-        /* Same containment as rvviDutTrap's catch: an exception here can only
-         * come from the RVVI-TEXT emit (the rest of this function doesn't
-         * allocate), so disable it and drop the write-set rather than risk a
-         * stale g_dut_csr_written spilling into the next retire's line. */
-        g_rvvi_text_enabled = false;
-        g_dut_csr_written.clear();
         return 0;
     } catch (...) {
         BRIDGE_LOG("batched DPI: unknown exception in rvviRefRetireAndCompare");
-        g_rvvi_text_enabled = false;
-        g_dut_csr_written.clear();
         return 0;
     }
 }
@@ -1689,15 +1672,6 @@ void setContextExtMemory(const char * /*func*/) {}
 /* ==========================================================================
  * SECTION 12 - RVVI API: sim-complete query
  * ========================================================================== */
-
-/* Called from SV to detect when to end the test gracefully after the ISS
- * exit device fires.  Two entry points with identical behaviour: the DPI
- * import name in the SV wrapper determines which is called at each site. */
-
-int rvviRefIsSimComplete(void)
-{
-    return gvsoc_engine_finished() ? 1 : 0;
-}
 
 /* Watchdog hook: SV-side polling entry point.
  * The SV watchdog calls this every 100us sim time; if it returns 1 the
