@@ -205,11 +205,6 @@ void gvsoc_engine_settle_irq(void);
  */
 int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id);
 
-/* ---- Configuration ---- */
-
-/** Set the clock period in picoseconds (default: 20000 = 50 MHz). */
-void gvsoc_engine_set_clock_period(int64_t period_ps);
-
 #ifdef __cplusplus
 }
 #endif

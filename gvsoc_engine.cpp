@@ -50,7 +50,22 @@
 #if !defined(CONFIG_GVSOC_ISS_CV32E40P)
 #error "gvsoc_engine.cpp requires CONFIG_GVSOC_ISS_CV32E40P=1 (see Makefile ISS_DEFINES)"
 #endif
+
+/* First line of defense on the ABI contract: if the ISS_DEFINES in the
+ * Makefile drift from the flags the model .so was built with, the Regfile
+ * layout is the first thing to move (ISS_SINGLE_REGFILE alone shrinks it
+ * 1592 -> 944 bytes). Catch the drift at compile time; the runtime canary in
+ * engine_acquire_core() catches what a same-size skew would still hide. */
+#ifdef ISS_SINGLE_REGFILE
+static_assert(sizeof(Regfile) == 944,
+              "Regfile layout drifted from the ISS_DEFINES contract (see Makefile)");
+#else
+static_assert(sizeof(Regfile) == 1592,
+              "Regfile layout drifted from the ISS_DEFINES contract (see Makefile)");
+#endif
+
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <unordered_map>
@@ -67,11 +82,15 @@
  * GVSOC engine global state
  * ---------------------------------------------------------------------- */
 
+/* Global because gvsoc_new(&g_conf) keeps the pointer for the engine's
+ * lifetime: the configuration must outlive the call. */
 static gv::GvsocConf  g_conf;
 static gv::Gvsoc     *g_gvsoc      = nullptr;
 static bool           g_running     = false;
 static bool           g_finished    = false;
-static int64_t        g_clock_ps    = 20000;  /* clock period, 20ns = 50 MHz */
+/* Clock period of the cv32e40p-standalone platform (50 MHz), a constant of
+ * the model: it must match the platform definition, not a runtime knob. */
+static constexpr int64_t g_clock_ps = 20000;
 
 static IssWrapper    *g_wrapper     = nullptr;
 
@@ -80,10 +99,14 @@ static IssWrapper    *g_wrapper     = nullptr;
 static std::unordered_map<uint32_t, iss_reg_t *> g_csr_value_map;
 
 /* Stepping state */
-static uint64_t      g_step_count    = 0;
+static uint64_t      g_retire_count  = 0;
 static iss_reg_t     g_retired_pc    = 0;  /* PC of last retired instruction */
 static uint32_t      g_retired_opcode = 0; /* always 0: opcode not captured in DPI mode */
-static FILE         *g_iss_trace_fp  = nullptr;  /* ISS-side trace file */
+static FILE         *g_iss_trace_fp  = nullptr;  /* opt-in, env GVSOC_RVVI_ISS_TRACE */
+
+/* When set, re-assert exec.skip_irq_check before every step(): the ISS
+ * slow handler clears it after one use. */
+static bool g_dpi_skip_irq = false;
 
 /* --------------------------------------------------------------------------
  * Runaway detector (DPI co-sim only)
@@ -161,11 +184,9 @@ static void build_csr_map(Csr &csr)
     g_csr_value_map[0x7A1] = &csr.tdata1.value;     /* tdata1 */
     g_csr_value_map[0x7A2] = &csr.tdata2.value;     /* tdata2 */
     g_csr_value_map[0x7A3] = &csr.tdata3.value;     /* tdata3 */
-#if defined(CONFIG_GVSOC_ISS_CV32E40P)
     /* tinfo is CV32E40P-specific; cast to Cv32e40pCsr to access it */
     Cv32e40pCsr &cv32_csr = static_cast<Cv32e40pCsr &>(csr);
     g_csr_value_map[0x7A4] = &cv32_csr.tinfo.value;      /* tinfo */
-#endif
 
     /* Debug CSRs - dcsr/depc are raw iss_reg_t, not CsrReg */
     g_csr_value_map[0x7B0] = &csr.dcsr;             /* dcsr */
@@ -191,17 +212,9 @@ static void build_csr_map(Csr &csr)
     g_csr_value_map[0x742] = &csr.mncause.value;    /* mncause */
     g_csr_value_map[0x744] = &csr.mnstatus.value;   /* mnstatus */
 
-    /* Supervisor CSRs - unused on CV32E40P, mapped for completeness */
-    g_csr_value_map[0x100] = &csr.sstatus.value;
-    g_csr_value_map[0x104] = &csr.sie.value;
-    g_csr_value_map[0x105] = &csr.stvec.value;
-    g_csr_value_map[0x106] = &csr.scounteren.value;
-    g_csr_value_map[0x140] = &csr.sscratch.value;
-    g_csr_value_map[0x141] = &csr.sepc.value;
-    g_csr_value_map[0x142] = &csr.scause.value;
-    g_csr_value_map[0x143] = &csr.stval.value;
-    g_csr_value_map[0x144] = &csr.sip.value;
-    g_csr_value_map[0x180] = &csr.satp.value;
+    /* Supervisor and vector CSRs are deliberately NOT mapped: CV32E40P has
+     * neither, nothing reads them through this bridge, and every mapped
+     * pointer is reach-in ABI surface to keep at zero benefit. */
 
     /* mhpmcounter3..31 (addresses 0xB03..0xB1F) */
     for (int i = 0; i < 29; i++)
@@ -217,22 +230,11 @@ static void build_csr_map(Csr &csr)
     }
 #endif
 
-#if defined(CONFIG_GVSOC_ISS_CV32E40P)
     /* mhpmevent3..31 (addresses 0x323..0x33F) */
     for (int i = 0; i < 29; i++)
     {
         g_csr_value_map[0x323 + i] = &csr.mhpmevent[i].value;
     }
-#endif
-
-    /* Vector CSRs */
-    g_csr_value_map[0x008] = &csr.vstart.value;
-    g_csr_value_map[0x009] = &csr.vxstat.value;
-    g_csr_value_map[0x00A] = &csr.vxrm.value;
-    g_csr_value_map[0x00F] = &csr.vcsr.value;
-    g_csr_value_map[0xC20] = &csr.vl.value;
-    g_csr_value_map[0xC21] = &csr.vtype.value;
-    g_csr_value_map[0xC22] = &csr.vlenb.value;
 
     ENGINE_LOG("CSR map built: %zu entries", g_csr_value_map.size());
 }
@@ -241,6 +243,23 @@ static void build_csr_map(Csr &csr)
  * Lifecycle - sub-functions for gvsoc_engine_init()
  * ---------------------------------------------------------------------- */
 
+/* Invoke a GVSOC API call, logging any exception without propagating.
+ * The checked variant reports whether the call completed. */
+template<typename Fn>
+static bool engine_call_checked(const char *name, Fn fn)
+{
+    try { fn(); return true; }
+    catch (const std::exception &e) { ENGINE_ERR("%s threw: %s", name, e.what()); }
+    catch (...)                      { ENGINE_ERR("%s threw unknown exception", name); }
+    return false;
+}
+
+template<typename Fn>
+static void engine_call_safe(const char *name, Fn fn)
+{
+    (void)engine_call_checked(name, fn);
+}
+
 /* Create GVSOC engine instance and bind callbacks.
  * Returns 0 on success, -1 on failure. */
 static int engine_create(const char *config_path)
@@ -248,20 +267,8 @@ static int engine_create(const char *config_path)
     g_conf.config_path = config_path;
     g_conf.api_mode    = gv::Api_mode_sync;
 
-    try
-    {
-        g_gvsoc = gv::gvsoc_new(&g_conf);
-    }
-    catch (const std::exception &e)
-    {
-        ENGINE_ERR("gvsoc_new() threw: %s", e.what());
+    if (!engine_call_checked("gvsoc_new", [](){ g_gvsoc = gv::gvsoc_new(&g_conf); }))
         return -1;
-    }
-    catch (...)
-    {
-        ENGINE_ERR("gvsoc_new() threw unknown exception");
-        return -1;
-    }
 
     if (!g_gvsoc)
     {
@@ -277,33 +284,9 @@ static int engine_create(const char *config_path)
  * Returns 0 on success, -1 on failure. */
 static int engine_open_and_start(void)
 {
-    try { g_gvsoc->open(); }
-    catch (const std::exception &e)
+    if (!engine_call_checked("open",  [](){ g_gvsoc->open();  }) ||
+        !engine_call_checked("start", [](){ g_gvsoc->start(); }))
     {
-        ENGINE_ERR("open() threw: %s", e.what());
-        g_gvsoc->close();
-        g_gvsoc = nullptr;
-        return -1;
-    }
-    catch (...)
-    {
-        ENGINE_ERR("open() threw unknown exception");
-        g_gvsoc->close();
-        g_gvsoc = nullptr;
-        return -1;
-    }
-
-    try { g_gvsoc->start(); }
-    catch (const std::exception &e)
-    {
-        ENGINE_ERR("start() threw: %s", e.what());
-        g_gvsoc->close();
-        g_gvsoc = nullptr;
-        return -1;
-    }
-    catch (...)
-    {
-        ENGINE_ERR("start() threw unknown exception");
         g_gvsoc->close();
         g_gvsoc = nullptr;
         return -1;
@@ -313,22 +296,44 @@ static int engine_open_and_start(void)
     return 0;
 }
 
+/* Layout canary: read back, through the reach-in pointer map, values that are
+ * known by construction right after reset. If the model .so was built with
+ * different structure-affecting flags than this file, these pointers land on
+ * the wrong fields and the mismatch surfaces here as a readable init error
+ * instead of a silent divergence (or a SIGSEGV) later.
+ * Returns 0 on success, -1 on mismatch. */
+static int engine_layout_canary(void)
+{
+    static const struct { uint32_t addr; uint32_t expect; const char *name; } checks[] = {
+        { 0xF11, 0x00000602, "mvendorid" },  /* OpenHW JEDEC, config reset value */
+        { 0xF12, 0x00000004, "marchid"   },  /* CV32E40P architecture id */
+        { 0x7B0, 0x40000003, "dcsr"      },  /* xdebugver=4, prv=M, Cv32e40pCsr::reset() */
+        { 0x300, 0x00001800, "mstatus"   },  /* forced above: checks the write+read round trip */
+    };
+    for (const auto &c : checks)
+    {
+        uint32_t got = 0;
+        if (!gvsoc_engine_get_csr(c.addr, &got) || got != c.expect)
+        {
+            ENGINE_ERR("layout canary FAILED on %s (0x%03x): read 0x%08x, expected 0x%08x - "
+                       "the bridge and the ISS model .so disagree on struct layout "
+                       "(ISS_DEFINES drift? see Makefile ABI contract)",
+                       c.name, c.addr, got, c.expect);
+            return -1;
+        }
+    }
+    ENGINE_LOG("layout canary OK (mvendorid/marchid/dcsr/mstatus)");
+    return 0;
+}
+
 /* Acquire the ISS core component and build CSR map.
  * Returns 0 on success, -1 on failure. */
 static int engine_acquire_core(void)
 {
     void *comp = nullptr;
-    try { comp = g_gvsoc->get_component("soc/core"); }
-    catch (const std::exception &e)
-    {
-        ENGINE_ERR("get_component() threw: %s", e.what());
+    if (!engine_call_checked("get_component",
+                             [&](){ comp = g_gvsoc->get_component("soc/core"); }))
         return -1;
-    }
-    catch (...)
-    {
-        ENGINE_ERR("get_component() threw unknown exception");
-        return -1;
-    }
 
     if (!comp)
     {
@@ -374,7 +379,8 @@ static int engine_acquire_core(void)
 
     ENGINE_LOG("initial PC=0x%08x",
                (unsigned)g_wrapper->iss.exec.current_insn);
-    return 0;
+
+    return engine_layout_canary();
 }
 
 /* --------------------------------------------------------------------------
@@ -411,15 +417,20 @@ int gvsoc_engine_init(const char *config_path)
         return -1;
     }
 
-    /* Open ISS trace file for offline comparison */
-    char trace_path[256] = {0};
-    snprintf(trace_path, sizeof(trace_path), "/tmp/iss_trace_%d.log",
-             (int)getpid());
-    g_iss_trace_fp = fopen(trace_path, "w");
-    if (g_iss_trace_fp)
-        ENGINE_LOG("ISS trace -> %s", trace_path);
+    /* Opt-in ISS-side PC trace for offline comparison. Off by default: an
+     * always-on trace leaves an orphan file per run and costs one fprintf
+     * per retire that nobody reads. */
+    const char *trace_env = getenv("GVSOC_RVVI_ISS_TRACE");
+    if (trace_env && trace_env[0] != '\0' && strcmp(trace_env, "0") != 0)
+    {
+        g_iss_trace_fp = fopen(trace_env, "w");
+        if (g_iss_trace_fp)
+            ENGINE_LOG("ISS trace -> %s", trace_env);
+        else
+            ENGINE_ERR("cannot open ISS trace file '%s'", trace_env);
+    }
 
-    g_step_count    = 0;
+    g_retire_count  = 0;
     g_retired_pc    = 0;
     g_retired_opcode = 0;
     g_running       = true;
@@ -436,15 +447,6 @@ int gvsoc_engine_init(const char *config_path)
 
     ENGINE_LOG("initialized OK");
     return 0;
-}
-
-/* Helper: invoke a GVSOC API call, logging any exception without propagating. */
-template<typename Fn>
-static void engine_call_safe(const char *name, Fn fn)
-{
-    try { fn(); }
-    catch (const std::exception &e) { ENGINE_ERR("%s threw: %s", name, e.what()); }
-    catch (...)                      { ENGINE_ERR("%s threw unknown exception", name); }
 }
 
 void gvsoc_engine_shutdown(void)
@@ -511,9 +513,33 @@ bool gvsoc_engine_is_running(void)
 
 static constexpr int STEP_MAX_CYCLES         = 2000; /* max stall cycles before timeout */
 
-/* When set, re-assert exec.skip_irq_check before every step(): the ISS
- * slow handler clears it after one use. */
-static bool g_dpi_skip_irq = false;
+/* Commit one retire: record the retired PC, bump the counter, log the first
+ * retires, feed the opt-in trace, reset the runaway detector. Shared by the
+ * two retire paths of the step loop (PC-changed and branch-to-self). */
+static void retire_commit(iss_reg_t retired_pc, const char *how, int cycles)
+{
+    g_retired_pc     = retired_pc;
+    g_retired_opcode = 0;  /* no opcode captured in DPI mode */
+    g_retire_count++;
+
+    if (g_retire_count <= 25)
+    {
+        ENGINE_LOG("retire #%llu: PC 0x%08x %s (cycles=%d)",
+                   (unsigned long long)g_retire_count,
+                   (unsigned)retired_pc, how, cycles);
+    }
+
+    if (g_iss_trace_fp)
+    {
+        fprintf(g_iss_trace_fp, "0x%08x\n", (unsigned)retired_pc);
+        if ((g_retire_count % 1000) == 0)
+            fflush(g_iss_trace_fp);
+    }
+
+    /* Clean retire: the ISS is making forward progress, not a runaway. */
+    g_runaway_count      = 0;
+    g_runaway_last_valid = false;
+}
 
 int gvsoc_engine_step(void)
 {
@@ -533,15 +559,10 @@ int gvsoc_engine_step(void)
 
     try
     {
-        bool saw_stall_zero = false;   /* stall_cycles was 0 at some point */
         for (int i = 0; i < STEP_MAX_CYCLES && !g_finished; i++)
         {
             iss_reg_t pre_pc = g_wrapper->iss.exec.current_insn;
             int64_t pre_stall = g_wrapper->iss.exec.stall_cycles;
-
-            /* stall_cycles reached 0 - the next step could execute an insn */
-            if (pre_stall == 0)
-                saw_stall_zero = true;
 
             /* Re-assert skip_irq_check before every step.
              * The ISS slow handler clears it after one use. */
@@ -553,68 +574,17 @@ int gvsoc_engine_step(void)
 
             if (post_pc != pre_pc)
             {
-                g_retired_pc = pre_pc;
-                g_retired_opcode = 0;  /* no opcode captured in DPI mode */
-                g_step_count++;
-
-                /* Log first 25 retires for diagnostic */
-                if (g_step_count <= 25)
-                {
-                    ENGINE_LOG("step #%llu: PC 0x%08x -> 0x%08x (cycles=%d)",
-                               (unsigned long long)g_step_count,
-                               (unsigned)g_retired_pc,
-                               (unsigned)post_pc,
-                               i + 1);
-                }
-
-                /* Write ISS trace file for offline comparison */
-                if (g_iss_trace_fp) {
-                    fprintf(g_iss_trace_fp, "0x%08x\n", (unsigned)g_retired_pc);
-                    if ((g_step_count % 1000) == 0)
-                        fflush(g_iss_trace_fp);
-                }
-
-                /* Clean retire: the ISS is making forward progress, so this
-                 * is not a runaway. Reset the consecutive-timeout counter. */
-                g_runaway_count = 0;
-                g_runaway_last_valid = false;
-
-                return 1;  /* One instruction retired */
+                retire_commit(pre_pc, "retired", i + 1);
+                return 1;
             }
 
             /* Branch-to-self: stall_cycles was 0 before step() and is >0 after
              * (branch penalty), with PC unchanged. */
             int64_t post_stall = g_wrapper->iss.exec.stall_cycles;
-            if (post_pc == pre_pc && saw_stall_zero && pre_stall == 0 && post_stall > 0)
+            if (pre_stall == 0 && post_stall > 0)
             {
-                g_retired_pc = pre_pc;
-                g_retired_opcode = 0;
-                g_step_count++;
-
-                if (g_step_count <= 25)
-                {
-                    ENGINE_LOG("step #%llu: PC 0x%08x branch-to-self (stall 0->%lld, cycles=%d)",
-                               (unsigned long long)g_step_count,
-                               (unsigned)g_retired_pc,
-                               (long long)post_stall,
-                               i + 1);
-                }
-
-                if (g_iss_trace_fp) {
-                    fprintf(g_iss_trace_fp, "0x%08x\n", (unsigned)g_retired_pc);
-                    if ((g_step_count % 1000) == 0)
-                        fflush(g_iss_trace_fp);
-                }
-
-                /* Reset for next iteration of branch-to-self */
-                saw_stall_zero = false;
-
-                /* Clean retire (branch-to-self): forward progress, reset
-                 * the runaway counter. */
-                g_runaway_count = 0;
-                g_runaway_last_valid = false;
-
-                return 1;  /* Branch-to-self retired */
+                retire_commit(pre_pc, "branch-to-self", i + 1);
+                return 1;
             }
         }
     }
@@ -637,10 +607,10 @@ int gvsoc_engine_step(void)
     if (timeout_log_count <= 5)
     {
         ENGINE_ERR("step TIMEOUT: no retire after %d cycles "
-                   "(step #%llu, PC=0x%08x, stall_cycles=%lld, stalled=%d, "
+                   "(retire #%llu, PC=0x%08x, stall_cycles=%lld, stalled=%d, "
                    "wfi=%d)",
                    STEP_MAX_CYCLES,
-                   (unsigned long long)g_step_count,
+                   (unsigned long long)g_retire_count,
                    (unsigned)g_wrapper->iss.exec.current_insn,
                    (long long)g_wrapper->iss.exec.stall_cycles,
                    (int)g_wrapper->iss.exec.stalled.get(),
@@ -668,11 +638,11 @@ int gvsoc_engine_step(void)
             {
                 g_runaway = true;  /* sticky */
                 ENGINE_ERR("RUNAWAY detected: %d consecutive stuck-PC timeouts "
-                           "(PC=0x%08x, step #%llu) - ISS diverged and stuck, "
+                           "(PC=0x%08x, retire #%llu) - ISS diverged and stuck, "
                            "signalling bridge to abort",
                            g_runaway_count,
                            (unsigned)now_pc,
-                           (unsigned long long)g_step_count);
+                           (unsigned long long)g_retire_count);
             }
         }
         else
@@ -951,15 +921,22 @@ void gvsoc_engine_set_irq(uint64_t net_index, int value)
         if (irq_log_count == 20)
             ENGINE_LOG("(suppressing further IRQ log messages)");
 
-        /* Mark settle needed only when asserting new bits (not on deassert) */
-        if (new_mip > old_mip)
+        /* Mark settle needed only when asserting new bits (not on deassert).
+         * Bitwise, not arithmetic: a simultaneous clear of a high bit and
+         * assert of a low one lowers the numeric value but still needs the
+         * settle. */
+        if (new_mip & ~old_mip)
             g_irq_pending_settle = true;
     }
 }
 
-/* Run up to 4 drain clock cycles after an mip assertion, letting the
+/* Drain cycles granted to the pre-fetch IRQ guard after an mip assertion,
+ * before the next gvsoc_engine_step() loop. */
+static constexpr int SETTLE_DRAIN_CYCLES = 4;
+
+/* Run up to SETTLE_DRAIN_CYCLES after an mip assertion, letting the
  * pre-fetch IRQ guard fire before the next gvsoc_engine_step() loop.
- * Does NOT count as a retire (g_step_count is unchanged). If the IRQ is
+ * Does NOT count as a retire (g_retire_count is unchanged). If the IRQ is
  * taken during the drain, g_retired_pc is set to the trapped instruction's
  * PC so the next step() returns the handler entry as the next retire.
  * Safe to call with no settle pending (returns immediately). */
@@ -977,12 +954,8 @@ void gvsoc_engine_settle_irq(void)
 
     iss_reg_t settle_start_pc = g_wrapper->iss.exec.current_insn;
 
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < SETTLE_DRAIN_CYCLES; i++)
     {
-        /* Re-assert skip_irq_check before every settle step */
-        if (g_dpi_skip_irq && g_wrapper)
-            g_wrapper->iss.exec.skip_irq_check = true;
-
         g_gvsoc->step(g_clock_ps);
 
         if (g_finished)
@@ -1002,7 +975,8 @@ void gvsoc_engine_settle_irq(void)
 
     /* No PC change: IRQ masked (mstatus.MIE=0) or pending for next fetch;
      * gvsoc_engine_step() will catch it at the pre-fetch guard. */
-    ENGINE_LOG("settle_irq: 4 drain cycles, no PC change (IRQ pending or masked)");
+    ENGINE_LOG("settle_irq: %d drain cycles, no PC change (IRQ pending or masked)",
+               SETTLE_DRAIN_CYCLES);
 }
 
 /* --------------------------------------------------------------------------
@@ -1078,12 +1052,3 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
     return rc;
 }
 
-/* --------------------------------------------------------------------------
- * Configuration
- * ---------------------------------------------------------------------- */
-
-void gvsoc_engine_set_clock_period(int64_t period_ps)
-{
-    if (period_ps > 0)
-        g_clock_ps = period_ps;
-}
