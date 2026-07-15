@@ -53,6 +53,7 @@ All commands from `cv32e40p/sim/uvmt/` in the core-v-verif tree.
 | RVVI-TEXT traces (RTL-only / bridge / dual) | see the "How to run" section of [`RVVI_TEXT_TRACING.md`](RVVI_TEXT_TRACING.md) |
 | Conformance-check a produced trace | `make check-rvvi RVVI_TRACE_DIR=<dir>` |
 | Formatter unit tests (no license needed) | `micromamba run -n gvsoc_env_3_12 make -C vendor_lib/gvsoc_rvvi test` |
+| Full validation matrix (unit + one lane per coverage axis) | `vendor_lib/gvsoc_rvvi/test/validation_matrix.sh [out-dir]` |
 
 A few things that save time:
 
