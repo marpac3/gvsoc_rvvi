@@ -4,12 +4,12 @@ How to run gdb on the bridge (`rvvi_api2gvsoc.cpp`), on the engine wrapper
 (`gvsoc_engine.cpp`) or on GVSOC itself while a `USE_ISS=YES ISS=GVSOC` test
 is running.
 
-Everything runs **in the simulator process**: Questa loads
-`libgvsoc_rvvi.so`, which links the GVSOC libraries (`libpulpvp.so`, the ISS
-model `.so`). So the debug story is: build with symbols, attach gdb to the
-running `vsim`, set breakpoints anywhere in that stack.
+Everything runs in the simulator process: Questa loads `libgvsoc_rvvi.so`,
+which links the GVSOC libraries (`libpulpvp.so`, the ISS model `.so`). So
+the debug story is: build with symbols, attach gdb to the running `vsim`,
+set breakpoints anywhere in that stack.
 
-## 1. Build with symbols
+## Build with symbols
 
 Bridge + engine wrapper (fast, ABI-compatible with the installed GVSOC —
 see the note in the Makefile):
@@ -29,7 +29,7 @@ make clean && make DEBUG=1        # rebuild the bridge against it
 When done, restore the optimized builds: `make clean && make` (and
 `make gvsoc` if GVSOC was rebuilt).
 
-## 2. Attach gdb: the `GVSOC_RVVI_GDB_WAIT` gate
+## Attach gdb: the `GVSOC_RVVI_GDB_WAIT` gate
 
 The bridge pauses at the very start of `rvviRefInit` when
 `GVSOC_RVVI_GDB_WAIT=<seconds>` is set, and prints the PID to attach to:
@@ -63,7 +63,7 @@ The gate detects the attach and raises `SIGTRAP`: gdb stops inside
 If the timeout expires with no debugger, the run continues normally — a
 leftover `GVSOC_RVVI_GDB_WAIT` in a batch run costs at most the timeout.
 
-## 3. Breakpoints that pay off
+## Breakpoints that pay off
 
 | Symbol | Stops |
 |--------|-------|
@@ -85,7 +85,7 @@ Conditional breakpoints keyed on the divergence PC are the usual workflow:
 (gdb) break gvsoc_engine_step if gvsoc_engine_get_pc() == 0x1a2c
 ```
 
-## 4. Runtime knobs (no debugger needed)
+## Runtime knobs (no debugger needed)
 
 All read once in `rvviRefInit`:
 
@@ -100,7 +100,7 @@ All read once in `rvviRefInit`:
 For behavioural (not source-level) ISS analysis, the standalone path avoids
 Questa entirely: `make trace BINARY=<elf>` produces the instruction trace.
 
-## 5. VS Code
+## VS Code
 
 `Attach to Process` on `vsim`, with the repo as workspace:
 
@@ -118,85 +118,76 @@ Questa entirely: `make trace BINARY=<elf>` produces the instruction trace.
 Launch the test with `GVSOC_RVVI_GDB_WAIT=300`, pick the `vsimk` process,
 then set breakpoints from the editor and continue.
 
-## 6. Questa's native C Debug (`cdbg`) — known limitations
+## Questa's native C Debug (`cdbg`)
 
-Questa ships a GUI-integrated C/C++ debugger (`Tools > C Debug` in the
-Visualizer/vsim GUI, backed by the `cdbg` Tcl command family and an
-attached gdb). It was evaluated as an alternative to the attach gate above;
-here is what actually works and what does not, verified by driving `vsim
--gui` headlessly under Xvfb with scripted `-do` commands (not just read from
-the manual).
+Questa ships a GUI-integrated C/C++ debugger (`Tools > C Debug`, backed by
+the `cdbg` Tcl command family and an attached gdb). We tried it as an
+alternative to the attach gate above, driving `vsim -gui` headlessly under
+Xvfb with scripted `-do` commands. Short version: on this Questa/host
+combination it never actually stops at a DPI-C breakpoint — use the attach
+gate. What follows is the trail, for whoever picks this up again.
 
-**Setup, once per session:**
+Setup, once per session:
 
 ```tcl
-cdbg set_debugger <path-to-gdb>   # any gdb works; the one Questa ships and
-                                   # tests against is
-                                   # $QUESTA_HOME/linux_x86_64/external/gdb-102
+cdbg set_debugger <path-to-gdb>   # any gdb; the one Questa ships and tests
+                                  # against is
+                                  # $QUESTA_HOME/linux_x86_64/external/gdb-102
 cdbg debug_on
 ```
 
-**Breakpoint syntax.** In the vsim Transcript / `-do` script, C breakpoints
-require the `-c` flag — this is easy to get wrong:
+C breakpoints need the `-c` flag, which is easy to get wrong:
 
 ```tcl
 bp -c rvviRefRetireAndCompare      # by function name
 bp -c gvsoc_engine.cpp 500         # by file:line
 ```
 
-`bp gvsoc_engine.cpp 500` (no `-c`) is parsed as an **HDL** breakpoint and
-fails with `vsim-3325: Cannot find a reference to source file`. A bare
-gdb-style `break gvsoc_engine.cpp:500` is not a vsim Transcript command at
-all.
+`bp gvsoc_engine.cpp 500` (no `-c`) is parsed as an HDL breakpoint and fails
+with `vsim-3325: Cannot find a reference to source file`; a gdb-style
+`break gvsoc_engine.cpp:500` is not a vsim command at all.
 
-**Step-into from SV does not reach DPI-C.** Auto Step Mode / Auto Find bp
-(the mechanism that lets you step from a `.sv` call site straight into the
-C implementation) only recognizes **PLI/VPI/FLI-registered** function
-calls, not plain `import "DPI-C"` imports — confirmed in the Questa User's
-Manual (`Contain_IdentifyingAllRegisteredFunctionCalls`). Stepping from
-`rvvi_trace2api.sv:196` (the `rvviRefRetireAndCompare(...)` call) into
-`gvsoc_engine.cpp` will not auto-descend, regardless of debug info. Set the
-breakpoint explicitly with `bp -c` instead.
+Stepping from SV into DPI-C does not work either. Auto Step Mode / Auto Find
+bp — the mechanism that descends from a `.sv` call site into the C
+implementation — only recognizes PLI/VPI/FLI-registered function calls, not
+plain `import "DPI-C"` imports (Questa User's Manual,
+`Contain_IdentifyingAllRegisteredFunctionCalls`). Stepping from the
+`rvviRefRetireAndCompare(...)` call in `rvvi_trace2api.sv` will not
+auto-descend into `gvsoc_engine.cpp`, regardless of debug info; the
+breakpoint has to be set explicitly with `bp -c`.
 
-**`-batch`/`-c` (console) mode cannot run C Debug at all.** `cdbg debug_on`
-depends on a GUI-session-only Tcl variable
-(`vsimPriv(is_kernel_running_on_valgrind)`) that is only populated by the
-interactive GUI kernel init path. In `-batch`/`-c` mode it throws `can't
-read "vsimPriv(is_kernel_running_on_valgrind)"`, and any subsequent `bp -c`
-fails with `C breakpoints are not supported with QIS_DEFAULT` — that
-QIS_DEFAULT message is a **downstream artifact of the failed `debug_on`**,
-not an independent statement that the modern QIS vopt/elaboration flow
-(the default since ~2020.1, and what this testbench's `VOPT_FLAGS` use)
-blocks DPI-C breakpoints. Confirmed by re-running the identical sequence
-with a real GUI kernel (`vsim -gui`, driven headlessly under Xvfb): there,
-`debug_on` succeeds and `bp -c rvviRefRetireAndCompare` is accepted and
-resolves to a real address — no vopt/QIS flag change needed.
+Console mode (`-batch`/`-c`) cannot run C Debug at all: `cdbg debug_on`
+reads a Tcl variable (`vsimPriv(is_kernel_running_on_valgrind)`) that only
+the interactive GUI kernel initializes, so it throws, and every later
+`bp -c` fails with `C breakpoints are not supported with QIS_DEFAULT`. That
+QIS_DEFAULT message is a downstream artifact of the failed `debug_on`, not
+an independent statement that the QIS vopt/elaboration flow (the default
+since ~2020.1, and what this testbench's `VOPT_FLAGS` use) blocks DPI-C
+breakpoints: with a real GUI kernel — `vsim -gui` driven headlessly under
+Xvfb — the same sequence succeeds, `debug_on` comes up and
+`bp -c rvviRefRetireAndCompare` resolves to a real address, with no
+vopt/QIS flag changes.
 
-**Confirmed: the breakpoint is accepted but never actually stops the
-sim.** With a real GUI kernel and a bridge built with `DEBUG=1` (so the
-breakpoint target has `-g` symbols — without them `bp -c` fails outright
-with `Unable to set breakpoint, location not executable ... compiled with
--g`), `cdbg debug_on` and `bp -c gvsoc_engine_init` both succeed. Using
-`gvsoc_engine_init` instead of `rvviRefRetireAndCompare` isolates the
-question from per-retire noise, since it is called exactly once, early,
-before the DUT program runs. `run -all` then emits a bounded burst of
-`Couldn't write extended state status: Bad address.` / `error from C
-debugger` pairs (84 in the run this was verified with, not one per
-retired instruction) and the simulation proceeds to completion unimpeded
--- full UVM report, `$finish`, zero errors -- as if the breakpoint had
-never been set. `Couldn't write extended state status: Bad address` is
-gdb's message for a failed `PTRACE_SETREGSET`/XSAVE write (`EFAULT`) when
-it tries to install the breakpoint's register state on the traced
+Even then, the breakpoint never fires. With the GUI kernel and a `DEBUG=1`
+bridge build (without `-g` symbols `bp -c` fails outright: `Unable to set
+breakpoint, location not executable ... compiled with -g`), both
+`cdbg debug_on` and `bp -c gvsoc_engine_init` succeed — `gvsoc_engine_init`
+is a good probe because it runs exactly once, early, before the DUT program
+starts, so per-retire noise is out of the picture. `run -all` then emits a
+bounded burst of `Couldn't write extended state status: Bad address.` /
+`error from C debugger` pairs (84 in the run we verified, not one per
+retired instruction) and the simulation runs to completion as if the
+breakpoint had never been set — full UVM report, `$finish`, zero errors.
+The `Bad address` message is gdb failing a `PTRACE_SETREGSET`/XSAVE write
+(`EFAULT`) while installing the breakpoint's register state on the traced
 process; after enough failed attempts gdb gives up silently and execution
-continues. This reproduces identically with the Questa-bundled gdb
-(`external/gdb-102`, the version Questa is tested against) and with a
-newer local gdb 12.1 -- not a gdb-version mismatch --
-`/proc/sys/kernel/yama/ptrace_scope` is `0` (unrestricted), ruling out the
-usual ptrace-scope cause, and the failure is independent of which
-function is targeted. It also reproduces with a controlling PTY on the
-whole process tree (the verified run was wrapped in `script`), ruling
-out a missing controlling terminal; the only configuration not tried is
-a human-driven GUI session on a real display. On this Questa/host
-combination, **treat Questa's native C Debug as not usable for DPI-C
-breakpoints and use the attach gate (§2) instead** -- it does not depend
-on `cdbg` and has been validated end-to-end.
+continues. The failure reproduces identically with the Questa-bundled gdb
+(`external/gdb-102`) and with a local gdb 12.1, so it is not a gdb-version
+mismatch; `/proc/sys/kernel/yama/ptrace_scope` is `0` (unrestricted), which
+rules out the usual ptrace-scope cause; it is independent of which function
+is targeted; and wrapping the whole process tree in `script` to give it a
+controlling PTY changes nothing. The one configuration we have not tried is
+a human-driven GUI session on a real display. Until someone gets further,
+treat Questa's native C Debug as unusable for DPI-C breakpoints here and use
+the attach gate instead — it does not depend on `cdbg` and has been
+validated end-to-end.

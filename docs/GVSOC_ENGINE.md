@@ -1,497 +1,529 @@
-# The GVSOC system — engine, `gv::Gvsoc` API, ISS, and internals
+# GVSOC internals — engine, `gv::Gvsoc` API, and the ISS
 
-> Deep-dive document on the **GVSOC side** (complementary to [`ARCHITECTURE.md`](ARCHITECTURE.md),
-> which describes *our* bridge). Covered here: how GVSOC builds and runs a system, the time
-> engine + the clock engine, the `gvsoc.hpp` API and its implementation, how the ISS hooks in
-> and runs, the service subsystems (trace/power/interconnect/semihosting), **why we did not use
-> the gdbserver**, and what could be improved on the GVSOC side.
->
-> Every claim is anchored to a `file:line` read directly from source, and the central points
-> went through an adversarial cross-check. Line numbers are indicative of these states: engine
-> `a8c57439`, core `d4f37777`. Where a detail is framework-level / not inspected it is marked
-> **[to verify]**.
+Notes on the GVSOC side of the co-simulation: how GVSOC builds and runs a
+system, the time and clock engines, the `gvsoc.hpp` control API and its
+implementation, how the ISS hooks in, why we did not use the gdbserver, and
+what could be improved. The companion document
+[`ARCHITECTURE.md`](ARCHITECTURE.md) describes our bridge; this one describes
+what the bridge sits on.
 
----
+Line references are against engine `a8c57439` and core `d4f37777`; prefer the
+symbol names, the line numbers drift.
 
-## 0. TL;DR
+## Repository layout
 
-1. GVSOC is a **multi-repo discrete-event simulator**: the **engine** (`gvsoc/gvsoc-engine`,
-   *upstream, not forked*) has the time engine + the control API; **core**/**pulp** (our
-   forks) hold the models + the ISS. The simulated system is a **tree of C++ components**
-   loaded from `.so` files (`dlopen`+`gv_new`), described by a Python config (gvrun/gapy →
-   JSON + "compiled platform tree").
-2. The **time engine** (`TimeEngine`) is a list of clients (`vp::Block`) ordered by timestamp;
-   it executes events by advancing time (time-warp). Each **clock domain** is a `ClockEngine`
-   (a client of the TimeEngine) that converts cycles↔ps (`period = 1e12/freq`) and executes
-   that cycle's `ClockEvent`s — including the ISS's **`instr_event`**, a *permanent* event
-   re-executed once per cycle.
-3. The `gv::Gvsoc` API is a **vtable-based abstract interface**; the concrete class is
-   `gv::ControllerClient` behind the `gv::Controller` singleton. `step(duration)` = posts a
-   *stop event* and runs the engine up to that timestamp. In **synchronous mode** the engine
-   runs inline in the caller's thread (for us, the DPI thread).
-4. The **ISS** (CV32E40P, **TIMED** model) runs one instruction per `instr_event` activation:
-   `exec.current_insn` is the PC, a retire = its mutation (the `handler` returns the next PC);
-   the public API exposes **no** state readback, hence our reach-in.
-5. **Why not the gdbserver** (correcting an earlier revision of this analysis): the
-   `gv::Gdbserver_core` interface exists in the header, **but the ISS implementation is
-   unsuitable** for step-and-compare (it exposes only GPR+PC, **zero CSRs**; single `reg_get`
-   is UNIMPLEMENTED; `stepi` is async over an RSP socket) **and** the component is not even
-   instantiated on the cv32e40p platform. The reach-in was not an avoidable shortcut: it was
-   the only way to get **synchronous access to PC+GPR+CSR**.
-
----
-
-## 1. Multi-repo topology + recency
-
-Since commit `d107dd0` ("engine: moved engine out of core to a new repo") GVSOC is split:
+Since commit `d107dd0` ("engine: moved engine out of core to a new repo")
+GVSOC is split across three submodules:
 
 | submodule | SHA | nature | contents |
 |---|---|---|---|
-| `engine` | `a8c57439` | **upstream `gvsoc/gvsoc-engine`, NOT forked** | TimeEngine, ClockEngine, `gv::Gvsoc` API, DPI/SystemC/proxy drivers, gdbserver-engine |
-| `core` | `d4f37777` | fork `FondazioneChipsIT/gvsoc-core` | HW models + ISS + gdbserver-iss |
-| `pulp` | `9d9835a` | fork `FondazioneChipsIT/gvsoc-pulp` | PULP targets/platforms |
+| `engine` | `a8c57439` | upstream `gvsoc/gvsoc-engine`, not forked | TimeEngine, ClockEngine, `gv::Gvsoc` API, DPI/SystemC/proxy drivers, gdbserver-engine |
+| `core` | `d4f37777` | fork of `FondazioneChipsIT/gvsoc-core` | hardware models, the ISS, gdbserver-iss |
+| `pulp` | `9d9835a` | fork of `FondazioneChipsIT/gvsoc-pulp` | PULP targets and platforms |
 
-The vendored engine is **~46 commits behind** upstream (§15). Our CV32E40P changes live in
-`core` (ISS) and in the bridge, **not** in the engine.
+Our CV32E40P changes live in `core` (the ISS) and in the bridge, not in the
+engine. The vendored engine lags upstream main by roughly 77 commits as of
+July 2026 — see "Upstream drift" at the end.
 
----
+## From config to component tree
 
-## 2. How GVSOC builds and runs a system
+The simulated system is a tree of C++ components loaded from shared objects
+and described by a Python configuration. Two Python tools (`gvsoc/gvrun/`,
+`gvsoc/gapy/`) generate the configuration in two artifacts:
 
-### 2.1 Before the engine: gvrun / gapy (Python)
+1. `gvsoc_config.json` — component hierarchy, parameters (reset value/mask,
+   frequencies), ports, bindings, plus the `target/gvsoc` section
+   (`include_dirs`, `platform_tree`). Generated, not versioned.
+2. The "compiled platform tree" — a per-target shared object
+   (`libplatform_tree_cv32e40p_standalone.so`) exporting
+   `vp_get_platform_tree()`, which returns a statically compiled
+   `ComponentTreeNode` tree: hierarchy, module names, bindings, typed config
+   structs.
 
-Two Python tools (`gvsoc/gvrun/`, `gvsoc/gapy/`) generate the **config tree** as **two artifacts**:
-1. **The JSON** (`gvsoc_config.json`): component hierarchy, parameters (reset value/mask,
-   frequencies), ports, bindings, and the `target/gvsoc` section (`include_dirs`,
-   `platform_tree`). Generated, not versioned.
-2. **The "compiled platform tree"** — a per-target `.so` (`libplatform_tree_cv32e40p_standalone.so`)
-   exporting `vp_get_platform_tree()` → a **statically compiled** `ComponentTreeNode` tree
-   (hierarchy + module names + bindings + typed config structs).
+The C++ side can instantiate from either artifact; the compiled tree is the
+preferred path and the one our target uses, with the raw JSON as fallback.
 
-→ There are **two instantiation paths** in the C++: from the compiled tree (preferred) or from
-the raw JSON (fallback). [finding: our tree uses the compiled platform tree as the primary source]
+The `vp::Top` constructor parses the JSON, `dlopen`s the platform tree and
+resolves `vp_get_platform_tree`, creates the global engines (`TimeEngine`,
+`TraceEngine`, `PowerEngine`, `StatsEngine`, `MemCheck`), and instantiates the
+root through `Component::load_component("**/target", ...)`.
 
-### 2.2 Build: from the config to the component tree
+Model loading follows a plugin contract: one model = one `.so` exporting
+`extern "C" gv_new(ComponentConf&)`. `Component::load_component` resolves
+`<inc_dir>/<module>.so` from the `vp_component` name, calls
+`dlopen(..., RTLD_NOW | RTLD_GLOBAL | RTLD_DEEPBIND)`, and resolves the
+`gv_new` factory with `dlsym`. `RTLD_DEEPBIND` isolates each model's symbols —
+a model's methods are not visible outside its own `.so`, which matters later
+(see "Why we did not use the gdbserver"). Each `Component` constructor
+registers with its parent and calls `create_comps()`, which recurses over the
+children, so the whole tree comes up depth-first. Config-struct fields marked
+`Runtime` are overridden from the JSON by field offset
+(`apply_runtime_overrides`).
 
-The `vp::Top::Top(config_path)` constructor (`top.cpp:28`): parses the JSON (`:30`), `dlopen`s the
-`platform_tree` and resolves `vp_get_platform_tree` (`:39-53`), creates the global engines (`TimeEngine`,
-`TraceEngine`, `PowerEngine`, `StatsEngine`, `MemCheck`, `:55-59`), and instantiates the root via
-`Component::load_component("**/target", ...)` (`:61-63`).
+### Lifecycle
 
-**Plugin loading of a model** (`Component::load_component`, `component.cpp:284`): resolves the
-`<inc_dir>/<module>.so` path from the `vp_component` name, performs
-**`dlopen(..., RTLD_NOW|RTLD_GLOBAL|RTLD_DEEPBIND)`** (`:328`), resolves the **`gv_new`** factory
-via `dlsym` (`:352`) and calls it. → **one model = one `.so` exporting
-`extern "C" gv_new(ComponentConf&)`**: this is the plugin contract. `DEEPBIND` isolates each
-`.so`'s symbols (relevant because a model's methods are not visible outside its `.so` —
-cf. §12).
-
-A `Component`'s constructor (`component.cpp:438`) registers with its parent and calls `create_comps()`
-(`:194`), which **recurses** over children (compiled-tree or JSON) → the whole tree is instantiated
-depth-first. Config-struct fields marked `Runtime` are overridden from the JSON via offsets
-(`apply_runtime_overrides`, `:393-435`).
-
-### 2.3 Lifecycle: open → build_all → bind → reset → start
-
-| Phase | Where | What |
+| Phase | Where | What happens |
 |---|---|---|
-| `init` | `launcher.cpp:121` | `new vp::Top(...)` → the whole build of §2.2 |
-| `open` → **`build_all`** | `launcher.cpp:176`, `component.cpp:84` | `bind_comps → pre_start_all → start_all → final_bind` |
-| `bind` | `launcher.cpp:179` | `time_engine->bind_to_launcher(user)` (wires the `Gvsoc_user` callbacks) |
-| `start` | `launcher.cpp:185-189` | `handler->start()` + **`reset_all(true); reset_all(false)`** (reset assert/deassert pulse) + `check_run()` |
-| `close` | `launcher.cpp:211` | flush traces, `stop_all`, dump stats, `unbuild_all`, delete |
+| `init` | `launcher.cpp` | `new vp::Top(...)` — the whole build above |
+| `open` | `Component::build_all` | `bind_comps → pre_start_all → start_all → final_bind` |
+| `bind` | `launcher.cpp` | `time_engine->bind_to_launcher(user)`, wiring the `Gvsoc_user` callbacks |
+| `start` | `launcher.cpp` | `handler->start()`, then `reset_all(true); reset_all(false)` — the reset pulse — then `check_run()` |
+| `close` | `launcher.cpp` | flush traces, `stop_all`, dump stats, `unbuild_all`, delete |
 
-`build_all` (`component.cpp:84`): **`bind_comps()`** resolves the master→slave port bindings
-(`master_port->bind_to_virtual(slave_port)`, `:545`); **`start_all()`** calls `start()` on every
-model. `reset_all(active)` (`block.cpp:103`) recurses over children→objects→signals→registers; the
-double `true`/`false` call is the hardware reset pulse. **Note**: reset is *separate* from `build_all`.
+`bind_comps()` resolves the master→slave port bindings
+(`master_port->bind_to_virtual(slave_port)`); `start_all()` calls `start()` on
+every model. `reset_all(active)` recurses over children, objects, signals and
+registers; the assert/deassert double call is the hardware reset pulse. Reset
+is deliberately separate from `build_all`.
 
-### 2.4 Memory map: how an address is routed
+### Memory map routing
 
-The `MappingTree` (`mapping_tree.cpp`) is a **BST over the `[base, base+size)` intervals**:
-`get(base, size, is_write)` (`:133`) walks down from the root (`right` if `base >= entry->base`,
-otherwise `left`), checks the range, and on a miss returns the `default_entry`. A core access
-resolves to the target component in O(log N). [to verify: the precise runtime call site of
-`MappingTree::get()` lives in the router model (a `.so`), not in the engine]
+The `MappingTree` (`mapping_tree.cpp`) is a binary search tree over
+`[base, base+size)` intervals. `get(base, size, is_write)` walks down from the
+root (right if `base >= entry->base`, else left), checks the range, and on a
+miss returns the `default_entry`, so a core access resolves to its target
+component in O(log N). The runtime call site lives in the router model, not in
+the engine.
 
----
+## The `vp::` component model
 
-## 3. The `vp::` component model
+`vp::Block` is the schedulable base: it owns the `vp::BlockTime time` member
+and a `virtual int64_t exec()` — the unit the TimeEngine calls back.
+`vp::Component : public vp::Block` adds ports, interfaces and sub-blocks.
+`vp::Top` is the root and exposes `build_all` / `reset_all` / `start_all` /
+`stop_all` / `pause_all` / `flush_all`.
 
-- **`vp::Block`** is the schedulable base: it holds the `vp::BlockTime time` member (`block.hpp:310`)
-  and a `virtual int64_t exec()` (`block.hpp:445`) — it is the unit the TimeEngine calls back.
-- **`vp::Component : public vp::Block`** adds ports/interfaces/sub-blocks.
-- **`vp::Top`** is the root; it exposes `build_all`/`reset_all`/`start_all`/`stop_all`/`pause_all`/`flush_all`.
-- **Ports/interfaces**: components connect through typed master/slave ports. An **`IoReq`**
-  travels from master to slave (`itf/io.hpp`): 4 return states — `IO_REQ_OK` (sync), `IO_REQ_INVALID`,
-  `IO_REQ_DENIED`, `IO_REQ_PENDING` (deferred response via the `grant()`/`resp()` callbacks,
-  `io.hpp:244-250,385-392`); latency accumulates monotonically (`set_latency` with `std::max`, `:108`).
-  The bus also carries **AMO** ops (`LR/SC/SWAP/ADD/XOR/AND/OR/MIN/MAX...`, `io.hpp:41-56`), not just R/W.
+Components connect through typed master/slave ports. An `IoReq`
+(`itf/io.hpp`) travels from master to slave and can end in four states:
+`IO_REQ_OK` (synchronous), `IO_REQ_INVALID`, `IO_REQ_DENIED`, or
+`IO_REQ_PENDING` — a deferred response completed later through the `grant()` /
+`resp()` callbacks. Latency accumulates monotonically (`set_latency` keeps the
+max). The bus also carries atomic operations (`LR/SC/SWAP/ADD/XOR/AND/OR/
+MIN/MAX...`), not just plain reads and writes.
 
----
+## The time engine
 
-## 4. The time engine: `TimeEngine`
+`TimeEngine` (`engine/engine/{include/vp/time,src/time}/time_engine.*`) is the
+event scheduler. The queue is not a heap: it is a linked list of clients
+(`vp::Block`) kept ordered by increasing `next_event_time`, with
+`first_client` the most imminent; `enqueue` inserts in order.
 
-`engine/engine/include/vp/time/time_engine.hpp` + `src/time/time_engine.cpp`. It is the event scheduler.
+`TimeEngine::exec()` takes `first_client`, advances global time straight to
+the event's timestamp (time-warp — no idle ticks), and calls
+`current->exec()`, which returns the delta in picoseconds to that client's
+next event; the client is then re-enqueued in order. The loop terminates on an
+empty queue or on `stop_req` at a timestamp boundary. `run()` is `exec()` plus
+`top->pause_all()`, and returns the time of the next event (or -1). `pause()`
+sets `stop_req` without taking a lock. When `enqueue` changes the first
+client, the engine notifies the launcher through `was_updated()`.
 
-- **Queue**: not a heap, but a **linked list of clients (`vp::Block`) ordered by increasing
-  `next_event_time`** (`time_engine.hpp:117-120`, `first_client` = the most imminent). `enqueue`
-  inserts in order (`time_engine.cpp:176`).
-- **`exec()`** (`:38`): takes `first_client`, **advances global time** to the event's timestamp
-  (`this->time = next_event_time`, `:48` — time-warp, no idle ticks), calls `current->exec()`
-  which returns the **delta (in ps)** to the client's next event; re-enqueues it in order.
-  Terminates on an empty queue or on `stop_req` at a timestamp boundary (`:108`).
-- **`run()`** (`:134`) = `exec()` + `top->pause_all()` + returns the time of the next event (or -1).
-  **`pause()`** (`:225`) sets `stop_req` (lock-free).
-- **Hook**: when `enqueue` changes the first client, it calls `launcher->was_updated()` (`:210-213`).
+## Clock engines and timed events
 
----
+Timing is two-level: one global `TimeEngine` in picoseconds, plus one
+`ClockEngine` per clock domain counting cycles.
 
-## 5. The clock engine and timed events
+Two event types exist. `vp::ClockEvent` is a cycle-based callback inside a
+clock domain, with two modes: repeated-enqueue (queued each time — flexible,
+slow) and enable/disable (a "permanent" event that executes every cycle while
+enabled — fast). `vp::TimeEvent` is a callback at an absolute timestamp in
+picoseconds, independent of any clock. The ISS uses a permanent `ClockEvent`.
 
-**Two-level** model: one global `TimeEngine` (ps) + N `ClockEngine`s (one per clock domain, in cycles).
+`ClockEngine` is itself a `vp::Component` registered as a time-engine client;
+`Block::exec()` is virtual and `ClockEngine::exec()` overrides it — that is
+where the polymorphic dispatch happens. On each activation it increments
+`cycles`, runs all the permanent callbacks, and — if it is the only client —
+keeps advancing `engine->time += period` cycle by cycle as a shortcut. Its
+return value is the delta in ps: `period` while permanent events exist,
+`cycle_diff * period` for the next delayed event, or -1 with no events.
+Conversion is `period = 1e12 / frequency`; multiple frequencies coexist as
+distinct clients on the shared picosecond axis.
 
-### 5.1 `ClockEvent` vs `TimeEvent`
-
-- **`vp::ClockEvent`** (`clock_event.hpp:51`): *cycle*-based callback inside a clock domain. `cycle`
-  field (absolute; `-1` = "permanent"). **Two modes** (`clock_event.hpp:43-49`): *repeated-enqueue*
-  (queued each time, flexible/slow) or *enable/disable* (permanent: executes **every cycle** while
-  enabled, fast). The ISS uses the **permanent** one.
-- **`vp::TimeEvent`** (`time_event.hpp:43`): callback at a *timestamp in ps*, clock-independent.
-
-### 5.2 `ClockEngine` is a client of the `TimeEngine`
-
-`ClockEngine : public vp::Component` (`clock_engine.hpp:43`), registered as a time client
-(`clock_engine.cpp:552`). `Block::exec()` is virtual and **overridden** by `ClockEngine::exec()`
-(`clock_engine.cpp:385`) — this is where the polymorphic dispatch happens. `ClockEngine::exec()`:
-- **permanent** branch: for each cycle `cycles++` (`:399`), runs all the permanent callbacks
-  (`current->meth(...)`, `:408`); if it remains the only client, it advances `engine->time += period`
-  and keeps going (cycle-by-cycle shortcut, `:422`);
-- **returns the delta in ps**: `period` if there are permanent events (`:465`), `(cycle_diff)*period`
-  for the next delayed one (`:472`), or `-1` (no events, `:478`).
-- Conversion: **`period = 1e12 / frequency`** (`:185`). Multiple frequencies coexist as distinct
-  TimeEngine clients on the common ps time axis.
-
-### 5.3 The exact chain (what "makes the ISS run")
+The exact chain that makes the ISS run:
 
 ```
-TimeEngine::exec()                          time_engine.cpp:54  current->exec()   [current = the core's ClockEngine, via virtual Block::exec()]
-  → ClockEngine::exec()                     clock_engine.cpp:385
-      → cycles++                            clock_engine.cpp:399
-      → instr_event.meth(_this, &event)     clock_engine.cpp:408  [callback = Exec::exec_instr]  → executes ONE instruction
-      → returns `period` (ps to the next cycle)
-  → TimeEngine advances time and reschedules  time_engine.cpp:59-98
+TimeEngine::exec()                              current->exec()  [current = the core's ClockEngine]
+  -> ClockEngine::exec()
+       -> cycles++
+       -> instr_event.meth(_this, &event)       [callback = Exec::exec_instr] executes ONE instruction
+       -> returns period (ps to the next cycle)
+  -> TimeEngine advances time and reschedules
 ```
 
-The ISS `instr_event` is a **permanent** `ClockEvent`: `instr_event.enable()` when not stalled,
-`disable()` when stalled (`exec_inorder_implem.hpp:181,198`). It is **re-executed once per cycle
-by the ClockEngine** — *not* manually re-enqueued each cycle.
+The ISS `instr_event` is a permanent `ClockEvent`: `enable()` while not
+stalled, `disable()` while stalled (`exec_inorder_implem.hpp`). The
+ClockEngine re-executes it once per cycle; nothing re-enqueues it manually.
 
----
+## The `gv::Gvsoc` control API
 
-## 6. The public `gvsoc.hpp` API (reference)
+`engine/engine/include/gv/gvsoc.hpp` (897 lines) is a purely virtual
+interface; the implementation lives in `libpulpvp.so` and the header acts as a
+vtable shared across `.so` boundaries.
 
-`engine/engine/include/gv/gvsoc.hpp` (897 lines). **Purely virtual abstract** interface: the
-implementation lives in `libpulpvp.so`; the header is a vtable shared cross-`.so`.
+`class Gvsoc` — control:
 
-### `class Gvsoc` (`:614`) — control
+| Method | Purpose |
+|---|---|
+| `open` / `start` / `close` | lifecycle (main controller only) |
+| `bind(Gvsoc_user*)` | register the event callbacks |
+| `run()` / `stop()` | free-running mode / stop at the current timestamp |
+| `step(duration, ...)` / `step_until(ts, ...)` | run and stop after a duration / at a timestamp — the lockstep primitives |
+| `update(ts)` / `wait_runnable()` | synchronization with external time |
+| `get_time()` / `get_next_event_time()` | introspection |
+| `get_component(path)` | component descriptor, or NULL |
+| `lock` / `unlock`, `flush`, `terminate`, `quit`, `join` | lifecycle and miscellany |
 
-| Method | Line | What it does | Use |
-|---|---|---|---|
-| `open`/`start`/`close` | :630/:657/:648 | lifecycle (main controller only) | lifecycle |
-| `bind(Gvsoc_user*)` | :638 | registers the event callbacks | wiring |
-| `run()` / `stop()` | :673/:685 | runnable / stop at the current timestamp | free-running |
-| `step(dur,wait,data)` / `step_until(ts,...)` | :742/:761 | run+stop after a duration / until a timestamp | **lockstep** |
-| `update(ts)` / `wait_runnable()` | :720/:817 | sync with external time | time-sync |
-| `get_time()` / `get_next_event_time()` | :826/:837 | current time / next event | introspection |
-| `get_component(path)`→**`void*`** | :794 | component descriptor (or NULL) | direct-access |
-| `lock`/`unlock`, `flush`, `terminate`, `quit`, `join` | :803/:782/:695/:708/:772 | — | lifecycle/misc |
+`get_component` returns `void*` — internally a `vp::Block*`, not a
+`vp::Component*` — and the cast to the concrete type is entirely the caller's
+responsibility.
 
-> **Correctness note**: `get_component` returns **`void*`** (internally a `vp::Block*`, not a
-> `vp::Component*`); the cast to the concrete type is the caller's responsibility.
+`class Gvsoc_user` — callbacks: `has_ended(status)`, `has_stopped()`,
+`was_updated()`, `handle_step_end(data)` (async step), `handle_syscall_stop()`.
+One rule applies: no GVSOC API calls from inside a callback.
 
-### `class Gvsoc_user` (`:560`) — callbacks
+The binding classes (`Io`, `Wire`, `Vcd`, `Power`, plus their `_user` /
+`_binding` counterparts) are the interaction channels: memory accesses, raw
+signals (including IRQs), traces, power. `GvsocConf` carries `config_path`,
+`proxy_socket` and `api_mode`; `gvsoc_new` creates a client, and the first
+client is the main controller — the only one allowed to `open`/`close`.
 
-`has_ended(status)` (:571), `has_stopped()` (:579), `was_updated()` (:587), `handle_step_end(data)`
-(:597, async step), `handle_syscall_stop()` (:606). **Rule: no GVSOC API from inside a callback.**
+What is *not* there: any architectural state readback. No `get_reg`,
+`get_csr`, `get_pc` anywhere in the header. That gap is where our reach-in
+comes from.
 
-### Bindings + `GvsocConf` + `gvsoc_new`
+## How the engine implements the API
 
-`Io`/`Wire`/`Vcd`/`Power` (+ `_user`/`_binding`): interaction channels (memory, raw signals
-including IRQs, trace, power). `GvsocConf` (:848): `config_path`, `proxy_socket`, `api_mode`.
-`gvsoc_new` (:895): the first client is the **main controller** (the only one allowed to
-`open`/`close`).
+`gvsoc_new` (`launcher.cpp`) returns a `gv::ControllerClient` — that object is
+the user's `gv::Gvsoc` — or a `Gvsoc_proxy_client` when `proxy_socket` is set.
+Behind it sits the `gv::Controller` singleton, which owns `vp::Top`, the
+`TimeEngine`, the client list and the `run_count`/`lock_count` bookkeeping.
+(A global `gv::controller` symbol also exists but is unused.)
 
-> **What is NOT there**: no architectural state readback (PC/GPR/CSR/FPR) — grep `get_reg`/`get_csr`/
-> `get_pc` = 0 matches. This is the gap our reach-in stems from.
+`step_sync(duration)` reduces to `step_until_sync(now + duration)`: it
+enqueues the client's pre-allocated `step_event` — a `vp::TimeEvent` whose
+callback is `time_engine->pause()` — at the target timestamp, then loops
+`run_sync()` until `get_time() >= end_time`.
 
----
+Threading is decided in `open` from `api_mode`. Async mode spawns a dedicated
+`engine_routine` thread (`while(1) run_sync()`). Sync mode creates no engine
+thread at all: the engine runs inline in the caller's thread. We use
+`Api_mode_sync`, so the engine runs in the thread of Questa's DPI call, in
+deterministic lockstep. The engine is runnable when
+`run_count == clients.size() && lock_count == 0`.
 
-## 7. How the engine implements the API
+## How the ISS hooks in and runs
 
-`gvsoc_new` (`launcher.cpp:649`) returns a **`gv::ControllerClient`** (this is the user's `gv::Gvsoc`;
-`controller.hpp:202`) or a `Gvsoc_proxy_client` (if `proxy_socket != -1`). Behind it sits the
-**`gv::Controller`** singleton (`Controller::get()`, `controller.hpp:56-59`) owning `vp::Top` +
-`TimeEngine` + the client list + `run_count`/`lock_count`. (A global `gv::controller` also exists
-but is **unused**.)
+`class IssWrapper : public vp::Component`
+(`core/models/cpu/iss/include/cores/cv32e40p/class.hpp`) contains `Iss iss` by
+value. The `Iss` itself is not a tree of sub-components: it is an aggregate of
+public by-value sub-blocks, in declaration order `regfile, exec, insn_cache,
+timing, core, prefetcher, decode, irq, gdbserver, lsu, dbgunit, syscalls,
+trace, csr, exception, memcheck`. Those public fields are what make the
+bridge's reach-in possible. The component path is `soc/core`;
+`get_component("soc/core")` returns it as `void*` and the bridge casts to
+`IssWrapper*`.
 
-`step_sync(duration)` → `step_until_sync(now+duration)` (`launcher.cpp:371`): enqueues
-`client->step_event` (a pre-allocated `vp::TimeEvent` whose callback is `time_engine->pause()`) at
-the target timestamp, then loops `run_sync()` until `get_time() >= end_time` (`:407-426`).
+The CV32E40P model (`pulp_cores.py`) is configured TIMED: `scoreboard=True,
+timed=True, riscv_exceptions=True` — real fetch through the prefetcher,
+modeled stalls. `EXEC_SCOREBOARD` stays off (the class does not pass
+`modules`, so the default `[ExecInOrder()]` with `scoreboard=False` applies).
 
-**Threading** (`open`, `launcher.cpp:151`): `is_async` from `api_mode` (`:114`). Async → dedicated
-`engine_routine` thread (`while(1) run_sync()`). **Sync → no engine thread**: it runs inline in the
-caller's thread. **We use `Api_mode_sync`** → the engine runs in the thread of Questa's DPI call, in
-lockstep (deterministic). Runnable: `run_count == clients.size() && lock_count == 0` (`:469`).
+### Fast and slow handlers
 
----
+Execution is driven by the `instr_event` with two callbacks: the fast one,
+`Exec::exec_instr`, and the slow one, `Exec::exec_instr_check_all`, which is
+the default at boot. The slow handler additionally handles pending cache
+flushes, exception take (`if (has_exception) current_insn = exception_pc`),
+the IRQ check, timing accounting (`timing.insn_account()`) and debug stepping.
+The engine switches slow→fast through `can_switch_to_fast_mode()` — blocked
+while a gdbserver, tracing or a hardware counter is active — and drops back
+fast→slow (`switch_to_full_mode`) on icache flush, exception raise, and
+similar events.
 
-## 8. How the ISS hooks in and runs
+### Instruction cache, prefetcher, execution
 
-### 8.1 IssWrapper as a component
+`get_insn(pc)` (`insn_cache.hpp`) is a page-based fast path with lazy decode:
+a fresh slot starts with `handler = iss_decode_pc_handler`, and the first
+execution of that PC decodes and caches the instruction. In the TIMED
+configuration the prefetcher's `fetch(addr)` may issue a memory `IoReq` and
+stall the core on an asynchronous refill (`stalled_inc` / `fetch_response`).
 
-`class IssWrapper : public vp::Component` (`cores/cv32e40p/class.hpp:90`) contains `Iss iss` by value
-(`:100`). The `Iss` (`class.hpp:59-88`) is **not** a tree of sub-components: it is an **aggregate of
-public by-value member sub-blocks**, in this order: `regfile, exec, insn_cache, timing, core,
-prefetcher, decode, irq, gdbserver, lsu, dbgunit, syscalls, trace, csr, exception, memcheck`. *This*
-is what makes the reach-in possible (direct public fields). The path is `soc/core`;
-`get_component("soc/core")` returns it as `void*`, the bridge casts it to `IssWrapper*`. [to verify:
-where `soc/core` is defined in the Python config]
+Execution itself is `current_insn = insn->fast_handler(iss, insn, pc)`: the
+handler's return value is the next PC, so a retire is precisely a mutation of
+`exec.current_insn`. Note that `csr.instret` is a plain `CsrReg` that does not
+auto-increment — which is why the bridge detects retires through the
+`current_insn` change and not through `instret`.
 
-### 8.2 CV32E40P configuration
+### Traps and IRQs inside the ISS
 
-`pulp_cores.py:184` — `cv32e40p` is **TIMED** (`scoreboard=True, timed=True, riscv_exceptions=True`).
-Hence: real fetch through the prefetcher, modeled stalls. (`EXEC_SCOREBOARD` is **off** instead — the
-class does not pass `modules`, default `[ExecInOrder()]` with `scoreboard=False`.)
+Traps are two-phase. `Exception::raise` computes the vector and `mcause`,
+saves `mepc`, updates `mstatus`, but does not redirect immediately: it sets
+`has_exception` and `exception_pc`, and the take happens on the next cycle in
+the slow handler (`current_insn = exception_pc`). This is the "trap = 2 ISS
+steps" shape the bridge has to handle.
 
-### 8.3 Fast vs slow handler
+For CV32E40P there is a combinational decode-stage IRQ check before fetch in
+both the fast and slow handlers, under `#ifdef CONFIG_GVSOC_ISS_CV32E40P`.
+`Irq::check()` runs inside the ISS run loop; the bridge never calls it.
 
-Execution is driven by the `instr_event` (§5). Two callbacks:
-- **FAST** `Exec::exec_instr` (`exec_inorder.cpp:165`);
-- **SLOW** `Exec::exec_instr_check_all` (`:305`) — the default at boot (`:28`); it additionally does:
-  pending cache flush, **take-exception** (`if (has_exception) current_insn = exception_pc`, `:320`),
-  IRQ check, slow handler, `timing.insn_account()`, dbg step.
+## Service subsystems
 
-Switching: **SLOW→FAST** if `can_switch_to_fast_mode()` (`:330`) — blocked by an active
-gdbserver/trace/HW counter (`exec_inorder_implem.hpp:158-170`). **FAST→SLOW** (`switch_to_full_mode`)
-on icache flush, exception raise, etc.
+Trace/VCD (`engine/src/trace/`): trace registration feeds an asynchronous
+dump thread (`vcd_routine`) and a backend. If an external `Vcd_user` is bound
+through `vcd_bind`, GVSOC delegates the dump to the consumer
+(`event_update_logical`) and does not write the file itself — that is how a
+host captures waveforms.
 
-### 8.4 Insn cache + prefetcher + execution
+Power (`engine/src/power/`): a hierarchical activity-based model —
+`PowerSource` with per-event quantum, background and leakage components,
+interpolated temperature/voltage/frequency tables (`power_table.cpp`),
+window-by-window energy integration (`power_trace.cpp`), propagation up the
+tree via `parent->inc_*`. Reports to `power_report.csv`. (Headers confirmed;
+the implementation only partially read.)
 
-- **`get_insn(pc)`** (`insn_cache.hpp:63`): page-based fast path; **lazy decode** — a fresh slot has
-  `handler = iss_decode_pc_handler`, and the *first* execution of that PC decodes and caches it (`:74-82`).
-- **Prefetcher** (TIMED): `fetch(addr)` (`prefetch_single_line_implem.hpp:29`) may issue a memory
-  `IoReq` and **stall** the core on an async refill (`stalled_inc`/`fetch_response`).
-- **Execution**: `current_insn = insn->fast_handler(iss, insn, pc)` (`exec_inorder.cpp:233`) — the
-  handler's return value **is the next PC**. A retire = a mutation of `current_insn`. `csr.instret`
-  is a plain `CsrReg` that does **not auto-increment** (which is why the bridge uses the
-  `current_insn` change, not `instret`, as the retire signal).
+Stats (`engine/src/stats.cpp`): `StatScalar` counters and `StatBw` derived
+bandwidth, behind `#ifdef CONFIG_GVSOC_STATS_ACTIVE`; without the define they
+compile to no-op stubs.
 
-### 8.5 Internal traps and IRQs
+Interconnect and memory (`core/models/`): the router's `handle_req` applies
+stats and the bandwidth limit, resolves the target through
+`mapping_tree.get()`, translates the address
+(`addr - remove_offset + add_offset`) and forwards. Requests straddling
+multiple mappings are split and reassembled. `memory.cpp` is the final
+target, with memcheck and atomics support.
 
-- **2-phase traps**: `Exception::raise` (`exception.cpp:41`) computes the vector/`mcause`, saves
-  `mepc`, updates `mstatus`, but does **not redirect immediately**: it sets
-  `has_exception`+`exception_pc`. The *take* happens the next cycle, in the SLOW handler
-  (`current_insn = exception_pc`, `exec_inorder.cpp:320`). (This is the "trap = 2 ISS steps" the
-  bridge handles.)
-- **Combinational DECODE-stage IRQ**: for CV32E40P there is an `irq.check()` *before fetch* both in
-  FAST (`exec_inorder.cpp:171-179`) and in SLOW (`:337`), under `#ifdef CONFIG_GVSOC_ISS_CV32E40P` —
-  the documented CV32E40P divergence. **`Irq::check()` runs inside the ISS run loop**, never called
-  by the bridge.
+Termination: three triggers converge on `TimeEngine::quit(status)` — our exit
+device at `0x2000_0000` (`cv32e40p_exit_device.cpp`, a model outside the
+engine; PASSED is the magic word `0x075BCD15` at offset 0x00, the same magic
+the UVM virtual peripheral uses, exit code at offset 0x04); HTIF tohost
+(`cmd & 1` → `quit(cmd >> 1)`); and semihosting `0x10D`. From there the
+engine-internal chain is `quit` → `finished=true` → `Controller::run_sync`
+sees it → `has_ended()` on the bound user → the bridge's
+`BridgeUser::has_ended` sets the flag exposed to SV as `rvviRefIsFinished()`,
+which the testbench-side watchdog polls to force `$finish`.
 
----
+## How other hosts drive the engine
 
-## 9. Service subsystems
-
-### 9.1 Trace / VCD
-`engine/src/trace/`. Registration (`reg_trace`) → **asynchronous** dumping in a thread (`vcd_routine`) →
-backend. **Key point**: if an external `Vcd_user` is bound (`vcd_bind`, `gvsoc.hpp:354`), GVSOC
-**delegates the dump** to the consumer (`event_update_logical`) and does NOT write the file — this is
-how a host captures waveforms.
-
-### 9.2 Power
-`engine/src/power/`. Hierarchical **activity-based** model: `PowerSource` (per-event quantum +
-background + leakage), interpolated T/V/F characterization tables (`power_table.cpp`),
-window-by-window energy integration (`power_trace.cpp`), `parent->inc_*` propagation up the tree.
-Report to `power_report.csv`. [headers confirmed; activity-based semantics as declared, implementation
-only partially read]
-
-### 9.3 Stats
-`engine/src/stats.cpp`. `StatScalar` (counters) + `StatBw` (derived bandwidth = bytes/duration). Behind
-`#ifdef CONFIG_GVSOC_STATS_ACTIVE` — without the define they degrade to no-op stubs (zero overhead).
-
-### 9.4 Interconnect / memory
-**Router** `core/models/interco/router/router.cpp`: `handle_req` (`:240`) → stats + bandwidth limit →
-`mapping_tree.get()` (`:267`) → translates the address (`addr - remove_offset + add_offset`) →
-`req_forward` (`:304`). Requests straddling multiple mappings are split and reassembled (`:306-455`).
-**Memory** `core/models/memory/memory.cpp`: final target, with memcheck and atomics.
-
-### 9.5 Semihosting / exit → `has_ended` → our watchdog
-Three termination triggers converge on `TimeEngine::quit(status)`:
-- our **exit device** at `0x2000_0000` (`cv32e40p_exit_device.cpp` — a *model*, outside the engine):
-  PASSED = magic `0x075BCD15` at offset 0x00 (**the same magic word as the UVM virtual peripheral**),
-  exit code via offset 0x04;
-- **HTIF** tohost (`cmd & 1` → `quit(cmd >> 1)`, `htif.cpp:104`);
-- **semihosting** `0x10D` (program-driven pause).
-
-Chain (the engine-internal part, verified): `TimeEngine::quit` (`time_engine.cpp:218`) sets
-`finished=true` → `Controller::run_sync` sees `finished_get()` → `sim_finished` → `user->has_ended()`
-(`launcher_client.cpp:134`) → **`BridgeUser::has_ended`** (`gvsoc_engine.cpp:118`) sets `g_finished`,
-exposed to SV as `rvviRefIsFinished()` (the **WFI watchdog** that forces `$finish`, see
-`tb-cv32e40p-discipline.md §4`). [the exit-device→quit *trigger* lives in a model `.so`, outside
-the engine; only the `quit→has_ended` propagation is engine-internal]
-
----
-
-## 10. How others drive the engine
-
-| Driver | file | model |
+| Driver | Where | Model |
 |---|---|---|
-| **Official DPI** | `engine/dpi-wrapper/src/dpi.cpp` | **time-driven** (`step_until` + `get_next_event_time` + `wait_runnable` + sleep); `wire_bind` for signals; **CPU state never touched** |
-| **SystemC** | `engine/engine/src/main_systemc.cpp` | same pattern in an `SC_THREAD` |
-| **Proxy (remote)** | `engine/engine/src/proxy.cpp` | text protocol over a socket: `run`/`step <ns>`/`step_cycles <dom> <n>`/`get_component`/`get_clock_domains`/`trace`/`event` |
-| **gdbserver** | `core/models/gdbserver/` + `core/.../iss/src/gdbserver.cpp` | RSP/GDB over TCP (opt-in; see §12) |
+| Official DPI wrapper | `engine/dpi-wrapper/src/dpi.cpp` | time-driven: `step_until` + `get_next_event_time` + `wait_runnable` + sleep; signals via `wire_bind`; never touches CPU state |
+| SystemC | `engine/engine/src/main_systemc.cpp` | same pattern inside an `SC_THREAD` |
+| Proxy (remote) | `engine/engine/src/proxy.cpp` | text protocol over a socket: `run`, `step <ns>`, `step_cycles <domain> <n>`, `get_component`, `get_clock_domains`, `trace`, `event` |
+| gdbserver | `core/models/gdbserver/` + the ISS side | GDB RSP over TCP, opt-in |
 
-The generic drivers (DPI/SystemC) are **time-driven** and inject stimuli via `wire_bind`/`io_bind`,
-**without reading architectural state**. None of them does step-and-compare. This is why our bridge
-deviates (retire-based + reach-in) — see [`ARCHITECTURE.md`](ARCHITECTURE.md) §11.
+The generic drivers are time-driven and inject stimuli through
+`wire_bind`/`io_bind` without ever reading architectural state; none of them
+does step-and-compare. That is why our bridge deviates — retire-based
+stepping plus the reach-in. The full comparison is in
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
 
----
+Our own usage, in one line: `Api_mode_sync`; `gvsoc_new → bind(BridgeUser) →
+open → start → get_component("soc/core") → cast to IssWrapper*`; a
+`step(20000 ps)` loop with PC-change retire detection; reach-in on
+`iss.regfile/csr/exec/irq`; no `step_until`, no `get_next_event_time`, no
+`wire_bind`. The bridge workarounds — CSR read fixups, write masks,
+force-reset, `skip_irq_check` re-assert, the runaway detector, IRQ injection
+through `mip` — all descend from the missing state API and from the symbol
+isolation described next.
 
-## 11. How WE implement `gvsoc.hpp` (summary)
+## Why we did not use the gdbserver
 
-Details in [`ARCHITECTURE.md`](ARCHITECTURE.md). In short: `Api_mode_sync`; `gvsoc_new → bind(BridgeUser)
-→ open → start → get_component("soc/core") → cast IssWrapper*`; a `step(g_clock_ps=20000ps)` loop with
-PC-change retire detection; reach-in on `iss.regfile/csr/exec/irq`; **never** `step_until`/
-`get_next_event_time`/`wire_bind`. The workarounds (CSR read fixups, write masks, force-reset,
-`skip_irq_check` re-assert, runaway detector, IRQ via direct `mip`) all descend from the absence of a
-state API (§6) and the non-linkability of the ISS methods (§12).
+GVSOC ships a gdbserver with `reg_get`/`reg_set`/`stepi`, so it is a fair
+question. It was not a viable route, for three independent reasons.
 
----
+First, the reach-in was never a choice *against* the gdbserver: it was forced
+by a linking barrier. The bridge reads state only through public struct
+fields, never through ISS methods (`get_csr`, `access`, ...), because those
+methods are compiled into the model's `.so` and are not linkable from a
+DPI-loaded library — `RTLD_DEEPBIND` isolates the model's symbols. The
+bridge's own design comment in `gvsoc_engine.cpp` says exactly this, and the
+bridge was born in a single commit (`42d2781`) with the reach-in already in
+place.
 
-## 12. Why we did not use the gdbserver
+Second, the component is simply not there on our platform. The gdbserver is
+an opt-in `vp::Component` instantiated explicitly only on pulp_open,
+siracusa, cheshire and magia; neither `cv32e40p-standalone.py` nor
+`pulp_cores.py` creates it. (Upstream later added per-target
+auto-instantiation — see "Upstream drift".) There was, and is, no
+`Gdbserver_core` on `soc/core` to talk to.
 
-> A fair question, since GVSOC *does* ship a gdbserver with `reg_get`/`reg_set`/`stepi`. The honest
-> answer is **multi-factor**, and corrects the enthusiasm of an earlier revision of this analysis:
-> the gdbserver **was not a viable route**, on three independent fronts.
+Third, even if it were instantiated, the ISS implementation
+(`core/models/cpu/iss/src/gdbserver.cpp`) is structurally unsuitable for
+step-and-compare:
 
-**(a) The reach-in was not chosen *against* the gdbserver.** The bridge's design comment
-(`gvsoc_engine.cpp:35-39`) is explicit: state is read only through *public struct fields*, never
-through *ISS methods* (`get_csr`, `access`, …), because those methods are compiled into the model's
-`.so` and are **not linkable at DPI time** (`libgvsoc_rvvi.so` is loaded via DPI; `RTLD_DEEPBIND`
-isolates the model's symbols). Root cause = a linking barrier, not an anti-gdb decision. The bridge
-was born in a single commit (`42d2781`) with the reach-in from the start; **zero** mentions of gdb in
-its code.
+- `gdbserver_regs_get` exposes 33 registers — 32 GPRs plus
+  `reg[32] = current_insn` (the PC) — and zero CSRs, while the compare needs
+  ~19 CSRs (mstatus, mtvec, mcause, mepc, ...);
+- the single-register `gdbserver_reg_get` is unimplemented (prints and
+  returns 0), and `reg_set` only handles the PC;
+- `gdbserver_stepi` does not execute the instruction: it raises the step
+  mode, releases the halt and returns; the advance happens later in the
+  event loop and completion is signalled back over the RSP socket — an
+  asynchronous handshake, not a synchronous in-process step;
+- the API speaks GDB register indices; CSRs would need a qXfer
+  target-description XML that is not wired up.
 
-**(b) The gdbserver is not there on the cv32e40p platform.** It is an opt-in `vp::Component` to be
-instantiated on the systree (explicitly created only on pulp_open/siracusa/cheshire/magia).
-`cv32e40p-standalone.py` does not create it (0 occurrences) and neither does `pulp_cores.py`.
-Per-target auto-instantiation is in the ~46 upstream commits we are missing. → at the time (and now)
-**there was no `Gdbserver_core` on `soc/core` to talk to**.
+The reach-in gives synchronous access to PC, GPRs and CSRs — exactly what
+step-and-compare needs. Adopting the gdbserver would have meant instantiating
+the component, bypassing RSP, extending the interface with CSR access and a
+synchronous step, and handling the async signalling: a rewrite, not a reuse.
 
-**(c) Even if it were there, the interface is structurally unsuitable for step-and-compare** — this
-is the new finding (verified by reading the ISS implementation, `core/models/cpu/iss/src/gdbserver.cpp`):
-- **`gdbserver_regs_get`** exposes **33 registers = 32 GPRs + `reg[32]`=`current_insn` (PC), and ZERO
-  CSRs** (`:135-167`). RVVI step-and-compare compares ~19 CSRs (mstatus/mtvec/mcause/mepc/…): the
-  interface does not provide them.
-- **`gdbserver_reg_get`** (single) is **UNIMPLEMENTED** (prints and returns 0, `:127-131`); `reg_set`
-  only handles the PC.
-- **`gdbserver_stepi`** (`:203-218`) does **not execute** the instruction: it raises
-  `step_mode`/releases the halt and returns; the advance happens in the event-driven loop and
-  completion is notified **over the RSP socket** (`signal` → `Rsp::signal_from_core`) — an
-  **asynchronous** handshake, not a synchronous in-process `step()`.
-- The API speaks **GDB register indices** (CSRs would require a qXfer target-description XML that is
-  not wired up).
+## Improvements worth pursuing
 
-**Verdict.** The reach-in into public fields directly provides **PC + GPR + CSR with synchronous
-access**, which is exactly what step-and-compare requires. Adopting the gdbserver would have required:
-instantiating the component, bypassing the RSP, **extending the interface with CSR access and a
-synchronous step**, and handling the async signal — a rewrite, not a reuse. "It was not available"
-**and** "it would not have been the right tool" are both true and independent.
+Adaptive stepping through `get_next_event_time()`. The official DPI and
+SystemC drivers already use it; for us it would kill the blind 2000-cycle
+poll and with it the root cause of the runaway detector firing on WFI and
+far-future events. Adoptable today — the API is already in the vendored
+engine. The one risk is calibration against retire detection, so it should
+land as a prototype plus a full regression pass. If we pursue only one item
+on this list, it is this one.
 
----
+IRQ and debug over `wire_bind()`. Architecturally the right thing — it is
+what the official dpi-wrapper does — and it would replace the direct `mip`
+write plus the settle logic, and make haltreq complete. But it could
+reintroduce the ±1-cycle desync that informed injection was built to
+eliminate (the IRQ would be taken on GVSOC's own timing), and it does not
+address the CV32E40P-specific local-IRQ priority. Worth a spike, not a direct
+refactor.
 
-## 13. What we could use better / improvements
+Engine bump plus `gv_api_version()`. Upstream now versions the control API;
+adopting it turns a stale-`.so` SIGSEGV into a fail-fast version error. See
+"Upstream drift" for what the bump involves.
 
-> **Correction to an earlier revision of this document**: the gdbserver had been presented as a
-> near "drop-in" solution for state readback + per-instruction stepping. Verification (§12c) shows
-> the ISS implementation is unsuitable. The actually actionable levers are therefore different.
+A layout canary on the reach-in. Purely on our side and cheap: turn the
+silent SIGSEGV after a core bump into a diagnosable startup error.
 
-| # | Lever | What it buys | Status / feasibility |
-|---|---|---|---|
-| **L1** | **`get_next_event_time()` for adaptive stepping** (used by dpi.cpp/systemc) | kills the blind 2000-cycle poll and the root cause of the runaway on WFI/far events | **ADOPTABLE TODAY** — the API is there. Risk: calibration vs retire-detect → prototype + FAST2 regression |
-| **L2** | **`wire_bind()` for IRQ/debug** (the official dpi.cpp does this) | would replace the direct `mip` write + the `settle`, and would make haltreq complete | **ADOPTABLE** but with the caveat ↓ |
-| **L3** | **`gv_api_version()` + engine bump** | fail-fast version check instead of a SIGSEGV from a stale `.so` | **EXISTS UPSTREAM**, we lack it (§15) — adoptable with the bump |
-| **L4** | **Layout canary / fail-fast** on the reach-in | silent SIGSEGV → diagnosable error at submodule bump | adoptable today (our side) |
-| **L5** | **(upstream) extend the ISS gdbserver** with CSRs + `reg_get` + a synchronous step | would *then* make the gdbserver a valid route (removing the reach-in + the ABI fragility) | **high cost, upstream** — not a reuse, see §12c |
+Upstream state-readback API. A `reg_get`/`csr_get`/`pc_get` per hart — for
+instance a `vp::CoreStateIf` returned by `vp::Block`, the same pattern as
+upstream's `debug_mem_if()` — with corresponding `gv::` vtable slots would
+remove the reach-in entirely: the bridge would compile against `gv/gvsoc.hpp`
+alone and survive core bumps. Moderate ask: the ISS getters already exist
+(`get_reg_untimed`, `exec.current_insn`, the csr objects); the real work is
+CSR-by-address dispatch and multi-hart semantics. Extending the gdbserver
+instead would cost more, for the reasons above.
 
-**Caveat L2 (`wire_bind` IRQ)**: architecturally right (it is what the official dpi-wrapper does)
-**but** it could **reintroduce** the ±1-cycle desync that the informed-injection was built to
-eliminate (the IRQ would be handled at GVSOC's timing), and it does **not** solve the
-CV32E40P-specific local-IRQ priority. → a spike, not a direct refactor.
+Upstream per-instruction step or retire hook. A `step_instructions(n)`
+built on a retire budget that pauses the time engine, or a registrable retire
+callback, gated the way the gdbserver already gates fast mode (zero cost when
+off). This would remove the per-cycle poll loop, the PC-changed heuristic,
+the branch-to-self special case, `STEP_MAX_CYCLES` and the runaway detector
+in one move — one engine crossing per retire instead of up to 2000. The
+pause-on-event mechanism and the fast-mode gating both exist already; the
+design work is the retire semantics around traps and IRQ entry.
 
-**If only ONE thing**: **L1** (`get_next_event_time`) — adoptable without depending on upstream and
-with the best immediate return (kills the runaway).
+Runtime trace control and the debug-memory backdoor. Both exist upstream and
+come with the engine bump: `trace_level_set`/`trace_subscribe` make ISS
+instruction/LSU/IRQ tracing switchable while the simulation runs (turn it on
+only around a divergence window), and `vp::DebugMemIf` gives zero-time,
+out-of-band memory access while the sim is paused — useful for test-image
+loading, divergence-point memory dumps, or targeted ref←dut resyncs. The
+debug-mem path additionally needs `debug_mem_access` implemented in the pulp
+memory model, a small change in our fork.
 
----
+## Odds and ends
 
-## 14. Other findings of interest
+- The bus supports deferred responses (`IO_REQ_PENDING` with `grant`/`resp`
+  callbacks) and cumulative latency. Our exit device always answers a
+  synchronous `IO_REQ_OK`; anyone extending toward devices with back-pressure
+  must handle PENDING.
+- `testandset.cpp` emulates test-and-set at the interconnect level (read,
+  forward, write -1) on top of the AMO opcodes the `IoReq` already carries.
+- `bus_watchpoint.cpp` doubles as a RISC-V syscall handler for semihosting
+  host I/O (`getcwd`, `fcntl`, `mkdirat`, `unlinkat`, ...) — that is how
+  bare-metal programs do host I/O without a UART.
+- The proxy text protocol is a second step-by-step control channel besides
+  DPI (per-domain `step_cycles`, `get_component`, `trace`/`event`). Not
+  active on our target, but it exists.
+- The exit device's PASSED magic `0x075BCD15` is the same word the UVM
+  virtual peripheral uses — the coupling point between the RTL/UVM flow and
+  standalone GVSOC.
+- Dead code: the legacy C function `handle_syscall(Iss*, ...)` calls
+  `iss_exit()`, which is not defined anywhere in the tree, so it cannot be
+  part of the active flow; the live path is the `Syscalls::` class plus HTIF.
 
-- **Asynchronous `io_req`** (`itf/io.hpp`): the bus supports `IO_REQ_PENDING` (deferred response via
-  callback) and cumulative latency. Our exit device always returns a synchronous `IO_REQ_OK` —
-  anyone extending toward devices with back-pressure must handle PENDING.
-- **AMO on the bus**: the `IoReq` carries atomic opcodes (`LR/SC/SWAP/ADD/…`, `io.hpp:41-56`);
-  `testandset.cpp` emulates test-and-set at the interconnect level (read → forward → write `-1`).
-- **`bus_watchpoint.cpp` is also a RISC-V syscall handler** (semihosting host I/O: `getcwd/fcntl/mkdirat/
-  unlinkat/…`) — this explains how bare-metal programs do host I/O without a real UART.
-- **Proxy text protocol** (`proxy.cpp`): a second step-by-step control channel besides DPI
-  (per-domain `step_cycles`, `get_component`, `trace`/`event`). Not active on our target, but it exists.
-- **Shared magic word**: the exit device's PASSED word `0x075BCD15` is the same one used by the UVM
-  virtual peripheral — it is the RTL/UVM ↔ standalone-GVSOC coupling point.
-- **Dead code**: the legacy C function `handle_syscall(Iss*, …)` calls `iss_exit()` which **is not
-  defined anywhere in the tree** → not compiled in the active flow (the live path is the
-  `Syscalls::` class + HTIF).
+Not verified: checkpoint/restart is absent from the vendored engine (the
+upstream `restart()` is in the missing commits); whether `iss/` vs `iss_v2/`
+differ in accuracy for our cores; the exact `prefetcher_size` for the
+`cv32e40p` class and where the branch penalty is accounted.
 
-**Not present / not verified**: checkpoint/restart is not in the vendored engine (the upstream
-`restart()` is in the missing commits); `iss/` vs `iss_v2/` — our path references
-`cpu/iss/src/cv32e40p/` (the "v1" ISS) but the accuracy difference has not been proven [to verify];
-the exact `prefetcher_size` for the `cv32e40p` class and where the branch penalty lives [to verify].
+## Upstream drift and what a bump would take
 
----
+As of July 2026 the vendored engine (`a8c57439`) is about 77 commits behind
+`gvsoc/gvsoc-engine` main. Upstream now versions the public API —
+`GV_API_VERSION = 10` plus an `extern "C" int gv_api_version()` accessor; our
+snapshot predates the versioning entirely. Additions we lack:
 
-## 15. Recency & maintenance
+- `gv_api_version()` (`99a3ffc7`, `ea216770`) — the fail-fast compatibility
+  check;
+- runtime trace control (`trace_subscribe`/`trace_unsubscribe` at v9,
+  `trace_level_set` at v10) — `--trace`/`--trace-level` become switchable at
+  runtime;
+- the debug-memory backdoor (`9a73ab40`, `20400ea7`): `vp::DebugMemIf`,
+  zero-time out-of-band memory access on a paused sim, with a flat
+  `DebugMemMap` built at first access and an optional host-pointer fast
+  path; terminal memories must implement `debug_mem_access`, which the
+  vendored pulp memory model does not yet;
+- in-process `restart()` (v3), `GvsocConf::proxy_enabled` (v5), a
+  console-output channel (v6), `get_memcheck_fault()` (v7), exact proxy-side
+  `step_cycles` (`23d670b4`);
+- per-target gdbserver auto-instantiation (`b93bf7b5`): Python-only (about
+  40 lines across the two runners), it adds an inert `gdbserver` node at the
+  tree root unless the target already declares one. It does not move or
+  rename `soc/core`, and it only takes effect when `gvsoc_config.json` is
+  regenerated with the new runners — an engine-only bump reusing a
+  pre-generated config does not instantiate it.
 
-The vendored engine (`a8c57439`, upstream not forked) is **~46 commits behind** `gvsoc/gvsoc-engine`
-main. Among the missing ones: `gv_api_version()` (`99a3ffc7` — lever L3), per-target gdbserver
-auto-instantiation (`b93bf7b5`), in-process `restart()`, exact `step_cycles`, SystemC launcher split.
-API delta: we lack `Gvsoc::restart()`, `GvsocConf::proxy_enabled`, `gv_api_version()`. **Bump risk**:
-the auto-gdbserver changes the component graph → validate that it neither moves `soc/core` nor breaks
-the reach-in (rule `cross-target-iss-validation.md` + `/verify-gvsoc`).
+A bump looks moderate. Checked directly on upstream main: the sync-mode
+contract is unchanged (`Controller::start()` still takes the engine mutex
+when `!is_async`, `stop()` still requires the engine locked — our shutdown
+workaround remains both valid and necessary), and `Gvsoc_user` keeps the same
+five callbacks with empty defaults. The real risk is skew between a new
+engine and our older core/pulp forks: upstream reworked the port signatures
+(`9968edfd`, class-based for all ports) and the platform-tree generation, and
+legacy string-signature support has already needed a follow-up fix
+(`7aa44582`). The API changelog documents breaking layout changes at v2, v4,
+v5 and v6, but they only affect `Vcd` consumers, which this bridge is not.
+One watch-item: sync `join()` now waits for every client's `has_quit`; we are
+single-client and call `quit(0)` first, so this should be fine, but it wants
+a smoke test. Bump order: rebuild the bridge against the new headers,
+regenerate the config, then `make check-rvvi` plus a dual-trace
+`illegal_instr_test` and `hello-world` with `USE_ISS=YES` before trusting any
+regression score.
 
-> Honesty note: the exact content of `b93bf7b5` is not readable in this tree (missing commit); the
-> **absence** of auto-instantiation, however, is verified directly on our code. The "46 commits"
-> figure is today's snapshot via `git fetch`.
+Related: the core repo also ships `iss_v2`, a modular rewrite of the ISS —
+thirteen compile-time subsystem slots, no `IssWrapper`, core personalities
+can live out of tree. The pulp fork's RI5CY already runs on it with an
+out-of-tree `Ri5kyCsr`, which would be the natural template if CV32E40P ever
+moved. We deliberately stay on iss v1 for now: the v2 gdbserver is unchanged
+(still no CSR readback), so migrating would not remove the reach-in, while
+all the CV32E40P personality code, the CORE-V ISA wiring (`isa_cv32e40pv2`
+has never been emitted for a v2 core) and the bridge's state access would
+need porting and a full parity re-validation. Worth revisiting if upstream
+grows a state-readback API or if v1 stops receiving fixes.
 
----
+## References
 
-## 16. References
+Engine (`gvsoc/engine/engine/`): `include/gv/gvsoc.hpp` · `src/launcher.cpp`
+and `include/vp/controller.hpp` · `time/time_engine.{hpp,cpp}` ·
+`clock/{clock_engine,clock_event,block_clock}.{hpp,cpp}` ·
+`src/{top,component,block,mapping_tree}.cpp` · `src/{trace,power}/*` ·
+`src/stats.cpp` · `include/vp/gdbserver/gdbserver_engine.hpp` ·
+`dpi-wrapper/src/dpi.cpp` · `src/proxy.cpp`
 
-**Engine** (`gvsoc/engine/engine/`): `include/gv/gvsoc.hpp` · `src/launcher.cpp` + `include/vp/controller.hpp`
-· `time/time_engine.{hpp,cpp}` · `clock/{clock_engine,clock_event,block_clock}.{hpp,cpp}` ·
-`src/{top,component,block,mapping_tree}.cpp` · `src/{trace,power}/*` · `src/stats.cpp` ·
-`include/vp/gdbserver/gdbserver_engine.hpp` · `dpi-wrapper/src/dpi.cpp` · `src/proxy.cpp`
+Core / ISS (`gvsoc/core/models/`):
+`cpu/iss/include/cores/cv32e40p/class.hpp` ·
+`cpu/iss/{src/exec/exec_inorder.cpp,include/exec/exec_inorder*.hpp}` ·
+`cpu/iss/include/insn_cache.hpp` · `cpu/iss/include/prefetch/*` ·
+`cpu/iss/src/{exception,syscalls,htif,gdbserver}.cpp` ·
+`interco/router/router.cpp` · `interco/{bus_watchpoint,testandset}.cpp` ·
+`memory/memory.cpp` · `gdbserver/{gdbserver,rsp}.cpp`
 
-**Core / ISS** (`gvsoc/core/models/`): `cpu/iss/include/cores/cv32e40p/class.hpp` ·
-`cpu/iss/{src/exec/exec_inorder.cpp,include/exec/exec_inorder*.hpp}` · `cpu/iss/include/insn_cache.hpp` ·
-`cpu/iss/include/prefetch/*` · `cpu/iss/src/{exception,syscalls,htif,gdbserver}.cpp` · `interco/router/router.cpp`
-· `interco/{bus_watchpoint,testandset}.cpp` · `memory/memory.cpp` · `gdbserver/{gdbserver,rsp}.cpp`
+Platform (`gvsoc/pulp/`): `cv32e40p-standalone.py` ·
+`pulp/cpu/iss/pulp_cores.py` · `pulp/cv32e40p_exit/cv32e40p_exit_device.cpp`
 
-**Platform** (`gvsoc/pulp/`): `cv32e40p-standalone.py` · `pulp/cpu/iss/pulp_cores.py` ·
-`pulp/cv32e40p_exit/cv32e40p_exit_device.cpp`
+Our side: `gvsoc_engine.{cpp,hpp}` and [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-**Our side**: `gvsoc_engine.{cpp,hpp}` · see [`ARCHITECTURE.md`](ARCHITECTURE.md)
-
-**External**: [GVSoC paper — arXiv:2201.08166](https://arxiv.org/pdf/2201.08166) ·
-[gvsoc/gvsoc (GitHub)](https://github.com/gvsoc/gvsoc) · [user docs](https://gvsoc.readthedocs.io/) ·
+External: [the GVSoC paper (arXiv:2201.08166)](https://arxiv.org/pdf/2201.08166) ·
+[gvsoc/gvsoc on GitHub](https://github.com/gvsoc/gvsoc) ·
+[user docs](https://gvsoc.readthedocs.io/) ·
 [developer docs](https://gvsoc-developer.readthedocs.io/) ·
-[GAP SDK GDB Server](https://greenwaves-technologies.com/manuals_gap9/gap9_sdk_doc/html/source/tools/docs/gvsoc/gdb_server.html)
+[GAP SDK GDB server](https://greenwaves-technologies.com/manuals_gap9/gap9_sdk_doc/html/source/tools/docs/gvsoc/gdb_server.html)
