@@ -54,13 +54,14 @@
 /* First line of defense on the ABI contract: if the ISS_DEFINES in the
  * Makefile drift from the flags the model .so was built with, the Regfile
  * layout is the first thing to move (ISS_SINGLE_REGFILE alone shrinks it
- * 1592 -> 944 bytes). Catch the drift at compile time; the runtime canary in
- * engine_acquire_core() catches what a same-size skew would still hide. */
+ * 1600 -> 952 bytes). Catch the drift at compile time; the runtime canary in
+ * engine_acquire_core() catches what a same-size skew would still hide.
+ * Sizes are pinned to the engine submodule revision (ea216770). */
 #ifdef ISS_SINGLE_REGFILE
-static_assert(sizeof(Regfile) == 944,
+static_assert(sizeof(Regfile) == 952,
               "Regfile layout drifted from the ISS_DEFINES contract (see Makefile)");
 #else
-static_assert(sizeof(Regfile) == 1592,
+static_assert(sizeof(Regfile) == 1600,
               "Regfile layout drifted from the ISS_DEFINES contract (see Makefile)");
 #endif
 
