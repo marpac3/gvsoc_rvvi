@@ -168,7 +168,8 @@ CV32E40P_TARGETS := cv32e40p-standalone \
                     cv32e40p-standalone:fpu=True \
                     cv32e40p-standalone:fpu=True,zfinx=True \
                     cv32e40p-standalone:corev_pulp=True,fpu=True \
-                    cv32e40p-standalone:corev_pulp=True,fpu=True,zfinx=True
+                    cv32e40p-standalone:corev_pulp=True,fpu=True,zfinx=True \
+                    cv32e40p-v2-spike
 
 gvsoc:
 	$(MAKE) -C $(GVSOC_HOME) \
