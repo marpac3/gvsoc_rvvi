@@ -412,9 +412,11 @@ int gvsoc_engine_init(const char *config_path)
 
     if (engine_acquire_core() != 0)
     {
-        g_gvsoc->stop();
-        g_gvsoc->close();
-        g_gvsoc = nullptr;
+        /* No graceful teardown here: stop() self-deadlocks in sync mode
+         * (see the abnormal-shutdown path below). The simulator aborts on
+         * the failed init anyway; the OS reclaims the engine. */
+        g_wrapper = nullptr;
+        g_gvsoc   = nullptr;
         return -1;
     }
 
@@ -955,23 +957,39 @@ void gvsoc_engine_settle_irq(void)
 
     iss_reg_t settle_start_pc = g_wrapper->iss.exec.current_insn;
 
-    for (int i = 0; i < SETTLE_DRAIN_CYCLES; i++)
+    /* No exception may cross the DPI boundary: same guard as the step loop. */
+    try
     {
-        g_gvsoc->step(g_clock_ps);
-
-        if (g_finished)
-            break;
-
-        iss_reg_t settle_pc = g_wrapper->iss.exec.current_insn;
-        if (settle_pc != settle_start_pc)
+        for (int i = 0; i < SETTLE_DRAIN_CYCLES; i++)
         {
-            /* IRQ taken: record the trapped instruction as the last retired
-             * PC so gvsoc_engine_get_pc() matches the DUT. */
-            g_retired_pc = settle_start_pc;
-            ENGINE_LOG("settle_irq: IRQ taken on drain cycle %d, PC 0x%08x -> 0x%08x",
-                       i, (unsigned)settle_start_pc, (unsigned)settle_pc);
-            return;
+            g_gvsoc->step(g_clock_ps);
+
+            if (g_finished)
+                break;
+
+            iss_reg_t settle_pc = g_wrapper->iss.exec.current_insn;
+            if (settle_pc != settle_start_pc)
+            {
+                /* IRQ taken: record the trapped instruction as the last retired
+                 * PC so gvsoc_engine_get_pc() matches the DUT. */
+                g_retired_pc = settle_start_pc;
+                ENGINE_LOG("settle_irq: IRQ taken on drain cycle %d, PC 0x%08x -> 0x%08x",
+                           i, (unsigned)settle_start_pc, (unsigned)settle_pc);
+                return;
+            }
         }
+    }
+    catch (const std::exception &e)
+    {
+        ENGINE_ERR("settle_irq: step() threw: %s", e.what());
+        g_finished = true;
+        return;
+    }
+    catch (...)
+    {
+        ENGINE_ERR("settle_irq: step() threw unknown exception");
+        g_finished = true;
+        return;
     }
 
     /* No PC change: IRQ masked (mstatus.MIE=0) or pending for next fetch;
