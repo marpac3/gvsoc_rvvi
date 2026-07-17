@@ -71,6 +71,26 @@ ISS_INCLUDES := -I$(GVSOC_HOME)/engine/engine/include \
 # fregs[] does not exist. Hence two distinct .so builds.
 ISS_DEFINES_ZFINX := $(ISS_DEFINES) -DISS_SINGLE_REGFILE=1 -DCONFIG_GVSOC_ISS_ZFINX=1
 
+# iss_v2 bridge (gvsoc_engine_v2.cpp). The module layout is fixed by the
+# generated ISA header (personality types + layout-affecting defines), so it
+# is force-included: run `make gvsoc` first, the header lives in the GVSOC
+# build tree. Base and FPU share one layout (verified by static_assert +
+# runtime canary); ZFINX drops the 32 float registers, hence a second build.
+ISS_DEFINES_V2 := -DNDEBUG -D__GVSOC__ -DISS_WORD_32 \
+                  -DCONFIG_GVSOC_ISS_V2=1 \
+                  -DCONFIG_GVSOC_ISS_TIMED=1 \
+                  -DCONFIG_GVSOC_ISS_HTIF=1 \
+                  -DCONFIG_GVSOC_ISS_FLOAT_USE_FLEXFLOAT=1 \
+                  -DCONFIG_GVSOC_ISS_FP_WIDTH=32
+ISS_DEFINES_V2_ZFINX := $(ISS_DEFINES_V2) -DCONFIG_GVSOC_ISS_ZFINX=1
+ISA_HDR_V2       := $(shell ls -t $(BUILDDIR)/engine/isa_cv32e40p_v2_rv32imfc_pulp_[0-9]*.hpp 2>/dev/null | head -1)
+ISA_HDR_V2_ZFINX := $(shell ls -t $(BUILDDIR)/engine/isa_cv32e40p_v2_rv32imfc_pulp_zfinx_*.hpp 2>/dev/null | head -1)
+ISS_INCLUDES_V2  := -I$(BUILDDIR)/engine \
+                    -I$(GVSOC_HOME)/config_tree \
+                    -I$(GVSOC_HOME)/engine/engine/include \
+                    -I$(GVSOC_HOME)/core/models \
+                    -I$(GVSOC_HOME)/pulp
+
 # DEBUG=1 → -g -O0 (gdb/VS Code). -O0 wins over -O2 because it comes later.
 # It does not change the ABI (which depends on the -D CONFIG_*, not on -O):
 # the .so stays compatible with libpulpvp.so.
@@ -82,26 +102,36 @@ endif
 CXXFLAGS              := $(CXXFLAGS_BASE)                                  # rvvi_api2gvsoc.cpp
 CXXFLAGS_ENGINE       := $(CXXFLAGS_BASE) $(ISS_DEFINES) $(ISS_INCLUDES)   # gvsoc_engine.cpp
 CXXFLAGS_ENGINE_ZFINX := $(CXXFLAGS_BASE) $(ISS_DEFINES_ZFINX) $(ISS_INCLUDES)
+CXXFLAGS_ENGINE_V2       := $(CXXFLAGS_BASE) $(ISS_DEFINES_V2) -include $(ISA_HDR_V2) $(ISS_INCLUDES_V2)
+CXXFLAGS_ENGINE_V2_ZFINX := $(CXXFLAGS_BASE) $(ISS_DEFINES_V2_ZFINX) -include $(ISA_HDR_V2_ZFINX) $(ISS_INCLUDES_V2)
 
 # Library options only: at link time the objects MUST precede -lpulpvp.
 LDFLAGS := -L$(GVSOC_LIB) -lpulpvp -Wl,-rpath,$(GVSOC_LIB)
 
 ifdef QUESTA_HOME
-    CXXFLAGS              += -I$(QUESTA_HOME)/include
-    CXXFLAGS_ENGINE       += -I$(QUESTA_HOME)/include
-    CXXFLAGS_ENGINE_ZFINX += -I$(QUESTA_HOME)/include
+    CXXFLAGS                 += -I$(QUESTA_HOME)/include
+    CXXFLAGS_ENGINE          += -I$(QUESTA_HOME)/include
+    CXXFLAGS_ENGINE_ZFINX    += -I$(QUESTA_HOME)/include
+    CXXFLAGS_ENGINE_V2       += -I$(QUESTA_HOME)/include
+    CXXFLAGS_ENGINE_V2_ZFINX += -I$(QUESTA_HOME)/include
 else ifdef VCS_HOME
-    CXXFLAGS              += -I$(VCS_HOME)/include
-    CXXFLAGS_ENGINE       += -I$(VCS_HOME)/include
-    CXXFLAGS_ENGINE_ZFINX += -I$(VCS_HOME)/include
+    CXXFLAGS                 += -I$(VCS_HOME)/include
+    CXXFLAGS_ENGINE          += -I$(VCS_HOME)/include
+    CXXFLAGS_ENGINE_ZFINX    += -I$(VCS_HOME)/include
+    CXXFLAGS_ENGINE_V2       += -I$(VCS_HOME)/include
+    CXXFLAGS_ENGINE_V2_ZFINX += -I$(VCS_HOME)/include
 endif
 
-TARGET       := libgvsoc_rvvi.so
-TARGET_ZFINX := libgvsoc_rvvi_zfinx.so
-TARGET_TEXT  := librvvi_text.so
-OBJS         := rvvi_api2gvsoc.o gvsoc_engine.o rvvi_text_writer.o
-OBJS_ZFINX   := rvvi_api2gvsoc.o gvsoc_engine_zfinx.o rvvi_text_writer.o
-OBJS_TEXT    := rvvi_text_dpi.o rvvi_text_writer.o
+TARGET          := libgvsoc_rvvi.so
+TARGET_ZFINX    := libgvsoc_rvvi_zfinx.so
+TARGET_V2       := libgvsoc_rvvi_v2.so
+TARGET_V2_ZFINX := libgvsoc_rvvi_v2_zfinx.so
+TARGET_TEXT     := librvvi_text.so
+OBJS            := rvvi_api2gvsoc.o gvsoc_engine.o rvvi_text_writer.o
+OBJS_ZFINX      := rvvi_api2gvsoc.o gvsoc_engine_zfinx.o rvvi_text_writer.o
+OBJS_V2         := rvvi_api2gvsoc.o gvsoc_engine_v2.o rvvi_text_writer.o
+OBJS_V2_ZFINX   := rvvi_api2gvsoc.o gvsoc_engine_v2_zfinx.o rvvi_text_writer.o
+OBJS_TEXT       := rvvi_text_dpi.o rvvi_text_writer.o
 
 # Installed gvrun: it sets LD_LIBRARY_PATH/PATH/PYTHONPATH/USE_GVRUN/--platform by itself.
 # gvrun needs the Python env (see README): wrap it in 'micromamba run' when
@@ -113,9 +143,9 @@ ifneq ($(MICROMAMBA),)
 endif
 GVRUN := $(GVRUN_ENV) timeout 10s $(INSTALLDIR)/bin/gvrun
 
-.PHONY: all gvsoc config trace clean distclean test
+.PHONY: all gvsoc config config-v2 trace clean distclean test
 
-all: $(TARGET) $(TARGET_ZFINX) $(TARGET_TEXT)
+all: $(TARGET) $(TARGET_ZFINX) $(TARGET_V2) $(TARGET_V2_ZFINX) $(TARGET_TEXT)
 
 # Separate compilation: rvvi_api2gvsoc.cpp with the base flags, gvsoc_engine.cpp with the ISS flags.
 rvvi_api2gvsoc.o: rvvi_api2gvsoc.cpp gvsoc_engine.hpp rvvi_text_writer.hpp
@@ -139,6 +169,14 @@ gvsoc_engine.o: gvsoc_engine.cpp gvsoc_engine.hpp
 gvsoc_engine_zfinx.o: gvsoc_engine.cpp gvsoc_engine.hpp
 	$(CXX) $(CXXFLAGS_ENGINE_ZFINX) -c $< -o $@
 
+gvsoc_engine_v2.o: gvsoc_engine_v2.cpp gvsoc_engine.hpp $(ISA_HDR_V2)
+	@test -n "$(ISA_HDR_V2)" || { echo "generated ISA header not found - run 'make gvsoc' first"; exit 1; }
+	$(CXX) $(CXXFLAGS_ENGINE_V2) -c $< -o $@
+
+gvsoc_engine_v2_zfinx.o: gvsoc_engine_v2.cpp gvsoc_engine.hpp $(ISA_HDR_V2_ZFINX)
+	@test -n "$(ISA_HDR_V2_ZFINX)" || { echo "generated ISA header not found - run 'make gvsoc' first"; exit 1; }
+	$(CXX) $(CXXFLAGS_ENGINE_V2_ZFINX) -c $< -o $@
+
 $(TARGET): $(OBJS)
 	$(CXX) -shared $(OBJS) $(LDFLAGS) -o $@
 	@echo "OK → $(TARGET)"
@@ -146,6 +184,14 @@ $(TARGET): $(OBJS)
 $(TARGET_ZFINX): $(OBJS_ZFINX)
 	$(CXX) -shared $(OBJS_ZFINX) $(LDFLAGS) -o $@
 	@echo "OK → $(TARGET_ZFINX)"
+
+$(TARGET_V2): $(OBJS_V2)
+	$(CXX) -shared $(OBJS_V2) $(LDFLAGS) -o $@
+	@echo "OK → $(TARGET_V2)"
+
+$(TARGET_V2_ZFINX): $(OBJS_V2_ZFINX)
+	$(CXX) -shared $(OBJS_V2_ZFINX) $(LDFLAGS) -o $@
+	@echo "OK → $(TARGET_V2_ZFINX)"
 
 # librvvi_text.so — standalone RVVI-TEXT writer for RTL-only sims (no GVSOC dep,
 # so it links without libpulpvp / the embedded engine).
@@ -202,6 +248,23 @@ endif
 	cp $(WORK_DIR)/gvsoc_config.json $(if $(GVSOC_CONFIG),$(GVSOC_CONFIG),gvsoc_config.json)
 	@echo "OK → $(if $(GVSOC_CONFIG),$(GVSOC_CONFIG),gvsoc_config.json) (binary=$(BINARY), pulp=$(COREV_PULP), fpu=$(FPU), zfinx=$(ZFINX), num_mhpmcounters=$(NUM_MHPMCOUNTERS))"
 
+# make config-v2 — same, for the iss_v2 co-simulation targets: the core
+# configuration is baked into the target name, so there are no --parameter
+# knobs besides the binary.
+V2_TARGET ?= cv32e40p-v2-standalone
+config-v2:
+ifeq ($(BINARY),__BINARY_NOT_SET__)
+	$(error BINARY not set — use: make config-v2 BINARY=/path/to/test.elf [V2_TARGET=cv32e40p-v2-standalone-fpu])
+endif
+	mkdir -p $(WORK_DIR)
+	$(GVRUN) \
+		--target=$(V2_TARGET) \
+		--work-dir=$(WORK_DIR) \
+		--parameter binary=$(BINARY) \
+		prepare
+	cp $(WORK_DIR)/gvsoc_config.json $(if $(GVSOC_CONFIG),$(GVSOC_CONFIG),gvsoc_config.json)
+	@echo "OK → $(if $(GVSOC_CONFIG),$(GVSOC_CONFIG),gvsoc_config.json) (target=$(V2_TARGET), binary=$(BINARY))"
+
 # make trace — standalone GVSOC with instruction trace → $(TRACE).
 trace:
 ifeq ($(BINARY),__BINARY_NOT_SET__)
@@ -221,7 +284,7 @@ endif
 		run > $(TRACE) 2>&1
 
 clean:
-	rm -f $(TARGET) $(TARGET_ZFINX) $(TARGET_TEXT) $(OBJS) gvsoc_engine_zfinx.o rvvi_text_dpi.o test/test_rvvi_text_writer
+	rm -f $(TARGET) $(TARGET_ZFINX) $(TARGET_V2) $(TARGET_V2_ZFINX) $(TARGET_TEXT) $(OBJS) gvsoc_engine_zfinx.o gvsoc_engine_v2.o gvsoc_engine_v2_zfinx.o rvvi_text_dpi.o test/test_rvvi_text_writer
 	rm -rf $(WORK_DIR)
 
 distclean: clean
