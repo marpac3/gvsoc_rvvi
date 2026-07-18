@@ -666,6 +666,29 @@ bool gvsoc_engine_is_runaway(void)
     return g_runaway;
 }
 
+/* Per-instruction stepping: the state is always exact for the served
+ * retire (see the header contract). */
+uint64_t gvsoc_engine_pending_commits(void)
+{
+    return 0;
+}
+
+int gvsoc_engine_commit_stream(void)
+{
+    return 0;
+}
+
+int gvsoc_engine_state_current(void)
+{
+    return 1;
+}
+
+/* Per-instruction stepping has no commit queue to inspect. */
+int gvsoc_engine_materialize_commit(uint32_t * /*pc*/)
+{
+    return -1;
+}
+
 bool gvsoc_engine_finished(void)
 {
     return g_finished;

@@ -82,6 +82,53 @@ bool gvsoc_engine_finished(void);
  */
 bool gvsoc_engine_is_runaway(void);
 
+/**
+ * Commits still queued after the last gvsoc_engine_step().
+ *
+ * The v2 engine retires from a deferred-commit stream: on a multi-commit
+ * burst the ISS register/CSR state has already advanced to the NEWEST
+ * queued commit, so while this returns > 0 a state compare against the
+ * retire just served would read future values. 0 = state is exact for the
+ * served retire. The v1 engine steps per instruction and always returns 0.
+ */
+uint64_t gvsoc_engine_pending_commits(void);
+
+/**
+ * 1 when retires are served from an architectural commit stream, 0 for
+ * per-instruction stepping.
+ *
+ * On a commit-stream engine (v2) a refused instruction (illegal) never
+ * commits, so its DUT trap row has no ISS step to consume: stepping there
+ * would eat the first handler commit and shift the comparison by one
+ * retire per trap. An instruction that executes and then traps
+ * (ecall/ebreak) does commit — materialize_commit tells the two apart by
+ * PC. A per-instruction engine (v1) always consumes the faulting step.
+ */
+int gvsoc_engine_commit_stream(void);
+
+/**
+ * 1 when the ISS architectural state matches the last served retire, 0 when
+ * a trap redirect happened after that instruction executed (it was still
+ * held in the commit FIFO behind an in-flight memory op when the next
+ * instruction trapped): the sampled CSR/GPR state then already includes
+ * the trap entry, and state compares on this retire must be skipped. The
+ * comparison re-arms on the first commit stamped after the redirect. The
+ * v1 engine steps per instruction and always returns 1.
+ */
+int gvsoc_engine_state_current(void);
+
+/**
+ * Ensure at least one commit is queued (advancing the engine if needed) and
+ * return its PC WITHOUT consuming it.  0 = *pc valid, -1 = timeout/finished
+ * or per-instruction engine.
+ *
+ * Used on DUT trap rows to decide whether the row has a commit to consume:
+ * an instruction that executes and then traps (ecall/ebreak) commits, so its
+ * PC equals the trapped PC; a refused instruction (illegal) never commits and
+ * the queued head is already the handler entry.
+ */
+int gvsoc_engine_materialize_commit(uint32_t *pc);
+
 /* ---- State query: PC and instruction ---- */
 
 uint32_t gvsoc_engine_get_pc(void);
@@ -164,7 +211,7 @@ void gvsoc_engine_set_fpr(uint32_t index, uint32_t value);
 int gvsoc_engine_set_csr(uint32_t csr_addr, uint32_t value);
 
 /**
- * Set or clear an IRQ line in the ISS (direct mip write).
+ * Set or clear an IRQ line in the ISS.
  *
  * Maps RVVI net indices (assigned by init_net_map in rvvi_api2gvsoc.cpp) to mip
  * bit positions:
@@ -173,6 +220,10 @@ int gvsoc_engine_set_csr(uint32_t csr_addr, uint32_t value);
  *   2     = MExternalInterrupt -> mip bit 11
  *   3..18 = LocalInterrupt0..15 -> mip bits 16..31
  *   19    = haltreq            -> debug request (not an IRQ, handled apart)
+ *
+ * Delivery is engine-specific: the v1 engine writes mip directly; the v2
+ * engine drives the platform irq-injector wires (gv::wire_bind), so mip and
+ * the WFI wake-up follow the model's own interrupt path.
  *
  * @param net_index  RVVI net index.
  * @param value      1 = assert, 0 = deassert.

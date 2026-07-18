@@ -219,6 +219,7 @@ CV32E40P_TARGETS := cv32e40p-standalone \
                     cv32e40p-v2-spike-fpu \
                     cv32e40p-v2-spike-zfinx \
                     cv32e40p-v2-standalone \
+                    cv32e40p-v2-standalone-nopulp \
                     cv32e40p-v2-standalone-fpu \
                     cv32e40p-v2-standalone-zfinx
 

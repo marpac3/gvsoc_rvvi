@@ -311,6 +311,29 @@ static uint64_t g_metric_comparisons_gpr   = 0;
 static uint64_t g_metric_comparisons_fpr   = 0;
 static uint64_t g_metric_comparisons_csr   = 0;
 static uint64_t g_metric_comparisons_insbin = 0;
+static uint64_t g_metric_state_deferred    = 0;
+
+/* Deferred-commit gate, two v2-only cases where the ISS state is newer
+ * than the retire being compared (PC/order compares stay valid):
+ * - commits still queued after this retire (multi-commit burst): the state
+ *   matches the NEWEST queued commit; the compare resumes at the burst tail;
+ * - a trap redirected the ISS after this instruction executed (it was held
+ *   in the commit FIFO behind an in-flight memory op when the next
+ *   instruction trapped): the state includes the trap entry; the compare
+ *   re-arms on the first post-redirect commit.
+ * The v1 engine steps per instruction and never defers. */
+static uint64_t g_state_deferred_last_retire = 0;
+
+static bool state_compare_deferred(void)
+{
+    if (gvsoc_engine_pending_commits() == 0 && gvsoc_engine_state_current())
+        return false;
+    if (g_state_deferred_last_retire != g_metric_retires) {
+        g_state_deferred_last_retire = g_metric_retires;
+        g_metric_state_deferred++;
+    }
+    return true;
+}
 
 /* Per-category mismatch counts for throttled logging */
 static uint64_t g_pc_mismatch_count   = 0;
@@ -763,6 +786,9 @@ bool_t rvviRefShutdown(void)
         BRIDGE_LOG("  phase realigns : %llu", (unsigned long long)g_phase_realign_count);
     if (g_volatile_sync_count > 0)
         BRIDGE_LOG("  volatile syncs : %llu", (unsigned long long)g_volatile_sync_count);
+    if (g_metric_state_deferred > 0)
+        BRIDGE_LOG("  state-deferred retires : %llu (commit bursts, PC-only compare)",
+                   (unsigned long long)g_metric_state_deferred);
 
     if (g_bridge_profile) {
         BRIDGE_LOG("--- per-function profile (CV_RVVI_BRIDGE_PROFILE=1) ---");
@@ -878,13 +904,19 @@ void rvviRefInjectIrq(uint32_t /*hartId*/, uint32_t mcause)
      * retire's DUT PC (committed by rvviDutRetire, called by SV before this). */
     uint32_t iss_mstatus = 0, mtvec = 0;
     gvsoc_engine_get_csr(TRAP_CSR_MSTATUS, &iss_mstatus);
-    if (!((iss_mstatus >> 3) & 1u))
+    if (!((iss_mstatus >> 3) & 1u)) {
+        BRIDGE_LOG_HOT("informed-inject reject: ISS MIE=0 (mstatus=0x%08x, mcause=0x%08x, dutPc=0x%08x)",
+                       iss_mstatus, mcause, g_retire.pc);
         return;                         /* ISS MIE=0: already took -> no re-inject */
+    }
     gvsoc_engine_get_csr(CSR_MTVEC, &mtvec);
     uint32_t vbase = mtvec & ~(uint32_t)1u;
     uint32_t entry = (mtvec & 1u) ? (vbase + (uint32_t)irq_id * 4u) : vbase;
-    if (g_retire.pc != entry)
+    if (g_retire.pc != entry) {
+        BRIDGE_LOG_HOT("informed-inject reject: DUT PC 0x%08x != entry 0x%08x (mtvec=0x%08x, id=%d)",
+                       g_retire.pc, entry, mtvec, irq_id);
         return;                         /* DUT not at the trap vector -> not a genuine take */
+    }
 
     g_informed_irq_count++;
 
@@ -1023,6 +1055,23 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
     PROF_SCOPE(g_prof_ns_step, g_prof_cnt_step);
     if (!gvsoc_engine_is_running())
         return RVVI_TRUE;  /* stub mode */
+
+    /* Trap rows need commit-stream care: an instruction that executes and
+     * then traps (ecall/ebreak) commits in the ISS, so its commit must be
+     * consumed here like any retire; a refused instruction (illegal) never
+     * commits, so the queued head is already the handler entry and consuming
+     * it would shift the comparison by one retire per trap.  Materialize the
+     * head and let its PC decide.  Per-instruction engines (v1) consume the
+     * faulting step unconditionally.  The SV batch compare is already gated
+     * on !trap, so returning without a step is safe. */
+    if (g_retire.is_trap && gvsoc_engine_commit_stream()) {
+        uint32_t commit_pc = 0;
+        if (gvsoc_engine_materialize_commit(&commit_pc) == 0 &&
+            commit_pc == (uint32_t)g_retire.pc) {
+            gvsoc_engine_step();
+        }
+        return RVVI_TRUE;
+    }
 
     int rc = gvsoc_engine_step();
     if (rc == 0 && gvsoc_engine_finished()) {
@@ -1254,6 +1303,8 @@ bool_t rvviRefGprsCompare(uint32_t /*hartId*/)
     PROF_SCOPE(g_prof_ns_gpr_cmp, g_prof_cnt_gpr_cmp);
     if (!gvsoc_engine_is_running() || gvsoc_engine_finished())
         return RVVI_TRUE;
+    if (state_compare_deferred())
+        return RVVI_TRUE;
 
     bool_t pass = RVVI_TRUE;
     for (uint32_t i = 1; i < 32; i++) {
@@ -1275,6 +1326,8 @@ bool_t rvviRefGprsCompareWritten(uint32_t /*hartId*/, bool_t ignX0)
 {
     PROF_SCOPE(g_prof_ns_gpr_cmp, g_prof_cnt_gpr_cmp);
     if (!gvsoc_engine_is_running() || gvsoc_engine_finished())
+        return RVVI_TRUE;
+    if (state_compare_deferred())
         return RVVI_TRUE;
 
     bool_t pass = RVVI_TRUE;
@@ -1300,6 +1353,8 @@ bool_t rvviRefFprsCompare(uint32_t hartId)
 {
     PROF_SCOPE(g_prof_ns_fpr_cmp, g_prof_cnt_fpr_cmp);
     if (!gvsoc_engine_is_running() || gvsoc_engine_finished() || !rvviRefFprsPresent(hartId))
+        return RVVI_TRUE;
+    if (state_compare_deferred())
         return RVVI_TRUE;
 
     bool_t pass = RVVI_TRUE;
@@ -1356,6 +1411,9 @@ bool_t rvviRefInsBinCompare(uint32_t /*hartId*/)
 bool_t rvviRefCsrCompare(uint32_t /*hartId*/, uint32_t csrIndex)
 {
     if (!gvsoc_engine_is_running())
+        return RVVI_TRUE;
+
+    if (state_compare_deferred())
         return RVVI_TRUE;
 
     /* Skip volatile CSRs */

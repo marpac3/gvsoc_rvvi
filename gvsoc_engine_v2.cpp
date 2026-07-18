@@ -62,15 +62,17 @@
 #endif
 
 /* First line of defense on the ABI contract: if the defines or the ISA
- * header drift from what the model .so was built with, the Regfile size is
- * the first thing to move (CONFIG_GVSOC_ISS_ZFINX alone shrinks it
- * 856 -> 600 bytes). The runtime canary in engine_acquire_core() catches
+ * header drift from what the model .so was built with, the register-file
+ * size is the first thing to move (CONFIG_GVSOC_ISS_ZFINX alone shrinks
+ * it by 256 bytes). Checked on the personality type actually instantiated
+ * in Iss (Cv32e40pRegfile adds its write-back suppression flag on top of
+ * the base Regfile). The runtime canary in engine_acquire_core() catches
  * what a same-size skew would still hide. */
 #ifdef CONFIG_GVSOC_ISS_ZFINX
-static_assert(sizeof(Regfile) == 600,
+static_assert(sizeof(CONFIG_GVSOC_ISS_REGFILE) == 608,
               "Regfile layout drifted from the iss_v2 build contract (see Makefile)");
 #else
-static_assert(sizeof(Regfile) == 856,
+static_assert(sizeof(CONFIG_GVSOC_ISS_REGFILE) == 864,
               "Regfile layout drifted from the iss_v2 build contract (see Makefile)");
 #endif
 
@@ -112,6 +114,7 @@ static std::unordered_map<uint32_t, iss_reg_t *> g_csr_value_map;
 static uint64_t      g_retire_count  = 0;
 static iss_reg_t     g_retired_pc    = 0;  /* PC of last retired instruction */
 static uint32_t      g_retired_opcode = 0; /* always 0: opcode not captured in DPI mode */
+static uint64_t      g_popped_trap_seq = 0; /* trap_seq stamp of the last popped commit */
 static FILE         *g_iss_trace_fp  = nullptr;  /* opt-in, env GVSOC_RVVI_ISS_TRACE */
 
 /* When set, re-assert exec.skip_irq_check before every step(): the ISS
@@ -140,6 +143,24 @@ static bool          g_runaway = false;         /* sticky once latched */
 
 /* Set when mip bits are asserted, cleared after settle */
 static bool          g_irq_pending_settle = false;
+
+/* Interrupt wire bindings on the platform irq injector, indexed by RVVI net:
+ * 0=MSWInterrupt->msi, 1=MTimerInterrupt->mti, 2=MExternalInterrupt->mei,
+ * 3..18=LocalInterrupt0..15->external_irq_16..31. haltreq (net 19) is a
+ * debug request, not an interrupt wire (see gvsoc_engine_set_irq). */
+static constexpr int  IRQ_NB_WIRES = 19;
+static gv::Wire_binding *g_irq_wire[IRQ_NB_WIRES] = {};
+/* Callback sink required by wire_bind; the ISS never drives these wires
+ * back, so it stays empty. */
+static gv::Wire_user  g_irq_wire_user;
+
+static const char *const g_irq_wire_name[IRQ_NB_WIRES] = {
+    "msi", "mti", "mei",
+    "external_irq_16", "external_irq_17", "external_irq_18", "external_irq_19",
+    "external_irq_20", "external_irq_21", "external_irq_22", "external_irq_23",
+    "external_irq_24", "external_irq_25", "external_irq_26", "external_irq_27",
+    "external_irq_28", "external_irq_29", "external_irq_30", "external_irq_31",
+};
 
 /* --------------------------------------------------------------------------
  * Gvsoc_user callback to detect simulation end
@@ -414,6 +435,32 @@ static int engine_acquire_core(void)
     return engine_layout_canary();
 }
 
+/* Bind the interrupt wires on the platform irq injector (official gv::
+ * client API). Returns 0 on success, -1 on failure. */
+static int engine_bind_irq_wires(void)
+{
+    for (int net = 0; net < IRQ_NB_WIRES; net++)
+    {
+        gv::Wire_binding *binding = nullptr;
+        if (!engine_call_checked("wire_bind", [&](){
+                binding = g_gvsoc->wire_bind(&g_irq_wire_user, "irq_injector",
+                                             g_irq_wire_name[net]); }))
+            return -1;
+
+        if (!binding)
+        {
+            ENGINE_ERR("wire_bind(irq_injector, %s) returned null - "
+                       "platform is missing the injector or the port",
+                       g_irq_wire_name[net]);
+            return -1;
+        }
+        g_irq_wire[net] = binding;
+    }
+
+    ENGINE_LOG("interrupt wires bound (%d lines on irq_injector)", IRQ_NB_WIRES);
+    return 0;
+}
+
 /* --------------------------------------------------------------------------
  * Lifecycle - public API
  * ---------------------------------------------------------------------- */
@@ -440,7 +487,7 @@ int gvsoc_engine_init(const char *config_path)
     if (engine_open_and_start() != 0)
         return -1;
 
-    if (engine_acquire_core() != 0)
+    if (engine_acquire_core() != 0 || engine_bind_irq_wires() != 0)
     {
         /* No graceful teardown here: stop() self-deadlocks in sync mode
          * (see the abnormal-shutdown path below). The simulator aborts on
@@ -495,6 +542,10 @@ void gvsoc_engine_shutdown(void)
     ENGINE_LOG("shutting down");
 
     g_csr_value_map.clear();
+
+    /* The wire bindings belong to the engine instance being torn down. */
+    for (int net = 0; net < IRQ_NB_WIRES; net++)
+        g_irq_wire[net] = nullptr;
 
     if (g_iss_trace_fp) {
         fclose(g_iss_trace_fp);
@@ -583,51 +634,64 @@ static void retire_commit(iss_reg_t retired_pc, const char *how, int cycles)
     g_runaway_last_valid = false;
 }
 
+/* Run the engine until at least one commit is queued in the ring.  Returns
+ * true with the head left at commit_pop (NOT consumed); false on timeout or
+ * finish.  Ring overflow marks the engine finished (commits were lost).
+ * Callers wrap in try/catch: GVSOC step() may throw across the DPI boundary.
+ * The trailing iteration serves a commit produced by the very last clock,
+ * including the one that finished the simulation. */
+static bool engine_advance_to_commit(int *cycles)
+{
+    for (int i = 0; i <= STEP_MAX_CYCLES; i++)
+    {
+        uint64_t backlog = g_iss->timing.commit_push - g_iss->timing.commit_pop;
+        if (backlog > 0)
+        {
+            if (backlog > (uint64_t)Cv32e40pEvents::COMMIT_RING)
+            {
+                ENGINE_ERR("commit ring overflow (backlog=%llu) - "
+                           "commits were lost, aborting",
+                           (unsigned long long)backlog);
+                g_finished = true;
+                return false;
+            }
+            if (cycles)
+                *cycles = i;
+            return true;
+        }
+
+        if (g_finished || i == STEP_MAX_CYCLES)
+            break;
+
+        /* Re-assert skip_irq_check before every step.
+         * The ISS slow handler clears it after one use. */
+        if (g_dpi_skip_irq)
+            g_iss->exec.skip_irq_check = true;
+
+        g_gvsoc->step(g_clock_ps);
+    }
+    return false;
+}
+
 int gvsoc_engine_step(void)
 {
     if (!g_running || !g_gvsoc || g_finished || !g_iss)
         return 0;
 
-    /* Step until PC changes (= one instruction retired) or the personality
-     * retire counter moves with the PC still (= branch-to-self retired).
-     * The try/catch is outside the hot loop so the compiler can optimize
-     * the loop body; GVSOC step() should never throw in normal operation. */
-
     try
     {
-        for (int i = 0; i <= STEP_MAX_CYCLES; i++)
+        int cycles = 0;
+        if (engine_advance_to_commit(&cycles))
         {
-            uint64_t backlog = g_iss->timing.commit_push - g_iss->timing.commit_pop;
-            if (backlog > 0)
-            {
-                if (backlog > (uint64_t)Cv32e40pEvents::COMMIT_RING)
-                {
-                    ENGINE_ERR("commit ring overflow (backlog=%llu) - "
-                               "commits were lost, aborting",
-                               (unsigned long long)backlog);
-                    g_finished = true;
-                    return 0;
-                }
-                iss_reg_t pc = g_iss->timing.commit_pc[
-                    g_iss->timing.commit_pop % Cv32e40pEvents::COMMIT_RING];
-                g_iss->timing.commit_pop++;
-                retire_commit(pc, "committed", i);
-                return 1;
-            }
-
-            /* The trailing ring check above (i == STEP_MAX_CYCLES) serves a
-             * commit produced by the very last clock, including the one that
-             * finished the simulation. */
-            if (g_finished || i == STEP_MAX_CYCLES)
-                break;
-
-            /* Re-assert skip_irq_check before every step.
-             * The ISS slow handler clears it after one use. */
-            if (g_dpi_skip_irq)
-                g_iss->exec.skip_irq_check = true;
-
-            g_gvsoc->step(g_clock_ps);
+            uint64_t idx = g_iss->timing.commit_pop % Cv32e40pEvents::COMMIT_RING;
+            iss_reg_t pc = g_iss->timing.commit_pc[idx];
+            g_popped_trap_seq = g_iss->timing.commit_trap_seq[idx];
+            g_iss->timing.commit_pop++;
+            retire_commit(pc, "committed", cycles);
+            return 1;
         }
+        if (g_finished)
+            return 0;
     }
     catch (const std::exception &e)
     {
@@ -702,6 +766,51 @@ bool gvsoc_engine_is_runaway(void)
     return g_runaway;
 }
 
+uint64_t gvsoc_engine_pending_commits(void)
+{
+    if (!g_iss)
+        return 0;
+    return g_iss->timing.commit_push - g_iss->timing.commit_pop;
+}
+
+int gvsoc_engine_commit_stream(void)
+{
+    return 1;
+}
+
+int gvsoc_engine_state_current(void)
+{
+    return g_iss && g_iss->timing.trap_seq == g_popped_trap_seq;
+}
+
+int gvsoc_engine_materialize_commit(uint32_t *pc)
+{
+    if (!g_running || !g_gvsoc || g_finished || !g_iss || !pc)
+        return -1;
+
+    try
+    {
+        if (!engine_advance_to_commit(NULL))
+            return -1;
+    }
+    catch (const std::exception &e)
+    {
+        ENGINE_ERR("materialize_commit: step() threw: %s", e.what());
+        g_finished = true;
+        return -1;
+    }
+    catch (...)
+    {
+        ENGINE_ERR("materialize_commit: step() threw unknown exception");
+        g_finished = true;
+        return -1;
+    }
+
+    *pc = (uint32_t)g_iss->timing.commit_pc[
+        g_iss->timing.commit_pop % Cv32e40pEvents::COMMIT_RING];
+    return 0;
+}
+
 bool gvsoc_engine_finished(void)
 {
     return g_finished;
@@ -739,11 +848,13 @@ void gvsoc_engine_set_pc(uint32_t pc)
      * addr-keyed, so a stale line cannot serve the redirected PC anyway;
      * the flush is defensive. */
     g_iss->exec.pending_flush = true;
-    /* Force-clear WFI: with skip_irq_check the ISS gets no interrupt
-     * delivery and cannot wake from WFI on its own. */
+    /* A WFI here means wire delivery diverged from the DUT: the v2 ISS can
+     * only wake through check_interrupts() (the held WFI entry must be
+     * terminated into the commit FIFO), so a manual clear would corrupt the
+     * commit stream. Report it and let the step timeout surface the stall. */
     if (g_iss->exec.wfi.get()) {
-        g_iss->exec.wfi.set(false);
-        ENGINE_LOG("set_pc: cleared WFI for PC=0x%08x", pc);
+        ENGINE_ERR("set_pc: ISS in WFI at force-resync (PC=0x%08x) - "
+                   "cannot wake it externally", pc);
     }
 }
 
@@ -880,37 +991,20 @@ int gvsoc_engine_set_csr(uint32_t csr_addr, uint32_t value)
 }
 
 /* --------------------------------------------------------------------------
- * State injection - IRQ via direct mip write
+ * State injection - IRQ via the injector wires
  *
- * RVVI net index -> mip bit mapping:
- *   0     = MSWInterrupt       -> mip bit 3
- *   1     = MTimerInterrupt    -> mip bit 7
- *   2     = MExternalInterrupt -> mip bit 11
- *   3..18 = LocalInterrupt0..15 -> mip bits 16..31
- *   19    = haltreq (debug request, not an IRQ)
+ * Each RVVI net drives its wire on the platform irq injector (bound at
+ * init, see engine_bind_irq_wires): IrqRiscv's sync method updates mip and
+ * runs check_interrupts() inside the model .so, so the full-mode switch and
+ * the WFI wake-up follow the same path as a hardware interrupt line.
  * ---------------------------------------------------------------------- */
-
-static int net_index_to_mip_bit(uint64_t net_index)
-{
-    switch (net_index)
-    {
-    case 0:  return 3;   /* MSWInterrupt */
-    case 1:  return 7;   /* MTimerInterrupt */
-    case 2:  return 11;  /* MExternalInterrupt */
-    default:
-        if (net_index >= 3 && net_index <= 18)
-            return (int)(16 + (net_index - 3));  /* LocalInterrupt0..15 -> bits 16..31 */
-        return -1;  /* haltreq or unknown */
-    }
-}
 
 void gvsoc_engine_set_irq(uint64_t net_index, int value)
 {
     if (!g_iss)
         return;
 
-    int bit = net_index_to_mip_bit(net_index);
-    if (bit < 0)
+    if (net_index >= IRQ_NB_WIRES)
     {
         /* haltreq (net_index=19): inject a debug request via direct struct
          * write only. The ISS debug_req() method is compiled into the model
@@ -924,22 +1018,23 @@ void gvsoc_engine_set_irq(uint64_t net_index, int value)
             g_iss->csr.dcsr = (g_iss->csr.dcsr & ~(0x7u << 6)) | (3u << 6);
             ENGINE_LOG("set_irq: haltreq asserted -> req_debug=true, dcsr.cause=3");
         }
+        else if (net_index > 19)
+        {
+            ENGINE_ERR("set_irq: unmapped net index %llu (value=%d)",
+                       (unsigned long long)net_index, value);
+        }
         return;
     }
 
     iss_reg_t old_mip = g_iss->csr.mip.value;
 
-    if (value)
-        g_iss->csr.mip.value |= (1u << bit);
-    else
-        g_iss->csr.mip.value &= ~(1u << bit);
+    /* Engine-owned call: guarded like every other gv:: entry point (no
+     * exception may cross the DPI boundary). On a throw mip is unchanged
+     * and the settle logic below naturally no-ops. */
+    engine_call_safe("wire_update",
+                     [&](){ g_irq_wire[net_index]->update(value); });
 
     iss_reg_t new_mip = g_iss->csr.mip.value;
-
-    /* irq.check_interrupts() is not called here: it is compiled into the
-     * model .so and not available at DPI link time. The mip.value write
-     * above is sufficient - the ISS checks mip in its dispatch loop
-     * (with up to 1 cycle of latency vs RTL). */
 
     if (old_mip != new_mip)
     {
@@ -947,9 +1042,9 @@ void gvsoc_engine_set_irq(uint64_t net_index, int value)
         irq_log_count++;
         if (irq_log_count <= 20)
         {
-            ENGINE_LOG("set_irq: net=%llu bit=%d val=%d -> mip 0x%08x->0x%08x",
-                       (unsigned long long)net_index, bit, value,
-                       (unsigned)old_mip, (unsigned)new_mip);
+            ENGINE_LOG("set_irq: net=%llu wire=%s val=%d -> mip 0x%08x->0x%08x",
+                       (unsigned long long)net_index, g_irq_wire_name[net_index],
+                       value, (unsigned)old_mip, (unsigned)new_mip);
         }
         if (irq_log_count == 20)
             ENGINE_LOG("(suppressing further IRQ log messages)");
@@ -1031,12 +1126,10 @@ void gvsoc_engine_settle_irq(void)
 /* --------------------------------------------------------------------------
  * Informed IRQ injection (OVPSim-style "deferint"). Contract in the header.
  *
- * Impl detail (the one-step window): the engine keeps iss.exec.skip_irq_check
- * asserted on every step, so the ISS never takes interrupts on its own. Here we
- * lower it (and the engine-level g_dpi_skip_irq) for exactly ONE
- * gvsoc_engine_step() - with g_dpi_skip_irq false the step loop does not
- * re-assert the guard, so the IRQ stays armed until taken - then restore both.
- * A residual WFI is force-cleared so the live fetch can redirect to the vector.
+ * The engine keeps iss.exec.skip_irq_check asserted on every step, so the
+ * ISS never takes interrupts on its own. Here we lower the guard, cycle the
+ * engine until the take lands its first commit, then restore the guard.
+ * The commit stays queued for the caller's step-and-compare.
  * ---------------------------------------------------------------------- */
 int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
 {
@@ -1060,11 +1153,15 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
     iss_reg_t old_mip = g_iss->csr.mip.value;
     g_iss->csr.mip.value = (1u << mcause_irq_id);
 
-    /* Defensively wake from WFI: with skip_irq_check the ISS cannot wake on its
-     * own; Irq::check() needs a live fetch to redirect to mtvec. */
+    /* The DUT only takes locally-enabled interrupts and mie is lockstep
+     * state, so the wire delivery (set_irq -> check_interrupts) has already
+     * woken the ISS from any WFI. A sleep here means delivery diverged;
+     * report it instead of forcing the wake - a manual wfi clear would
+     * leave the held WFI entry parked in the commit FIFO. */
     if (g_iss->exec.wfi.get())
     {
-        g_iss->exec.wfi.set(false);
+        ENGINE_ERR("take_irq: ISS still in WFI at injection (irq id=%d) - "
+                   "wire delivery diverged from the DUT", mcause_irq_id);
     }
 
     /* Remember the engine-level defense so we can restore it exactly. */
@@ -1078,9 +1175,48 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
                mcause_irq_id, (unsigned)old_mip,
                (unsigned)g_iss->csr.mip.value);
 
-    /* One step: Irq::check() takes the pending IRQ and computes the entry
-     * (current_insn=mtvec, mepc/mstatus/mcause updated). PC changes -> retire. */
-    int rc = gvsoc_engine_step();
+    /* Commits already queued at the injection: the ISS ran past the DUT's
+     * interrupt boundary inside a load-response burst and executed
+     * instructions the DUT never did. No clean recovery from here; report
+     * it and let the compare surface the divergence. */
+    uint64_t stale = g_iss->timing.commit_push - g_iss->timing.commit_pop;
+    if (stale > 0)
+    {
+        ENGINE_ERR("take_irq: %llu stale commits at injection - ISS ran "
+                   "past the DUT's interrupt boundary",
+                   (unsigned long long)stale);
+    }
+
+    /* Step until the take lands its first commit (Irq::check() redirects to
+     * the vector slot and the same dispatch executes it), but LEAVE the
+     * commit queued: the caller's normal step-and-compare must serve the
+     * vector-slot retire against the DUT's entry row - popping it here
+     * would shift the whole stream by one. */
+    int rc = 0;
+    try
+    {
+        for (int i = 0; i < STEP_MAX_CYCLES; i++)
+        {
+            if (g_iss->timing.commit_push - g_iss->timing.commit_pop > stale)
+            {
+                rc = 1;
+                break;
+            }
+            if (g_finished)
+                break;
+            g_gvsoc->step(g_clock_ps);
+        }
+    }
+    catch (const std::exception &e)
+    {
+        ENGINE_ERR("take_irq: step() threw: %s", e.what());
+        g_finished = true;
+    }
+    catch (...)
+    {
+        ENGINE_ERR("take_irq: step() threw unknown exception");
+        g_finished = true;
+    }
 
     /* Restore mip to its pre-inject net-driven value: the mask above was a
      * transient single-bit arm for this one step. mip is MRO in CV32E40P (it
@@ -1088,13 +1224,15 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
      * irq_i drives, not this step's transient arm. */
     g_iss->csr.mip.value = old_mip;
 
-    /* Re-assert the defense: the next normal step() must not take IRQs. */
+    /* Re-assert the defense: the next normal step() must not take IRQs.
+     * g_iss stays valid across step(): only shutdown clears it, and no
+     * shutdown runs on this call path. */
     g_dpi_skip_irq = saved_dpi_skip;
-    if (g_iss)
-        g_iss->exec.skip_irq_check = saved_dpi_skip;
+    g_iss->exec.skip_irq_check = saved_dpi_skip;
 
-    ENGINE_LOG("take_irq: injection step rc=%d, ISS PC now 0x%08x (mcause=0x%08x)",
-               rc, (unsigned)gvsoc_engine_get_pc(),
+    ENGINE_LOG("take_irq: rc=%d, vector-slot commit queued, ISS at 0x%08x "
+               "(mcause=0x%08x)",
+               rc, (unsigned)g_iss->exec.current_insn,
                (unsigned)g_iss->csr.mcause.value);
 
     return rc;
