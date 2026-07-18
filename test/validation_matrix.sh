@@ -10,6 +10,8 @@
 # Usage:   test/validation_matrix.sh [output-dir]
 # Expects: simulator environment already set up (see docs/TESTING.md) and a
 #          compiled toolchain; run from anywhere inside the core-v-verif tree.
+# With GVSOC_ISS_V2=YES in the environment every lane runs on the iss_v2
+# reference core (v2 bridge library + v2 platform).
 #
 # Known-open expectations (do not read every FAIL as a regression):
 #   - matmul_32b_float FAILs on an ISS trap-redirect desync after an illegal
@@ -36,6 +38,7 @@ fi
 cd "$UVMT" || exit 1
 : > "$OUT/SUMMARY.txt"
 echo "matrix start: $(date -Iseconds)" >> "$OUT/SUMMARY.txt"
+echo "reference core: $([ -n "$GVSOC_ISS_V2" ] && echo iss_v2 || echo v1)" >> "$OUT/SUMMARY.txt"
 
 echo "=== unit: formatter grammar (no simulator license) ===" >> "$OUT/SUMMARY.txt"
 make -C "$SUB" test > "$OUT/unit.log" 2>&1
@@ -45,7 +48,8 @@ run() {
     local name=$1 test=$2; shift 2
     local t0=$(date +%s)
     timeout 2400 make test TEST="$test" USE_ISS=YES ISS=GVSOC RVVI_TRACE=YES \
-        RVVI_TEXT_TRACE="$OUT/${name}_trace" "$@" > "$OUT/$name.log" 2>&1
+        RVVI_TEXT_TRACE="$OUT/${name}_trace" \
+        ${GVSOC_ISS_V2:+GVSOC_ISS_V2=$GVSOC_ISS_V2} "$@" > "$OUT/$name.log" 2>&1
     local rc=$? t1=$(date +%s)
     echo "=== $name rc=$rc wall=$((t1-t0))s end=$(date -Iseconds) $(grep -o 'SIMULATION PASSED\|SIMULATION FAILED' "$OUT/$name.log" | head -1)" >> "$OUT/SUMMARY.txt"
     grep -E 'Total Reference model mismatches|phase realigns|retires total|volatile syncs|UVM_ERROR :' "$OUT/$name.log" | tail -5 >> "$OUT/SUMMARY.txt"
