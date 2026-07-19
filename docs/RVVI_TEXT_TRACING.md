@@ -245,11 +245,14 @@ to anything but GVSOC, `RVVI_TRACE=YES` is ignored and make prints
 ## Limitations and open points
 
 - No GVSOC-only headless runner (trace the ISS with no RTL and no Questa in
-  the loop). It would need per-retire write-set capture inside
-  `gvsoc_engine` — the bridge derives the write-set from the DUT push,
-  which does not exist without a DUT — and would have to bypass
-  `rvviRefEventStep`, which force-resyncs the ISS to the (absent) DUT
-  state.
+  the loop). It would need per-retire write-set capture inside the engine
+  wrapper — the bridge derives the write-set from the DUT push, which does
+  not exist without a DUT — and would have to bypass `rvviRefEventStep`,
+  which on the v1 bridge force-resyncs the ISS to the (absent) DUT state.
+- The trace path itself is bridge-agnostic: emission lives in
+  `rvvi_api2gvsoc.cpp`, which is compiled into both the v1 and the v2
+  bridge libraries, so RVVI-TEXT output works identically under
+  `GVSOC_ISS_V2=YES` (the default) and `=NO`.
 - Dual-trace has been exercised on CFG `default`, `pulp` and `pulp_fpu`;
   `pulp_fpu_zfinx` and the FPU-trap path have not. When diffing
   `dut.rvvi`/`ref.rvvi` on the PULP CFGs, expect a few ref-side deltas that

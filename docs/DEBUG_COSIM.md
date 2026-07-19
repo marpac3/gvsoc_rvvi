@@ -1,13 +1,17 @@
 # Debugging GVSOC under DPI co-simulation
 
 How to run gdb on the bridge (`rvvi_api2gvsoc.cpp`), on the engine wrapper
-(`gvsoc_engine.cpp`) or on GVSOC itself while a `USE_ISS=YES ISS=GVSOC` test
+(`gvsoc_engine_v2.cpp` on the default iss_v2 path, `gvsoc_engine.cpp` under
+`GVSOC_ISS_V2=NO`) or on GVSOC itself while a `USE_ISS=YES ISS=GVSOC` test
 is running.
 
-Everything runs in the simulator process: Questa loads `libgvsoc_rvvi.so`,
+Everything runs in the simulator process: Questa loads the bridge library
+(`libgvsoc_rvvi_v2.so` by default, `libgvsoc_rvvi.so` on the v1 path),
 which links the GVSOC libraries (`libpulpvp.so`, the ISS model `.so`). So
 the debug story is: build with symbols, attach gdb to the running `vsim`,
-set breakpoints anywhere in that stack.
+set breakpoints anywhere in that stack. The C API symbols (`rvviRef*`,
+`gvsoc_engine_*`) are shared by both bridge generations, so function-name
+breakpoints work the same on either.
 
 ## Build with symbols
 
@@ -16,7 +20,8 @@ see the note in the Makefile):
 
 ```bash
 cd vendor_lib/gvsoc_rvvi
-make clean && make DEBUG=1        # -g -O0 on the bridge objects
+make clean && make DEBUG=1        # -g -O0 on the bridge objects (all
+                                  # bridge libraries, the v2 pair included)
 ```
 
 GVSOC itself (only when you need to step *inside* the ISS — long rebuild):
@@ -68,9 +73,11 @@ leftover `GVSOC_RVVI_GDB_WAIT` in a batch run costs at most the timeout.
 | Symbol | Stops |
 |--------|-------|
 | `rvviRefRetireAndCompare` | once per DUT retire, before the ISS is stepped |
-| `gvsoc_engine_step` | one ISS retire (PC-change detection loop inside) |
+| `gvsoc_engine_step` | one ISS retire (v1: PC-change poll loop inside; v2: commit-stream pop) |
 | `gvsoc_engine_init` | engine bring-up, config parsing |
 | `gvsoc_engine_get_pc` / `gvsoc_engine_get_gpr` | state readback used by the compare |
+| `gvsoc_engine_materialize_commit` | v2 only: peek of the next commit PC on a DUT trap row |
+| `gvsoc_engine_state_current` | v2 only: trap-window check that gates state compares |
 
 For GVSOC-internal symbols, find the right name first:
 
@@ -94,7 +101,7 @@ All read once in `rvviRefInit`:
 | `CV_RVVI_BRIDGE_VERBOSE=1` | per-call bridge logging in the transcript |
 | `RVVI_TEXT_TRACE=<dir>` | RVVI-TEXT `dut.rvvi`/`ref.rvvi` (see RVVI_TEXT_TRACING.md) |
 | `CV_RVVI_BRIDGE_PROFILE=1` | ns counters per `rvviRef*` call, dumped at shutdown |
-| `GVSOC_FORCE_TRAP_CSR=0` | disable force-resync on IRQ traps |
+| `GVSOC_FORCE_TRAP_CSR=0` | disable force-resync on IRQ traps (v1 path; the v2 bridge handles the trap seam through its commit stream) |
 | `CV_RVVI_VOLATILE_CSR_SYNC=0` | disable the DUT-value sync of performance-counter CSR reads (cycle/instret/hpm); disabling it forks the co-sim on any program that consumes a counter value |
 
 For behavioural (not source-level) ISS analysis, the standalone path avoids
@@ -139,8 +146,9 @@ cdbg debug_on
 C breakpoints need the `-c` flag, which is easy to get wrong:
 
 ```tcl
-bp -c rvviRefRetireAndCompare      # by function name
-bp -c gvsoc_engine.cpp 500         # by file:line
+bp -c rvviRefRetireAndCompare      # by function name (same on both bridges)
+bp -c gvsoc_engine.cpp 500         # by file:line (v1 bridge)
+bp -c gvsoc_engine_v2.cpp 500      # by file:line (v2 bridge)
 ```
 
 `bp gvsoc_engine.cpp 500` (no `-c`) is parsed as an HDL breakpoint and fails

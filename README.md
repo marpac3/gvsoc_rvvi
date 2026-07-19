@@ -26,8 +26,11 @@ gvsoc_rvvi/
 ├── RVVI/             ← RVVI standard API, host headers (git submodule → riscv-verification/RVVI)
 ├── rvvi_trace2api.sv ← SV DPI driver: reads the rvviTrace interface and drives the RVVI API (RVVI-TRACE → RVVI-API)
 ├── rvvi_api2gvsoc.cpp   ← C++ DPI bridge: implements the RVVI API on top of the GVSOC engine (RVVI-API → GVSOC)
-├── gvsoc_engine.cpp  ← embedded GVSOC engine: ISS instance, retire-based stepping,
-├── gvsoc_engine.hpp  ←   PC/GPR/CSR/mip access, IRQ and debug injection
+├── gvsoc_engine.cpp  ← v1 engine wrapper: iss core, PC-change retire detection,
+│                        direct mip IRQ injection
+├── gvsoc_engine_v2.cpp ← v2 engine wrapper (default): iss_v2 core, commit-stream
+│                        retires, wire-driven IRQ injection
+├── gvsoc_engine.hpp  ← shared pure-C engine API (+ v2 capability queries)
 ├── rvvi_text_writer.cpp/.hpp ← canonical RVVI-TEXT trace formatter (shared by bridge and shim)
 ├── rvvi_text_dpi.cpp/.hpp    ← DPI shim around the formatter for RTL-only tracing
 ├── test/             ← deterministic formatter unit test (make test)
@@ -92,8 +95,11 @@ make gvsoc
 ```
 
 Builds the `cv32e40p-standalone` target in six variants (base, `corev_pulp`, `fpu`,
-`fpu`+`zfinx`, `corev_pulp`+`fpu`, `corev_pulp`+`fpu`+`zfinx`): ISS model (`Cv32e40pCsr`) +
-all CV32E40P ISA models. Build in `build/`, install in `install/`.
+`fpu`+`zfinx`, `corev_pulp`+`fpu`, `corev_pulp`+`fpu`+`zfinx`) plus the iss_v2
+targets (`cv32e40p-v2-standalone`, `-fpu`, `-zfinx`, `-nopulp`, and the
+`cv32e40p-v2-spike` variants — the core configuration is baked into each v2
+target name): ISS models + all CV32E40P ISA models. Build in `build/`,
+install in `install/`.
 
 ### 3. Generate `gvsoc_config.json`
 
@@ -109,6 +115,12 @@ invokes `make config` here); the actual ELF path is injected at runtime by the b
 (`rvvi_api2gvsoc.cpp`) using the real binary passed from UVM via `rvviRefInit()`. The
 generated file is gitignored.
 
+For the iss_v2 targets use `make config-v2 BINARY=...
+[V2_TARGET=cv32e40p-v2-standalone-fpu]` — the core configuration is baked
+into the target name, so there are no `--parameter` knobs besides the
+binary. The production flow generates one `gvsoc_config_v2_<CFG>.json`
+template per testbench CFG.
+
 This step needs the Python env with the gvsoc dependencies —
 `micromamba run -n gvsoc_env_3_12 make config BINARY=...`.
 
@@ -118,17 +130,20 @@ This step needs the Python env with the gvsoc dependencies —
 make            # same as 'make all'
 ```
 
-Produces three libraries:
+Produces five libraries:
 
 | Library | Role |
 |---|---|
-| `libgvsoc_rvvi.so` | bridge, standard variant (FP with `fregs[]`) |
-| `libgvsoc_rvvi_zfinx.so` | bridge, ZFINX — compiled with `ISS_SINGLE_REGFILE=1` to match the ZFINX ISS regfile layout |
+| `libgvsoc_rvvi_v2.so` | v2 bridge (iss_v2 reference core — the default), standard variant |
+| `libgvsoc_rvvi_v2_zfinx.so` | v2 bridge, ZFINX |
+| `libgvsoc_rvvi.so` | v1 bridge (legacy), standard variant (FP with `fregs[]`) |
+| `libgvsoc_rvvi_zfinx.so` | v1 bridge, ZFINX — compiled with `ISS_SINGLE_REGFILE=1` to match the ZFINX ISS regfile layout |
 | `librvvi_text.so` | RVVI-TEXT writer for RTL-only tracing — no GVSOC dependency (see `docs/RVVI_TEXT_TRACING.md`) |
 
-The two bridge libraries link `install/lib/libpulpvp.so` with an embedded rpath
+The four bridge libraries link `install/lib/libpulpvp.so` with an embedded rpath
 (no `LD_LIBRARY_PATH` needed at runtime). The DPI test selects the correct variant
-via `GVSOC_RVVI_MODEL` in `mk/Common.mk`.
+(v1/v2 × standard/ZFINX) via `GVSOC_ISS_V2` and the CFG in `mk/Common.mk`,
+which set `GVSOC_RVVI_MODEL`.
 
 For C++ debugging (gdb / VS Code), `make DEBUG=1 ...` adds `-g -O0` — see
 [`docs/DEBUG_COSIM.md`](docs/DEBUG_COSIM.md).
@@ -146,16 +161,24 @@ make comp USE_ISS=YES ISS=GVSOC
 make test TEST=hello-world USE_ISS=YES ISS=GVSOC COMP=NO
 ```
 
+The reference model defaults to the iss_v2 core (`GVSOC_ISS_V2 ?= YES` in
+`mk/Common.mk`): the v2 library and the `gvsoc_config_v2_<CFG>.json`
+template are selected automatically. `GVSOC_ISS_V2=NO` on the make line
+falls back to the legacy v1 bridge and the `gvsoc_config_<CFG>.json`
+templates.
+
 Environment variable set by `mk/Common.mk`:
-- `GVSOC_CONFIG` — absolute path to `gvsoc_config.json`
+- `GVSOC_CONFIG` — absolute path to the generated config
+  (`gvsoc_config_v2_<CFG>.json` by default, `gvsoc_config_<CFG>.json` under
+  `GVSOC_ISS_V2=NO`)
 
 ## Files required at runtime
 
 | File | Role |
 |---|---|
-| `libgvsoc_rvvi.so` / `libgvsoc_rvvi_zfinx.so` | DPI bridge loaded by the simulator via `-sv_lib` (variant chosen by `mk/Common.mk`) |
+| `libgvsoc_rvvi_v2.so` / `libgvsoc_rvvi_v2_zfinx.so` (default) or `libgvsoc_rvvi.so` / `libgvsoc_rvvi_zfinx.so` (v1) | DPI bridge loaded by the simulator via `-sv_lib` (variant chosen by `GVSOC_ISS_V2` and ZFINX in `mk/Common.mk`) |
 | `install/lib/libpulpvp.so` | GVSOC engine (found through the embedded rpath) |
-| `gvsoc_config.json` | Generated topology (`gvrun prepare`): describes the system — models, parameters, ELF — that the engine instantiates via `gv::gvsoc_new()` |
+| `gvsoc_config_v2_<CFG>.json` / `gvsoc_config_<CFG>.json` | Generated topology (`gvrun prepare`): describes the system — models, parameters, ELF — that the engine instantiates via `gv::gvsoc_new()` |
 
 The models in `install/models/` are loaded automatically by `libpulpvp.so`
 through `dlopen`, based on the paths in `gvsoc_config.json`.
@@ -166,21 +189,29 @@ through `dlopen`, based on the paths in `gvsoc_config.json`.
   CSRs (19) and the volatile masks are configured on the testbench side in `ref_init`
   (`cv32e40p/tb/uvmt/uvmt_cv32e40p_gvsoc_wrap.sv`) — that is the source of truth, not the bridge.
 - **`rvviRefEventStep`**: advances GVSOC by one instruction (retire-based), not by one
-  clock period.
+  clock period — on the v2 bridge (default) by popping one commit from the iss_v2
+  commit stream, on the v1 bridge by polling for a PC change.
 - **Interrupt injection** — the bridge implements two mechanisms:
-  1. Reactive (default): `rvviRefNetSet` → `gvsoc_engine_set_irq` → direct set of the
-     `mip` CSR (`LocalInterrupt0-15` as a net group). The ISS takes the IRQ in its natural loop.
+  1. Reactive (default): `rvviRefNetSet` → `gvsoc_engine_set_irq`. On the v2 bridge
+     (default) this drives one of the 19 wires of the `cv32e40p_irq_injector`
+     component (bound via `wire_bind` at init) and `mip` is updated by the ISS
+     interrupt model itself; on the v1 bridge it sets the `mip` CSR directly
+     (`LocalInterrupt0-15` as a net group). Either way the ISS takes the IRQ in its
+     natural loop.
   2. Informed-injection / OVPSim deferint (opt-in via the `+rvvi_informed_irq` plusarg,
-     default off): the bridge detects the vectored entry (DUT-PC == `mtvec` base + cause·4)
-     and calls `gvsoc_engine_take_irq_for_one_step()`, letting the ISS compute the handler
+     default off; available on both bridges): the bridge detects the vectored entry
+     (DUT-PC == `mtvec` base + cause·4) and calls
+     `gvsoc_engine_take_irq_for_one_step()`, letting the ISS compute the handler
      entry from `mcause`.
 
 ## Known limitations
 
 - **IRQ timing (reactive path)**: GVSOC evaluates interrupts post-execute, the RTL does so
-  combinationally in the DECODE FSM, so the entry is desynchronized by about a cycle.
-  Informed-injection (above) is the mechanism to align the entry when strict parity is needed.
-- **Debug mode**: `haltreq` is partially wired (`gvsoc_engine.cpp` sets `req_debug`
+  combinationally in the DECODE FSM, so the entry is desynchronized by about a cycle —
+  on the v1 bridge through the direct `mip` write, on the v2 bridge through the injector
+  wires (the injection channel changes, the timing gap does not). Informed-injection
+  (above) is the mechanism to align the entry when strict parity is needed.
+- **Debug mode**: `haltreq` is partially wired (both engine wrappers set `req_debug`
   + `dcsr.cause`), but the full side effects of `debug_req()` (WFI exit, switch to full-exec)
   are not triggered because the method is not linkable via DPI. Debug single-stepping
   remains limited.
