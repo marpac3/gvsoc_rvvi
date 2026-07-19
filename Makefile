@@ -76,7 +76,11 @@ ISS_DEFINES_ZFINX := $(ISS_DEFINES) -DISS_SINGLE_REGFILE=1 -DCONFIG_GVSOC_ISS_ZF
 # is force-included: run `make gvsoc` first, the header lives in the GVSOC
 # build tree. Base and FPU share one layout (verified by static_assert +
 # runtime canary); ZFINX drops the 32 float registers, hence a second build.
+# -DRISCV selects the RISC-V (not legacy RISCY) SIMD operand order in shared
+# int.h. The recipe also emits it into the generated ISA header; kept here so
+# the operand order does not silently flip on a stale header.
 ISS_DEFINES_V2 := -DNDEBUG -D__GVSOC__ -DISS_WORD_32 \
+                  -DRISCV=1 \
                   -DCONFIG_GVSOC_ISS_V2=1 \
                   -DCONFIG_GVSOC_ISS_TIMED=1 \
                   -DCONFIG_GVSOC_ISS_HTIF=1 \

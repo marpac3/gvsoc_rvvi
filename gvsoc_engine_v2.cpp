@@ -838,10 +838,49 @@ uint32_t gvsoc_engine_get_insn(void)
 void gvsoc_engine_set_pc(uint32_t pc)
 {
     if (!g_iss) return;
+    /* Let parked work complete before redirecting: flushing the commit
+     * stream while an instruction sits in the commit FIFO (its scoreboard
+     * bit set at issue) or an LSU response is in flight drops the
+     * writeback, leaves the load-use scoreboard bit set forever, and the
+     * next reader of that register deadlocks the exec loop. Bounded
+     * because back-to-back issue can keep the pipeline busy; the
+     * architectural state is forced from the DUT after the redirect either
+     * way. A held WFI never drains, so skip (reported below). */
+    if (g_gvsoc && !g_iss->exec.wfi.get() &&
+        (g_iss->lsu.get_nb_pending_accesses() > 0 || g_iss->timing.inflight_pending()))
+    {
+        /* At most the single in-flight access can retire here: CV32E40P's
+         * LsuV2 is built with the default nb_outstanding=1 (cv32e40p_v2.py).
+         * Revisit the post-redirect force set if that ever changes. */
+        int steps = 0;
+        try
+        {
+            while ((g_iss->lsu.get_nb_pending_accesses() > 0 ||
+                    g_iss->timing.inflight_pending()) && steps < STEP_MAX_CYCLES)
+            {
+                /* skip_irq_check is one-shot, consumed every dispatch cycle:
+                 * re-assert per step or the ISS takes the pending wire-driven
+                 * IRQ on its own mid-drain (same idiom as the other step
+                 * loops in this file). */
+                if (g_dpi_skip_irq)
+                    g_iss->exec.skip_irq_check = true;
+                g_gvsoc->step(g_clock_ps);
+                steps++;
+            }
+        }
+        catch (const std::exception &e)
+        {
+            ENGINE_ERR("set_pc: engine step threw during pipeline drain: %s", e.what());
+        }
+        ENGINE_LOG("set_pc: drained pipeline in %d steps before redirect (PC=0x%08x)",
+                   steps, pc);
+        if (g_iss->lsu.get_nb_pending_accesses() > 0 || g_iss->timing.inflight_pending())
+            ENGINE_ERR("set_pc: pipeline still busy after drain budget (PC=0x%08x)", pc);
+    }
     g_iss->exec.current_insn = (iss_reg_t)pc;
     g_retired_pc = pc;
     /* Drop unconsumed commits: after a force-resync they belong to the
-     * pre-resync stream. */
+     * pre-resync stream (including any produced by the drain above). */
     g_iss->timing.commit_stream_flush();
     /* Ask the exec loop to flush prefetch + insn cache at the next slow
      * dispatch (the flush methods live in the model .so). Both are
@@ -894,6 +933,22 @@ int gvsoc_engine_get_csr(uint32_t csr_addr, uint32_t *value)
 {
     if (!g_iss || !value)
         return 0;
+
+    /* Hwloop CSRs (0xCC0-2 loop0, 0xCC4-6 loop1): the architectural values
+     * live behind header-inline accessors, not in a raw store - lpstart and
+     * lpcount in the hwloop module, lpend in the personality shadow (the
+     * module keeps the loop-back point, LPEND - 4). */
+    if (csr_addr >= 0xCC0 && csr_addr <= 0xCC6 && csr_addr != 0xCC3)
+    {
+        int loop = (csr_addr >= 0xCC4) ? 1 : 0;
+        switch (csr_addr - (loop ? 0xCC4u : 0xCC0u))
+        {
+            case 0: *value = (uint32_t)g_iss->hwloop.get_start(loop); break;
+            case 1: *value = (uint32_t)g_iss->csr.hwloop_lpend[loop]; break;
+            case 2: *value = (uint32_t)g_iss->hwloop.get_count(loop); break;
+        }
+        return 1;
+    }
 
     auto it = g_csr_value_map.find(csr_addr);
     if (it == g_csr_value_map.end())
@@ -1013,10 +1068,10 @@ void gvsoc_engine_set_irq(uint64_t net_index, int value)
         if (net_index == 19 && value)
         {
             g_iss->irq.req_debug = true;
-            /* Set dcsr.cause = 3 (haltreq) in bits [8:6]. Irq::check() sets
-             * debug_mode and depc but does not update dcsr.cause. */
-            g_iss->csr.dcsr = (g_iss->csr.dcsr & ~(0x7u << 6)) | (3u << 6);
-            ENGINE_LOG("set_irq: haltreq asserted -> req_debug=true, dcsr.cause=3");
+            /* dcsr.cause is written by Cv32e40pIrq::check() atomically with
+             * the debug entry, as the RTL does; an eager write here would be
+             * visible retires before the entry. */
+            ENGINE_LOG("set_irq: haltreq asserted -> req_debug=true");
         }
         else if (net_index > 19)
         {
