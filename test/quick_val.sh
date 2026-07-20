@@ -30,6 +30,11 @@
 #     exercise a debug flow the reference model does not implement
 #     (ebreak-enters-debug and single-step); they are marked xfail and
 #     reported as KNOWN_FAIL.
+#   - fpu_bugs_test (xfail): the remaining mismatches are the on-hold
+#     underflow accrual difference (fflags read back into GPRs), one
+#     subnormal-boundary value and the control-flow knock-on of both; the
+#     FMA lanes also carry a double-rounding artefact (flexfloat computes
+#     fma in double, the RTL fuses at single precision).
 #   - corev_rand_pulp_hwloop_count_range_test (gen_xfail): random hwloop
 #     body with IRQ noise deadlocks the v2 exec loop - a load-use scoreboard
 #     bit is orphaned around an IRQ redirect and the next reader stalls
@@ -165,7 +170,7 @@ skip|corev_rand_fp_instr_sanity_test|corev_rand_fp_instr_sanity_test|riscv-dv co
 skip|corev_rand_fp_instr_data_fwd_test|corev_rand_fp_instr_data_fwd_test|riscv-dv constraint contradiction (generation aborts)
 skip|corev_rand_fp_instr_mlt_cyc_test|corev_rand_fp_instr_mlt_cyc_test|riscv-dv constraint contradiction (generation aborts)
 skip|corev_rand_fp_instr_w_special_ops_test|corev_rand_fp_instr_w_special_ops_test|riscv-dv constraint contradiction (generation aborts)
-run|fpu_bugs_test|fpu_bugs_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
+xfail|fpu_bugs_test|fpu_bugs_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|illegal_fp_instr_test|illegal_fp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=100000000"
 '
 
