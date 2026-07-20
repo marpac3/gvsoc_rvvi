@@ -6,7 +6,9 @@
 # are directly comparable.
 #
 # Test lists mirror cv32e40p_full_covg_no_pulp.yaml (CFG=default) and the
-# cv32e40pv2_{xpulp,fpu,fpu_zfinx}_instr yamls (PULP/FPU configs).
+# cv32e40pv2_{xpulp,fpu,fpu_zfinx}_instr yamls (PULP/FPU configs); the
+# interrupt lanes come from the same no_pulp yaml (CFG=default) and from
+# cv32e40pv2_interrupt_debug_short.yaml (CFG=pulp, gen_rand_int aliases).
 #
 # Usage:   test/quick_val.sh [output-dir] [cfg ...]
 #            cfg list optional (default: default pulp pulp_fpu pulp_fpu_zfinx)
@@ -33,6 +35,13 @@
 #     bit is orphaned around an IRQ redirect and the next reader stalls
 #     forever. The clean fix (pipeline squash on redirect) lives in the
 #     common iss_v2 exec/LSU layer and is on hold.
+#   - interrupt lanes: corev_rand_interrupt and interrupt_bootstrap PASS;
+#     the other default-config IRQ lanes and the pulp gen_rand_int aliases
+#     share open reference-model gaps, all confirmed on the v1 bridge too
+#     (never measured before: the fast2 regression list has its interrupt
+#     entries commented out). Signatures: IRQ taken at a different retire
+#     than the RTL (interrupt_test, _exception, _nested), WFI wake-up missed
+#     (_wfi, _wfi_mem_stress), hwloop+IRQ commit starvation (pulp aliases).
 
 set -o pipefail
 
@@ -71,6 +80,11 @@ gen|corev_rand_arithmetic_base_test|corev_rand_arithmetic_base_test|
 gen|corev_rand_instr_test|corev_rand_instr_test|
 gen|corev_rand_jump_stress_test|corev_rand_jump_stress_test|
 gen|corev_rand_instr_long_stall|corev_rand_instr_long_stall|
+gen|corev_rand_interrupt|corev_rand_interrupt|
+gen|corev_rand_interrupt_wfi|corev_rand_interrupt_wfi|
+gen|corev_rand_interrupt_wfi_mem_stress|corev_rand_interrupt_wfi_mem_stress|
+gen|corev_rand_interrupt_exception|corev_rand_interrupt_exception|
+gen|corev_rand_interrupt_nested|corev_rand_interrupt_nested|
 run|hello-world|hello-world|
 run|branch_zero|branch_zero|
 run|csr_instr_asm|csr_instr_asm|
@@ -84,6 +98,8 @@ run|hpmcounter_basic_test|hpmcounter_basic_test|
 run|hpmcounter_hazard_test|hpmcounter_hazard_test|
 run|illegal|illegal|
 run|illegal_instr_test|illegal_instr_test|
+run|interrupt_bootstrap|interrupt_bootstrap|
+run|interrupt_test|interrupt_test|
 run|isa_fcov_holes|isa_fcov_holes|
 run|mhpmcounter29_csr_access_test_1|mhpmcounter29_csr_access_test_1|
 run|misalign|misalign|
@@ -103,6 +119,9 @@ gen|corev_rand_pulp_hwloop_exception|corev_rand_pulp_hwloop_exception|CFG_PLUSAR
 gen|corev_rand_pulp_illegal_instr_test|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=5000000" TEST_CFG_FILE=insert_illegal_instr
 gen|corev_rand_pulp_hwloop_illegal_instr_test|corev_rand_pulp_hwloop_test|CFG_PLUSARGS="+UVM_TIMEOUT=25000000" TEST_CFG_FILE=insert_illegal_instr
 gen|corev_rand_pulp_with_priv_instr_test|corev_rand_pulp_with_priv_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
+gen|corev_rand_pulp_instr_interrupt_test|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int
+gen|corev_rand_pulp_hwloop_interrupt_test|corev_rand_pulp_hwloop_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int
+gen|corev_directed_pulp_hwloop_test_with_interrupt|corev_directed_pulp_hwloop_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int
 gen_xfail|corev_rand_pulp_hwloop_count_range_test|corev_rand_pulp_hwloop_count_range_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" VSIM_USER_FLAGS=+skip_sampling_uvme_rv32x_hwloop_covg
 gen|tb_hack_obi_gnt_stalls|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" VSIM_USER_FLAGS="+random_instr_stall +random_data_stall +tb_hack_1_obi_gnt_signal"
 run|pulp_hardware_loop|pulp_hardware_loop|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" VSIM_USER_FLAGS="+skip_sampling_uvme_rv32x_hwloop_covg +fixed_data_gnt_stall=3"
