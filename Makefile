@@ -37,7 +37,9 @@ TRACE            ?= gvsoc_trace.log
 GVSOC_LIB := $(INSTALLDIR)/lib
 CXX       := g++
 
-CXXFLAGS_BASE := -std=c++17 -fPIC -O2 \
+# -MMD: emit a .d per object so GVSOC/personality header edits retrigger the
+# bridge compile (the hand-written prerequisites below only cover local headers).
+CXXFLAGS_BASE := -std=c++17 -fPIC -O2 -MMD -MP \
                  -I$(RVVI_DIR)/include/host/rvvi
 
 # ISS defines — they MUST match the ISS model .so build (extracted from the
@@ -289,8 +291,10 @@ endif
 		run > $(TRACE) 2>&1
 
 clean:
-	rm -f $(TARGET) $(TARGET_ZFINX) $(TARGET_V2) $(TARGET_V2_ZFINX) $(TARGET_TEXT) $(OBJS) gvsoc_engine_zfinx.o gvsoc_engine_v2.o gvsoc_engine_v2_zfinx.o rvvi_text_dpi.o test/test_rvvi_text_writer
+	rm -f $(TARGET) $(TARGET_ZFINX) $(TARGET_V2) $(TARGET_V2_ZFINX) $(TARGET_TEXT) $(OBJS) gvsoc_engine_zfinx.o gvsoc_engine_v2.o gvsoc_engine_v2_zfinx.o rvvi_text_dpi.o test/test_rvvi_text_writer *.d
 	rm -rf $(WORK_DIR)
 
 distclean: clean
 	rm -rf $(BUILDDIR) $(INSTALLDIR)
+
+-include $(wildcard *.d)

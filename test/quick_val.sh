@@ -14,8 +14,8 @@
 #            cfg list optional (default: default pulp pulp_fpu pulp_fpu_zfinx)
 # Expects: simulator environment already set up (see docs/TESTING.md) and a
 #          compiled toolchain; run from anywhere inside the core-v-verif tree.
-# With GVSOC_ISS_V2=YES in the environment every run uses the iss_v2
-# reference core.
+# The iss_v2 reference core is the default (Common.mk); set GVSOC_ISS_V2=NO
+# in the environment to run against the legacy v1 core.
 #
 # Exit code: 0 only when no lane reports FAIL/TIMEOUT/NO_SIM. Known-fail
 # lanes (kind xfail) and skips do not affect it.
@@ -68,7 +68,7 @@ cd "$UVMT" || exit 1
 PASS=0; FAIL=0; XFAIL=0; SKIP=0
 : > "$OUT/SUMMARY.txt"
 echo "quick_val start: $(date -Iseconds)" >> "$OUT/SUMMARY.txt"
-echo "reference core: $([ -n "$GVSOC_ISS_V2" ] && echo iss_v2 || echo v1)" >> "$OUT/SUMMARY.txt"
+echo "reference core: $([ "${GVSOC_ISS_V2:-YES}" = "NO" ] && echo v1 || echo iss_v2)" >> "$OUT/SUMMARY.txt"
 echo "configs: $CFGS" >> "$OUT/SUMMARY.txt"
 
 # Entry format: kind|label|TEST|extra make args
