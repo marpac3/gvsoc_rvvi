@@ -256,6 +256,19 @@ void gvsoc_engine_settle_irq(void);
  */
 int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id);
 
+/* Debug-entry twin of gvsoc_engine_take_irq_for_one_step(): arms a debug
+ * request with the given dcsr.cause (1=ebreak, 3=haltreq, 4=single-step),
+ * lowers the IRQ-check defense for exactly one step so the ISS computes the
+ * debug entry itself (dpc, dcsr.cause, redirect to the debug ROM), then
+ * restores the defense. The entry's first debug-ROM commit is left queued
+ * for the caller's step-and-compare. The v1 engine does not implement the
+ * debug entry and stubs this to 0.
+ *
+ * @param dcsr_cause  debug entry cause for dcsr[8:6].
+ * @return 1 if the debug entry landed a commit, 0 otherwise.
+ */
+int gvsoc_engine_take_debug_for_one_step(int dcsr_cause);
+
 #ifdef __cplusplus
 }
 #endif

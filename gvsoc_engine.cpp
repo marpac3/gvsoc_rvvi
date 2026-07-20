@@ -1031,6 +1031,14 @@ void gvsoc_engine_settle_irq(void)
  * re-assert the guard, so the IRQ stays armed until taken - then restore both.
  * A residual WFI is force-cleared so the live fetch can redirect to the vector.
  * ---------------------------------------------------------------------- */
+int gvsoc_engine_take_debug_for_one_step(int dcsr_cause)
+{
+    /* The v1 core has no debug-mode model; the informed debug entry is an
+     * iss_v2 feature. Returning 0 leaves the caller on the legacy path. */
+    (void)dcsr_cause;
+    return 0;
+}
+
 int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
 {
     if (!g_running || !g_gvsoc || g_finished || !g_wrapper)

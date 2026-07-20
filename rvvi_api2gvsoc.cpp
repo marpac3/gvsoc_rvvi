@@ -239,6 +239,11 @@ static const uint32_t TRAP_CSR_MCAUSE  = 0x342U;
 static const uint32_t TRAP_CSR_MTVAL   = 0x343U;
 static const uint32_t TRAP_CSR_MSTATUS = 0x300U;  /* trap entry updates MPIE/MIE - also needs snapshot protection */
 static const uint32_t CSR_MTVEC        = 0x305U;  /* trap-vector base+mode (informed-inject entry-detect) */
+static const uint32_t CSR_DCSR         = 0x7B0U;  /* debug control: cause[8:6] read on informed debug entry */
+
+/* DUT debug-mode level at the previous retire: the informed debug entry
+ * fires on the 0->1 transition (first debug-ROM retire). */
+static bool g_prev_dut_debug = false;
 
 static inline bool is_trap_csr(uint32_t addr)
 {
@@ -660,6 +665,10 @@ bool_t rvviRefInit(const char *programPath)
 
     init_net_map();
 
+    /* Informed debug entry tracks the DUT's debug-mode level per retire;
+     * start from the reset level. */
+    g_prev_dut_debug = false;
+
     /* Force-resync on IRQ traps (default ON, GVSOC_FORCE_TRAP_CSR=0 disables).
      * Skip ISS IRQ checking only when force-resync is active, so that the ISS
      * never takes interrupts on its own and is resynced to the DUT. */
@@ -997,7 +1006,7 @@ void rvviDutVrSet(uint32_t /*hartId*/, uint32_t /*vrIndex*/,
 void rvviDutCycleCountSet(uint64_t /*cycleCount*/) {}
 
 void rvviDutRetire(uint32_t /*hartId*/, uint64_t dutPc,
-                   uint64_t dutInsBin, bool_t /*debugMode*/)
+                   uint64_t dutInsBin, bool_t debugMode)
 {
     PROF_SCOPE(g_prof_ns_dut_retire, g_prof_cnt_dut_retire);
     g_metric_retires++;
@@ -1005,6 +1014,30 @@ void rvviDutRetire(uint32_t /*hartId*/, uint64_t dutPc,
     /* Do NOT clear g_pending_handler here: rvvi_trace2api calls rvviDutRetire
      * before rvviRefCsrsCompare, so the trap-CSR snapshot must stay active for
      * the comparison.  It is cleared in rvviRefCsrsCompare after consumption. */
+
+    /* Informed debug entry: on the DUT's first debug-mode retire (the debug
+     * ROM entry row) the ISS is still parked at the interrupted boundary -
+     * the RTL's entry has no architectural retire of its own, so nothing in
+     * the step-and-compare stream makes the ISS enter debug. Arm the entry
+     * with the DUT's own dcsr.cause (haltreq wire, ebreak or single-step all
+     * land here) and let the ISS compute dpc/dcsr and redirect to the ROM;
+     * the queued debug-ROM commit is then served against this retire row.
+     * The v1 engine stubs the take to 0: the legacy divergence stays. */
+    if (debugMode && !g_prev_dut_debug && gvsoc_engine_is_running())
+    {
+        uint32_t cause = 3;
+        auto it = g_dut_csr.find(CSR_DCSR);
+        if (it != g_dut_csr.end())
+            cause = (it->second >> 6) & 0x7u;
+        BRIDGE_LOG_HOT("informed debug entry: DUT PC=0x%08x cause=%u",
+                       (uint32_t)dutPc, cause);
+        int rc = gvsoc_engine_take_debug_for_one_step((int)cause);
+        if (rc != 1)
+            BRIDGE_ERR("informed debug entry: ISS did NOT enter debug "
+                       "(cause=%u rc=%d) - the step-and-compare will surface "
+                       "a PC mismatch", cause, rc);
+    }
+    g_prev_dut_debug = (debugMode != 0);
 }
 
 void rvviDutTrap(uint32_t /*hartId*/, uint64_t dutPc, uint64_t dutInsBin)

@@ -1292,3 +1292,98 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
 
     return rc;
 }
+
+int gvsoc_engine_take_debug_for_one_step(int dcsr_cause)
+{
+    if (!g_running || !g_gvsoc || g_finished || !g_iss)
+        return 0;
+
+    /* Arm the debug request with the DUT-observed cause; Cv32e40pIrq::check()
+     * writes dcsr.cause and dpc atomically with the entry and redirects to
+     * the debug ROM. Because the entry runs BEFORE the fetch of the current
+     * insn, depc = current_insn is correct for every cause: the ebreak the
+     * DUT never retired (cause 1), the next unexecuted insn on haltreq
+     * (cause 3) and the insn after the stepped one (cause 4). */
+    g_iss->irq.req_debug_cause = dcsr_cause & 0x7;
+    g_iss->irq.req_debug = true;
+
+    /* A WFI-parked ISS cannot spontaneously wake for an injected take (same
+     * diagnostic as take_irq): report it, the step loop below will surface
+     * the stall. */
+    if (g_iss->exec.wfi.get())
+    {
+        ENGINE_ERR("take_debug: ISS in WFI at injection (cause=%d) - "
+                   "delivery diverged from the DUT", dcsr_cause);
+    }
+
+    /* Remember the engine-level defense so we can restore it exactly. */
+    bool saved_dpi_skip = g_dpi_skip_irq;
+
+    /* Lower the defense for ONE step (same window guarantee as take_irq). */
+    g_dpi_skip_irq = false;
+    g_iss->exec.skip_irq_check = false;
+
+    ENGINE_LOG("take_debug: arming debug entry (cause=%d), single-step inject",
+               dcsr_cause);
+
+    /* Commits already queued at the injection: the ISS ran past the DUT's
+     * debug-entry boundary. Report and let the compare surface it. */
+    uint64_t stale = g_iss->timing.commit_push - g_iss->timing.commit_pop;
+    if (stale > 0)
+    {
+        ENGINE_ERR("take_debug: %llu stale commits at injection - ISS ran "
+                   "past the DUT's debug-entry boundary",
+                   (unsigned long long)stale);
+    }
+
+    /* Step until the entry lands its first debug-ROM commit, and LEAVE the
+     * commit queued: the caller's step-and-compare serves it against the
+     * DUT's first debug-ROM retire row. */
+    int rc = 0;
+    try
+    {
+        for (int i = 0; i < STEP_MAX_CYCLES; i++)
+        {
+            if (g_iss->timing.commit_push - g_iss->timing.commit_pop > stale)
+            {
+                rc = 1;
+                break;
+            }
+            if (g_finished)
+                break;
+            g_gvsoc->step(g_clock_ps);
+        }
+    }
+    catch (const std::exception &e)
+    {
+        ENGINE_ERR("take_debug: step() threw: %s", e.what());
+        g_finished = true;
+    }
+    catch (...)
+    {
+        ENGINE_ERR("take_debug: step() threw unknown exception");
+        g_finished = true;
+    }
+
+    /* Re-assert the defense: the next normal step() must not take IRQs. */
+    g_dpi_skip_irq = saved_dpi_skip;
+    g_iss->exec.skip_irq_check = saved_dpi_skip;
+
+    /* Failed injection: req_debug is a LATCHED request only consumed by a
+     * successful entry in Cv32e40pIrq::check(). Left armed, it would hijack
+     * the next take_irq_for_one_step() window into a bogus debug entry (the
+     * debug branch outranks the IRQ ladder). Disarm it, mirroring take_irq's
+     * unconditional mip restore. */
+    if (rc == 0)
+    {
+        g_iss->irq.req_debug = false;
+        g_iss->irq.req_debug_cause = 3;
+    }
+
+    ENGINE_LOG("take_debug: rc=%d, debug-ROM commit queued, ISS at 0x%08x "
+               "(dcsr=0x%08x)",
+               rc, (unsigned)g_iss->exec.current_insn,
+               (unsigned)g_iss->csr.dcsr);
+
+    return rc;
+}
