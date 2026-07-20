@@ -554,31 +554,27 @@ void gvsoc_engine_shutdown(void)
 
     if (g_gvsoc)
     {
-        if (!g_finished)
-        {
-            /* Abnormal termination: the sim did not finish on its own (SV-side
-             * abort - consecutive-mismatch watchdog, runaway, UVM timeout).
-             * The graceful teardown MUST be skipped here:
-             * - stop() self-deadlocks: in sync mode Controller::start() takes
-             *   the engine mutex and the external loop (us) owns it until the
-             *   internal sim-finished path releases it, which never ran; the
-             *   stop() -> engine_lock() relock on the same non-recursive mutex
-             *   hangs the simulator forever (observed: 35+ min "hangs" that
-             *   were really this deadlock until an external kill).
-             * - join() would RESUME the simulation: its sync branch loops on
-             *   run_sync() until is_sim_finished.
-             * The process is exiting anyway; the OS reclaims the engine. */
-            ENGINE_LOG("abnormal shutdown (sim not finished) - skipping engine stop/join");
-            g_gvsoc = nullptr;
-        }
-        else
-        {
-            engine_call_safe("stop",  [](){ g_gvsoc->stop();   });
-            engine_call_safe("quit",  [](){ g_gvsoc->quit(0);  });
-            engine_call_safe("join",  [](){ g_gvsoc->join();   });
-            engine_call_safe("close", [](){ g_gvsoc->close();  });
-            g_gvsoc = nullptr;
-        }
+        /* Never tear the engine down from this DPI thread.
+         *
+         * A genuine engine finish runs has_ended(), which sets
+         * g_running = false; that path already returned at the
+         * "if (!g_running) return;" guard at the top of this function, so
+         * control reaches here ONLY when termination was forced WITHOUT the
+         * engine reaching its own end:
+         *   - SV-side abort (consecutive-mismatch watchdog, runaway, UVM
+         *     timeout): g_finished still false;
+         *   - bridge ENGINE_ERR (commit-ring overflow, step() threw, ...):
+         *     g_finished set true only to halt stepping.
+         * In both cases the sync run loop still owns the non-recursive engine
+         * mutex (taken in Controller::start()), so stop() -> engine_lock()
+         * would relock it and hang forever (observed: multi-minute "hangs"
+         * that were really this self-deadlock until an external kill).
+         * join() is worse: its sync branch loops on run_sync() until
+         * is_sim_finished, resuming the sim. The process is exiting anyway;
+         * drop the pointer and let the OS reclaim the engine. */
+        ENGINE_LOG("shutdown from DPI thread - skipping engine stop/join "
+                   "(avoids Controller mutex self-deadlock)");
+        g_gvsoc = nullptr;
     }
 
     g_iss      = nullptr;
@@ -1323,6 +1319,16 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause)
     g_dpi_skip_irq = false;
     g_iss->exec.skip_irq_check = false;
 
+    /* The debug entry only happens inside Cv32e40pIrq::check(), which the
+     * fast dispatch handler never calls. No forcing is needed here: the
+     * co-sim personality pins the slow handler (can_switch_to_fast_mode()
+     * returns false while commit_stream_observed is set), so the next
+     * dispatch always runs check(). Do NOT call switch_to_full_mode() from
+     * the bridge: it inlines a reference to ExecInOrder::exec_instr_check_all,
+     * which the ISS library does not export - vsim aborts with an undefined
+     * symbol (vsim-12005) at the first call. The success check on debug_mode
+     * below still guards against an unrelated commit slipping through. */
+
     ENGINE_LOG("take_debug: arming debug entry (cause=%d), single-step inject",
                dcsr_cause);
 
@@ -1346,7 +1352,19 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause)
         {
             if (g_iss->timing.commit_push - g_iss->timing.commit_pop > stale)
             {
-                rc = 1;
+                /* A new commit alone does not prove the entry: only trust it
+                 * if the ISS actually switched into debug mode - anything
+                 * else means an unrelated instruction retired first and the
+                 * ISS ran past the DUT's debug-entry boundary. */
+                if (g_iss->exec.debug_mode)
+                {
+                    rc = 1;
+                }
+                else
+                {
+                    ENGINE_ERR("take_debug: unrelated commit while the debug "
+                               "request was pending - entry not taken");
+                }
                 break;
             }
             if (g_finished)
@@ -1369,16 +1387,14 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause)
     g_dpi_skip_irq = saved_dpi_skip;
     g_iss->exec.skip_irq_check = saved_dpi_skip;
 
-    /* Failed injection: req_debug is a LATCHED request only consumed by a
-     * successful entry in Cv32e40pIrq::check(). Left armed, it would hijack
-     * the next take_irq_for_one_step() window into a bogus debug entry (the
-     * debug branch outranks the IRQ ladder). Disarm it, mirroring take_irq's
-     * unconditional mip restore. */
-    if (rc == 0)
-    {
-        g_iss->irq.req_debug = false;
-        g_iss->irq.req_debug_cause = 3;
-    }
+    /* req_debug is a LATCHED request only consumed by a successful entry in
+     * Cv32e40pIrq::check(). Left armed after a failed injection, it would
+     * hijack the next take_irq_for_one_step() window into a bogus debug
+     * entry (the debug branch outranks the IRQ ladder). Disarm it
+     * unconditionally, mirroring take_irq's unconditional mip restore: on
+     * success check() already consumed it, so this is a no-op there. */
+    g_iss->irq.req_debug = false;
+    g_iss->irq.req_debug_cause = 3;
 
     ENGINE_LOG("take_debug: rc=%d, debug-ROM commit queued, ISS at 0x%08x "
                "(dcsr=0x%08x)",
