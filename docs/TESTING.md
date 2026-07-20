@@ -18,7 +18,7 @@ not read `~/.bashrc`, so set them explicitly:
 source /etc/profile.d/modules.sh
 module load questa/2025.3
 export CV_SIMULATOR=vsim
-export CV_SW_TOOLCHAIN=/opt/riscv/corev-openhw-gcc-modded
+export CV_SW_TOOLCHAIN=/opt/riscv/corev-openhw-gcc-modded-v0.1
 export CV_SW_PREFIX=riscv64-unknown-elf-
 ```
 

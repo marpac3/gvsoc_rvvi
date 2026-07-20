@@ -136,9 +136,11 @@ run|pulp_vectorial_shuffle_pack|pulp_vectorial_shuffle_pack|CFG_PLUSARGS="+UVM_T
 
 # Shared FPU lanes; the func_cov programs are ISA-specific (F uses f-registers,
 # Zfinx uses x-registers) and only assemble on their own config, so each config
-# list below runs its own and skips the other.
+# list below runs its own and skips the other. corev_fp_mstatus_fs_test is also
+# per-config: the generator needs +enable_floating_point (F) or
+# +enable_fp_in_x_regs (Zfinx) via TEST_CFG_FILE, otherwise the FP instruction
+# registry is empty and the stream degrades to an unconstrained random pick.
 TESTS_fpu_common='
-gen|corev_fp_mstatus_fs_test|corev_fp_mstatus_fs_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 skip|corev_rand_fp_instr_test|corev_rand_fp_instr_test|riscv-dv constraint contradiction (generation aborts)
 skip|corev_rand_fp_instr_sanity_test|corev_rand_fp_instr_sanity_test|riscv-dv constraint contradiction (generation aborts)
 skip|corev_rand_fp_instr_data_fwd_test|corev_rand_fp_instr_data_fwd_test|riscv-dv constraint contradiction (generation aborts)
@@ -148,11 +150,13 @@ run|fpu_bugs_test|fpu_bugs_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|illegal_fp_instr_test|illegal_fp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=100000000"
 '
 
-TESTS_pulp_fpu="$TESTS_fpu_common"'run|fpu_func_cov_improve_test|fpu_func_cov_improve_test|CFG_PLUSARGS="+UVM_TIMEOUT=100000000"
+TESTS_pulp_fpu="$TESTS_fpu_common"'gen|corev_fp_mstatus_fs_test|corev_fp_mstatus_fs_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" TEST_CFG_FILE=floating_pt_instr_en
+run|fpu_func_cov_improve_test|fpu_func_cov_improve_test|CFG_PLUSARGS="+UVM_TIMEOUT=100000000"
 skip|zfinx_func_cov_improve_test|zfinx_func_cov_improve_test|Zfinx-only program (F-config assembler rejects x-register FP operands)
 '
 
-TESTS_pulp_fpu_zfinx="$TESTS_fpu_common"'skip|fpu_func_cov_improve_test|fpu_func_cov_improve_test|F-only program (Zfinx config has no F register file)
+TESTS_pulp_fpu_zfinx="$TESTS_fpu_common"'gen|corev_fp_mstatus_fs_test|corev_fp_mstatus_fs_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" TEST_CFG_FILE=floating_pt_zfinx_instr_en
+skip|fpu_func_cov_improve_test|fpu_func_cov_improve_test|F-only program (Zfinx config has no F register file)
 run|zfinx_func_cov_improve_test|zfinx_func_cov_improve_test|CFG_PLUSARGS="+UVM_TIMEOUT=100000000"
 '
 
