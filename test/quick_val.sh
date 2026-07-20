@@ -1,7 +1,7 @@
 #!/bin/bash
 # Quick validation sweep for the GVSOC RVVI co-simulation: one run of every
 # test type in each testbench configuration, instead of a full regression
-# (~82 runs vs 651+; same breadth of stimulus types, a fraction of the wall
+# (~100 runs vs 651+; same breadth of stimulus types, a fraction of the wall
 # clock). Generated tests run with SEED=1 so two sweeps on the same build
 # are directly comparable.
 #
@@ -21,8 +21,11 @@
 # lanes (kind xfail) and skips do not affect it.
 #
 # Known-open expectations:
-#   - corev_rand_fp_instr_* are SKIPPED: riscv-dv aborts generation with a
-#     constraint contradiction on pulp_fpu/pulp_fpu_zfinx (before any sim).
+#   - corev_rand_fp_instr_* run the shared corev-dv rand FP stream with the
+#     per-config test_cfg (floating_pt_instr_en / floating_pt_zfinx_instr_en);
+#     without it riscv-dv aborts generation with a constraint contradiction.
+#     Expected near-parity; the residual is the flexfloat FMA double-rounding
+#     (fma computed in double, the RTL fuses at single precision).
 #   - corev_rand_pulp_{,hwloop_}illegal_instr_test run the base rand TEST with
 #     TEST_CFG_FILE=insert_illegal_instr (regress-yaml alias); they currently
 #     share the base lanes' open FAIL.
@@ -35,18 +38,17 @@
 #     subnormal-boundary value and the control-flow knock-on of both; the
 #     FMA lanes also carry a double-rounding artefact (flexfloat computes
 #     fma in double, the RTL fuses at single precision).
-#   - corev_rand_pulp_hwloop_count_range_test (gen_xfail): random hwloop
-#     body with IRQ noise deadlocks the v2 exec loop - a load-use scoreboard
-#     bit is orphaned around an IRQ redirect and the next reader stalls
-#     forever. The clean fix (pipeline squash on redirect) lives in the
-#     common iss_v2 exec/LSU layer and is on hold.
 #   - interrupt lanes: corev_rand_interrupt and interrupt_bootstrap PASS;
-#     the other default-config IRQ lanes and the pulp gen_rand_int aliases
-#     share open reference-model gaps, all confirmed on the v1 bridge too
-#     (never measured before: the fast2 regression list has its interrupt
-#     entries commented out). Signatures: IRQ taken at a different retire
-#     than the RTL (interrupt_test, _exception, _nested), WFI wake-up missed
-#     (_wfi, _wfi_mem_stress), hwloop+IRQ commit starvation (pulp aliases).
+#     the other default-config IRQ lanes share open reference-model gaps,
+#     all confirmed on the v1 bridge too (never measured before: the fast2
+#     regression list has its interrupt entries commented out). Signatures:
+#     IRQ taken at a different retire than the RTL (interrupt_test,
+#     _exception, _nested), WFI wake-up missed (_wfi, _wfi_mem_stress).
+#   - hwloop-with-IRQ lanes (gen_rand_int aliases, directed_with_interrupt):
+#     lpcount off-by-one at the loop-end boundary - the RTL suppresses the
+#     end-of-body decrement when it takes the interrupt on that instruction
+#     (hwlp_mask), the reference model commits it with the retire; the
+#     corev-dv handler's hwloop CSR save/restore makes the skew permanent.
 
 set -o pipefail
 
@@ -127,7 +129,7 @@ gen|corev_rand_pulp_with_priv_instr_test|corev_rand_pulp_with_priv_instr_test|CF
 gen|corev_rand_pulp_instr_interrupt_test|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int
 gen|corev_rand_pulp_hwloop_interrupt_test|corev_rand_pulp_hwloop_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int
 gen|corev_directed_pulp_hwloop_test_with_interrupt|corev_directed_pulp_hwloop_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int
-gen_xfail|corev_rand_pulp_hwloop_count_range_test|corev_rand_pulp_hwloop_count_range_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" VSIM_USER_FLAGS=+skip_sampling_uvme_rv32x_hwloop_covg
+gen|corev_rand_pulp_hwloop_count_range_test|corev_rand_pulp_hwloop_count_range_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" VSIM_USER_FLAGS=+skip_sampling_uvme_rv32x_hwloop_covg
 gen|tb_hack_obi_gnt_stalls|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" VSIM_USER_FLAGS="+random_instr_stall +random_data_stall +tb_hack_1_obi_gnt_signal"
 run|pulp_hardware_loop|pulp_hardware_loop|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" VSIM_USER_FLAGS="+skip_sampling_uvme_rv32x_hwloop_covg +fixed_data_gnt_stall=3"
 run|pulp_hardware_loop_interrupt_test|pulp_hardware_loop_interrupt_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
@@ -165,21 +167,26 @@ run|pulp_vectorial_shuffle_pack|pulp_vectorial_shuffle_pack|CFG_PLUSARGS="+UVM_T
 # +enable_fp_in_x_regs (Zfinx) via TEST_CFG_FILE, otherwise the FP instruction
 # registry is empty and the stream degrades to an unconstrained random pick.
 TESTS_fpu_common='
-skip|corev_rand_fp_instr_test|corev_rand_fp_instr_test|riscv-dv constraint contradiction (generation aborts)
-skip|corev_rand_fp_instr_sanity_test|corev_rand_fp_instr_sanity_test|riscv-dv constraint contradiction (generation aborts)
-skip|corev_rand_fp_instr_data_fwd_test|corev_rand_fp_instr_data_fwd_test|riscv-dv constraint contradiction (generation aborts)
-skip|corev_rand_fp_instr_mlt_cyc_test|corev_rand_fp_instr_mlt_cyc_test|riscv-dv constraint contradiction (generation aborts)
-skip|corev_rand_fp_instr_w_special_ops_test|corev_rand_fp_instr_w_special_ops_test|riscv-dv constraint contradiction (generation aborts)
 xfail|fpu_bugs_test|fpu_bugs_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|illegal_fp_instr_test|illegal_fp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=100000000"
 '
 
-TESTS_pulp_fpu="$TESTS_fpu_common"'gen|corev_fp_mstatus_fs_test|corev_fp_mstatus_fs_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" TEST_CFG_FILE=floating_pt_instr_en
+TESTS_pulp_fpu="$TESTS_fpu_common"'gen|corev_rand_fp_instr_test|corev_rand_fp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=5000000" TEST_CFG_FILE=floating_pt_instr_en
+gen|corev_rand_fp_instr_sanity_test|corev_rand_fp_instr_sanity_test|CFG_PLUSARGS="+UVM_TIMEOUT=5000000" TEST_CFG_FILE=floating_pt_instr_en
+gen|corev_rand_fp_instr_data_fwd_test|corev_rand_fp_instr_data_fwd_test|CFG_PLUSARGS="+UVM_TIMEOUT=5000000" TEST_CFG_FILE=floating_pt_instr_en
+gen|corev_rand_fp_instr_mlt_cyc_test|corev_rand_fp_instr_mlt_cyc_test|CFG_PLUSARGS="+UVM_TIMEOUT=5000000" TEST_CFG_FILE=floating_pt_instr_en
+gen|corev_rand_fp_instr_w_special_ops_test|corev_rand_fp_instr_w_special_ops_test|CFG_PLUSARGS="+UVM_TIMEOUT=5000000" TEST_CFG_FILE=floating_pt_instr_en
+gen|corev_fp_mstatus_fs_test|corev_fp_mstatus_fs_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" TEST_CFG_FILE=floating_pt_instr_en
 run|fpu_func_cov_improve_test|fpu_func_cov_improve_test|CFG_PLUSARGS="+UVM_TIMEOUT=100000000"
 skip|zfinx_func_cov_improve_test|zfinx_func_cov_improve_test|Zfinx-only program (F-config assembler rejects x-register FP operands)
 '
 
-TESTS_pulp_fpu_zfinx="$TESTS_fpu_common"'gen|corev_fp_mstatus_fs_test|corev_fp_mstatus_fs_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" TEST_CFG_FILE=floating_pt_zfinx_instr_en
+TESTS_pulp_fpu_zfinx="$TESTS_fpu_common"'gen|corev_rand_fp_instr_test|corev_rand_fp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=5000000" TEST_CFG_FILE=floating_pt_zfinx_instr_en
+gen|corev_rand_fp_instr_sanity_test|corev_rand_fp_instr_sanity_test|CFG_PLUSARGS="+UVM_TIMEOUT=5000000" TEST_CFG_FILE=floating_pt_zfinx_instr_en
+gen|corev_rand_fp_instr_data_fwd_test|corev_rand_fp_instr_data_fwd_test|CFG_PLUSARGS="+UVM_TIMEOUT=5000000" TEST_CFG_FILE=floating_pt_zfinx_instr_en
+gen|corev_rand_fp_instr_mlt_cyc_test|corev_rand_fp_instr_mlt_cyc_test|CFG_PLUSARGS="+UVM_TIMEOUT=5000000" TEST_CFG_FILE=floating_pt_zfinx_instr_en
+gen|corev_rand_fp_instr_w_special_ops_test|corev_rand_fp_instr_w_special_ops_test|CFG_PLUSARGS="+UVM_TIMEOUT=5000000" TEST_CFG_FILE=floating_pt_zfinx_instr_en
+gen|corev_fp_mstatus_fs_test|corev_fp_mstatus_fs_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" TEST_CFG_FILE=floating_pt_zfinx_instr_en
 skip|fpu_func_cov_improve_test|fpu_func_cov_improve_test|F-only program (Zfinx config has no F register file)
 run|zfinx_func_cov_improve_test|zfinx_func_cov_improve_test|CFG_PLUSARGS="+UVM_TIMEOUT=100000000"
 '
