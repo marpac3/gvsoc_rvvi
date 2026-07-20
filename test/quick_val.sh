@@ -21,6 +21,9 @@
 # Known-open expectations:
 #   - corev_rand_fp_instr_* are SKIPPED: riscv-dv aborts generation with a
 #     constraint contradiction on pulp_fpu/pulp_fpu_zfinx (before any sim).
+#   - corev_rand_pulp_{,hwloop_}illegal_instr_test run the base rand TEST with
+#     TEST_CFG_FILE=insert_illegal_instr (regress-yaml alias); they currently
+#     share the base lanes' open FAIL.
 #   - debug-mode tests (debug_hwloop_test, pulp_hardware_loop_debug_test)
 #     exercise a debug flow the reference model does not implement
 #     (ebreak-enters-debug and single-step); they are marked xfail and
@@ -97,8 +100,8 @@ gen|corev_rand_pulp_instr_test|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIM
 gen|corev_rand_pulp_simd_instr_test|corev_rand_pulp_simd_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 gen|corev_rand_pulp_mac_instr_test|corev_rand_pulp_mac_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 gen|corev_rand_pulp_hwloop_exception|corev_rand_pulp_hwloop_exception|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
-skip|corev_rand_pulp_illegal_instr_test|corev_rand_pulp_illegal_instr_test|no corev-dv.yaml testlist entry (Common.mk stops before generation)
-skip|corev_rand_pulp_hwloop_illegal_instr_test|corev_rand_pulp_hwloop_illegal_instr_test|no corev-dv.yaml testlist entry (Common.mk stops before generation)
+gen|corev_rand_pulp_illegal_instr_test|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=5000000" TEST_CFG_FILE=insert_illegal_instr
+gen|corev_rand_pulp_hwloop_illegal_instr_test|corev_rand_pulp_hwloop_test|CFG_PLUSARGS="+UVM_TIMEOUT=25000000" TEST_CFG_FILE=insert_illegal_instr
 gen|corev_rand_pulp_with_priv_instr_test|corev_rand_pulp_with_priv_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
 gen_xfail|corev_rand_pulp_hwloop_count_range_test|corev_rand_pulp_hwloop_count_range_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" VSIM_USER_FLAGS=+skip_sampling_uvme_rv32x_hwloop_covg
 gen|tb_hack_obi_gnt_stalls|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" VSIM_USER_FLAGS="+random_instr_stall +random_data_stall +tb_hack_1_obi_gnt_signal"
@@ -131,7 +134,10 @@ run|pulp_vectorial_shift|pulp_vectorial_shift|CFG_PLUSARGS="+UVM_TIMEOUT=1000000
 run|pulp_vectorial_shuffle_pack|pulp_vectorial_shuffle_pack|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 '
 
-TESTS_fpu='
+# Shared FPU lanes; the func_cov programs are ISA-specific (F uses f-registers,
+# Zfinx uses x-registers) and only assemble on their own config, so each config
+# list below runs its own and skips the other.
+TESTS_fpu_common='
 gen|corev_fp_mstatus_fs_test|corev_fp_mstatus_fs_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 skip|corev_rand_fp_instr_test|corev_rand_fp_instr_test|riscv-dv constraint contradiction (generation aborts)
 skip|corev_rand_fp_instr_sanity_test|corev_rand_fp_instr_sanity_test|riscv-dv constraint contradiction (generation aborts)
@@ -140,7 +146,13 @@ skip|corev_rand_fp_instr_mlt_cyc_test|corev_rand_fp_instr_mlt_cyc_test|riscv-dv 
 skip|corev_rand_fp_instr_w_special_ops_test|corev_rand_fp_instr_w_special_ops_test|riscv-dv constraint contradiction (generation aborts)
 run|fpu_bugs_test|fpu_bugs_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|illegal_fp_instr_test|illegal_fp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=100000000"
-run|fpu_func_cov_improve_test|fpu_func_cov_improve_test|CFG_PLUSARGS="+UVM_TIMEOUT=100000000"
+'
+
+TESTS_pulp_fpu="$TESTS_fpu_common"'run|fpu_func_cov_improve_test|fpu_func_cov_improve_test|CFG_PLUSARGS="+UVM_TIMEOUT=100000000"
+skip|zfinx_func_cov_improve_test|zfinx_func_cov_improve_test|Zfinx-only program (F-config assembler rejects x-register FP operands)
+'
+
+TESTS_pulp_fpu_zfinx="$TESTS_fpu_common"'skip|fpu_func_cov_improve_test|fpu_func_cov_improve_test|F-only program (Zfinx config has no F register file)
 run|zfinx_func_cov_improve_test|zfinx_func_cov_improve_test|CFG_PLUSARGS="+UVM_TIMEOUT=100000000"
 '
 
@@ -205,8 +217,8 @@ for cfg in $CFGS; do
     case $cfg in
         default)        sweep_cfg default        "$TESTS_default" ;;
         pulp)           sweep_cfg pulp           "$TESTS_pulp" ;;
-        pulp_fpu)       sweep_cfg pulp_fpu       "$TESTS_fpu" ;;
-        pulp_fpu_zfinx) sweep_cfg pulp_fpu_zfinx "$TESTS_fpu" ;;
+        pulp_fpu)       sweep_cfg pulp_fpu       "$TESTS_pulp_fpu" ;;
+        pulp_fpu_zfinx) sweep_cfg pulp_fpu_zfinx "$TESTS_pulp_fpu_zfinx" ;;
         *)
             echo "unknown cfg: $cfg" >> "$OUT/SUMMARY.txt"
             FAIL=$((FAIL+1)) ;;
