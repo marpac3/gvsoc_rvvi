@@ -327,7 +327,12 @@ fires in the same cycle as the RTL. Since `skip_irq_check` is held asserted
 (the ISS never takes IRQs on its own), the force-resync path in
 `rvviRefEventStep` realigns PC, CSRs and GPR/FPR from the DUT when the DUT
 enters an asynchronous trap — RVFI does not set `rvfi_trap` for async
-traps, so the bridge has to detect the entry itself.
+traps, so the bridge has to detect the entry itself. The CSR restore
+covers the four trap CSRs plus every compared non-volatile CSR (`mip`
+excluded: it mirrors the interrupt wires); a WFI-parked ISS is first
+released through the legitimate wire path (a wake edge held across one
+step on a `mie`-enabled cause) so the redirect never lands on a stalled
+core.
 
 On the v2 bridge the same entry point drives wires instead: each net index
 maps to one of the 19 lines of the `cv32e40p_irq_injector` component

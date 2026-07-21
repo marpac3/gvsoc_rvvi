@@ -1083,6 +1083,139 @@ void rvviDutTrap(uint32_t /*hartId*/, uint64_t dutPc, uint64_t dutInsBin)
  * SECTION 8 - RVVI API: reference model stepping
  * ========================================================================== */
 
+/* Release a WFI-parked ISS through the legitimate wire path (fix R1).  In
+ * reactive resync the ISS can reach WFI *after* the DUT's level-sensitive
+ * interrupt has already de-asserted (mirrored to mip=0), so no rising edge
+ * remains to drive the ISS check_interrupts() and the WFI never releases; the
+ * force-resync set_pc then bails on the parked ISS and the step-and-compare
+ * aborts.  Replay a momentary wake edge on the wire of a cause enabled in mie:
+ * gvsoc_engine_set_irq -> wire update -> the ISS check_interrupts runs the
+ * legitimate wake trio (clear wfi, retain_dec, terminate the held WFI entry),
+ * keeping the commit FIFO consistent - unlike a manual flag clear.
+ * assert+deassert leaves mip and the wire value unchanged: while parked the
+ * bit is necessarily 0 (else mie&mip!=0 and the ISS would not be in WFI).
+ * Uses only the engine API present in every engine variant (this file is
+ * linked into all three .so).  Returns true if the ISS left WFI. */
+/* mcause[4:0] -> RVVI net index, matching the engine's g_irq_wire_name order:
+ * MSI(3)->0, MTI(7)->1, MEI(11)->2, local fast 16..31 -> 3..18.
+ * Returns -1 for a code with no wire mapping. */
+static int cause_code_to_net(uint32_t code)
+{
+    if (code == 3)  return 0;
+    if (code == 7)  return 1;
+    if (code == 11) return 2;
+    if (code >= 16 && code <= 31) return 3 + (int)(code - 16);
+    return -1;
+}
+
+/* Number of RVVI interrupt-wire nets (mirrors gvsoc_engine_v2.cpp IRQ_NB_WIRES,
+ * kept local so this shared file does not depend on an engine-side symbol):
+ * nets 0..18 = MSI, MTI, MEI, then local fast 16..31 - the exact range
+ * cause_code_to_net maps. */
+static constexpr int WFI_WAKE_NB_NETS = 19;
+
+/* Inverse of cause_code_to_net: RVVI net index -> mip/mie bit position.
+ * net 0->3(MSI), 1->7(MTI), 2->11(MEI), 3..18 -> 16..31 (local fast). */
+static int net_to_cause_bit(int net)
+{
+    if (net == 0) return 3;
+    if (net == 1) return 7;
+    if (net == 2) return 11;
+    if (net >= 3 && net <= 18) return 16 + (net - 3);
+    return -1;
+}
+
+/* Drive one candidate wire high and HOLD it across a forced step, then release.
+ *
+ * Round-2 asserted+deasserted with no step in between: the wire edge and the
+ * ISS check_interrupts()/wake trio effectively need mip to stay asserted THROUGH
+ * a step, so the momentary edge returned mip to 0 before the wake ran and the
+ * WFI never released (Int-2).  Here the wire is held high; a single forced step
+ * lets the wire propagation reach check_interrupts() with (mie&mip)!=0 so the
+ * legitimate wake trio (wfi.set(false)/retain_dec/insn_terminate) runs and the
+ * terminated WFI entry drains into the commit FIFO consistently.  skip_irq is
+ * re-asserted for that step so the wire path releases WFI without the ISS also
+ * taking the IRQ architecturally (the take path IrqRiscv::check() is skip-gated;
+ * the wake trio in check_interrupts() is not) - avoids a double take.
+ * The wire is deasserted afterwards (its parked value is 0: the ISS could not be
+ * in WFI with the bit already pending). Returns true iff the ISS left WFI. */
+static bool try_wake_on_net(int net)
+{
+    gvsoc_engine_set_irq((uint64_t)net, 1);      /* assert, hold */
+    if (gvsoc_engine_is_wfi()) {
+        /* Not woken by the assert edge alone (deferred wire propagation):
+         * force one step with the wire still high and skip_irq re-asserted. */
+        gvsoc_engine_skip_irq(true);
+        gvsoc_engine_step();
+    }
+    bool awake = !gvsoc_engine_is_wfi();
+    gvsoc_engine_set_irq((uint64_t)net, 0);      /* release: parked value is 0 */
+    return awake;
+}
+
+static bool wake_wfi_via_wire(void)
+{
+    if (!gvsoc_engine_is_wfi())
+        return true;
+
+    /* Sync mie from the DUT before the wake edge: the wire only releases WFI
+     * when (mip & mie)!=0 on the driven bit, so a stale/diverged ISS mie would
+     * make even the correct edge a no-op.  mie is in the compared set and is
+     * force-resynced by the caller a few lines later anyway - doing it here
+     * just makes the wake reliable. */
+    {
+        auto mie_it = g_dut_csr.find(0x304u /*mie*/);
+        if (mie_it != g_dut_csr.end())
+            gvsoc_engine_set_csr(0x304u, mie_it->second);
+    }
+    uint32_t mie = 0;
+    gvsoc_engine_get_csr(0x304u /*mie*/, &mie);
+
+    /* Preferred candidate: the cause the DUT actually took out of WFI
+     * (mcause[4:0]).  g_dut_csr is a sticky mirror, never cleared, so this can
+     * be STALE on a MIE=0 wake-without-trap (Int-3 / review MEDIUM).  Rather
+     * than gate it on a freshness flag, we simply try it FIRST and, if the WFI
+     * does not release, FALL THROUGH to every other mie-enabled wire-mapped
+     * cause below.  A stale/wrong mcause therefore costs one failed attempt,
+     * never a stuck WFI, and the wake becomes exhaustive. */
+    int preferred = -1;
+    {
+        auto mc = g_dut_csr.find(TRAP_CSR_MCAUSE);
+        if (mc != g_dut_csr.end() && (mc->second & 0x80000000u)) {
+            uint32_t code = mc->second & 0x1fu;
+            int dut_net = cause_code_to_net(code);
+            if (dut_net >= 0 && (mie & (1u << code)))
+                preferred = dut_net;
+        }
+    }
+
+    if (preferred >= 0 && try_wake_on_net(preferred)) {
+        BRIDGE_LOG_HOT("wfi-wake: released via net=%d (dut-mcause, mie=0x%08x)",
+                       preferred, mie);
+        return true;
+    }
+
+    /* Fallthrough: try every mie-enabled wire-mapped cause in wire order
+     * (MSI, MTI, MEI, then local 16..31).  Handles a stale/wrong preferred
+     * candidate and a MIE=0 wake where mcause is not an interrupt. */
+    for (int net = 0; net < WFI_WAKE_NB_NETS; net++) {
+        if (net == preferred)
+            continue;
+        int bit = net_to_cause_bit(net);
+        if (bit < 0 || !(mie & (1u << bit)))
+            continue;
+        if (try_wake_on_net(net)) {
+            BRIDGE_LOG_HOT("wfi-wake: released via net=%d (fallthrough, mie=0x%08x)",
+                           net, mie);
+            return true;
+        }
+    }
+
+    BRIDGE_ERR("wfi-wake: WFI still set after held-step wake on all mie-enabled "
+               "causes (mie=0x%08x) - set_pc will bail as before", mie);
+    return false;
+}
+
 bool_t rvviRefEventStep(uint32_t /*hartId*/)
 {
     PROF_SCOPE(g_prof_ns_step, g_prof_cnt_step);
@@ -1168,22 +1301,43 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
                                    (unsigned long long)g_force_resync_count);
                 }
 
+                /* WFI-stuck: release the held WFI through the wire path first
+                 * (fix R1), so the following set_pc redirect does not bail on
+                 * a parked ISS and corrupt the commit stream. */
+                if (is_wfi_stuck)
+                    wake_wfi_via_wire();
+
                 /* Force ISS PC to DUT handler entry */
                 gvsoc_engine_set_pc(g_retire.pc);
 
-                /* Force trap CSRs from DUT state */
-                for (uint32_t addr : {TRAP_CSR_MEPC, TRAP_CSR_MCAUSE,
-                                       TRAP_CSR_MTVAL, TRAP_CSR_MSTATUS}) {
+                /* Force the DUT trap CSRs AND the full architectural CSR set
+                 * the compare tracks - not just the 4 trap CSRs (fix R2).  A
+                 * value the ISS missed while stalled in WFI (e.g. mscratch
+                 * 0x340, swapped with sp by the trap prologue) would otherwise
+                 * stay permanently stale and re-surface at every handler entry
+                 * (periodic post-WFI divergence).  Skips: volatile CSRs (not
+                 * compared) and mip 0x344 (driven by the interrupt wires -
+                 * force-writing it would decouple the ISS mip from the wire
+                 * mirror). */
+                static const uint32_t CSR_MIP = 0x344U;
+                auto force_csr_from_dut = [](uint32_t addr) {
                     auto it = g_dut_csr.find(addr);
-                    if (it != g_dut_csr.end()) {
-                        uint32_t iss_val = 0;
-                        gvsoc_engine_get_csr(addr, &iss_val);
-                        if (iss_val != it->second) {
-                            BRIDGE_LOG_HOT("IRQ-resync force CSR[0x%03x]: ISS=0x%08x -> DUT=0x%08x",
-                                           addr, iss_val, it->second);
-                            gvsoc_engine_set_csr(addr, it->second);
-                        }
+                    if (it == g_dut_csr.end()) return;
+                    uint32_t iss_val = 0;
+                    gvsoc_engine_get_csr(addr, &iss_val);
+                    if (iss_val != it->second) {
+                        BRIDGE_LOG_HOT("IRQ-resync force CSR[0x%03x]: ISS=0x%08x -> DUT=0x%08x",
+                                       addr, iss_val, it->second);
+                        gvsoc_engine_set_csr(addr, it->second);
                     }
+                };
+                for (uint32_t addr : {TRAP_CSR_MEPC, TRAP_CSR_MCAUSE,
+                                       TRAP_CSR_MTVAL, TRAP_CSR_MSTATUS})
+                    force_csr_from_dut(addr);
+                for (uint32_t addr : g_csr_compare_enabled) {
+                    if (is_trap_csr(addr) || addr == CSR_MIP) continue;
+                    if (g_csr_volatile.count(addr))           continue;
+                    force_csr_from_dut(addr);
                 }
 
                 /* Force all GPRs */

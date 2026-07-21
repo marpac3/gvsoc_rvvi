@@ -43,7 +43,10 @@
 #     all confirmed on the v1 bridge too (never measured before: the fast2
 #     regression list has its interrupt entries commented out). Signatures:
 #     IRQ taken at a different retire than the RTL (interrupt_test,
-#     _exception, _nested), WFI wake-up missed (_wfi, _wfi_mem_stress).
+#     _exception, _nested); on the WFI lanes the parked ISS is now released
+#     through the wire path, the residual is a step/compare divergence after
+#     the wake (_wfi: non-fatal rvviRefEventStep failures; _wfi_mem_stress:
+#     mismatch-heavy run that exceeds the per-lane timeout).
 #   - hwloop-with-IRQ lanes (gen_rand_int aliases, directed_with_interrupt):
 #     lpcount off-by-one at the loop-end boundary - the RTL suppresses the
 #     end-of-body decrement when it takes the interrupt on that instruction
