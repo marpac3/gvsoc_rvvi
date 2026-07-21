@@ -23,5 +23,9 @@ gvsoc_config*.json
 /test/test_rvvi_text_writer
 /test/*.rvvi
 
+# Compiler dependency files (-MMD) + gvrun runtime config dump
+*.d
+gvsoc_runtime_config.txt
+
 # Agent session memory (local, not versioned)
 .claude/
