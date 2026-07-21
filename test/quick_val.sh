@@ -47,11 +47,13 @@
 #     through the wire path, the residual is a step/compare divergence after
 #     the wake (_wfi: non-fatal rvviRefEventStep failures; _wfi_mem_stress:
 #     mismatch-heavy run that exceeds the per-lane timeout).
-#   - hwloop-with-IRQ lanes (gen_rand_int aliases, directed_with_interrupt):
-#     lpcount off-by-one at the loop-end boundary - the RTL suppresses the
-#     end-of-body decrement when it takes the interrupt on that instruction
-#     (hwlp_mask), the reference model commits it with the retire; the
-#     corev-dv handler's hwloop CSR save/restore makes the skew permanent.
+#   - corev_directed_pulp_hwloop_test_with_interrupt: the historical lpcount
+#     off-by-one (RTL hwlp_mask cancels the loop-end instruction the IRQ
+#     preempts; the reference model had already retired it) is fixed - the
+#     IRQ-resync now restores the hwloop CSRs, undoing the rolled-back
+#     decrement. The residual is a small set of GPR mismatches at fixed
+#     loop-body PCs under interrupts (distinct data-path family, in triage);
+#     the gen_rand_int hwloop aliases PASS.
 
 set -o pipefail
 

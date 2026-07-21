@@ -1014,6 +1014,34 @@ int gvsoc_engine_set_csr(uint32_t csr_addr, uint32_t value)
     if (!g_iss)
         return 0;
 
+    /* Hwloop CSRs: mirror of the get_csr() special case, routed through the
+     * module setters (set_count maintains the active bitmap) with the same
+     * semantics as the CSR/ISA write path: lpstart/lpend bits [1:0] hardwired
+     * 0, module end = LPEND - 4 (loop-back point), architectural LPEND in the
+     * personality shadow. Restoring these on an IRQ-redirect rollback undoes
+     * the loop-count decrement of a cancelled-and-reexecuted loop-end
+     * instruction (RTL hwlp_mask behavior, corev_hw_loop.rst) - without this
+     * the counters were the only compared state not restored at a redirect,
+     * so the off-by-one became permanent. */
+    if (csr_addr >= 0xCC0 && csr_addr <= 0xCC6 && csr_addr != 0xCC3)
+    {
+        int loop = (csr_addr >= 0xCC4) ? 1 : 0;
+        switch (csr_addr - (loop ? 0xCC4u : 0xCC0u))
+        {
+            case 0: g_iss->hwloop.set_start(loop, value & ~3u); break;
+            case 1:
+            {
+                uint32_t end = value & ~3u;
+                g_iss->csr.hwloop_lpend[loop] = end;
+                g_iss->hwloop.set_end(loop, end - 4);
+                break;
+            }
+            case 2: g_iss->hwloop.set_count(loop, value); break;
+        }
+        ENGINE_LOG("set_csr: hwloop 0x%03x = 0x%08x", csr_addr, value);
+        return 1;
+    }
+
     auto it = g_csr_value_map.find(csr_addr);
     if (it == g_csr_value_map.end())
     {
