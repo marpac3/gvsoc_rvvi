@@ -26,34 +26,31 @@
 #     without it riscv-dv aborts generation with a constraint contradiction.
 #     Expected near-parity; the residual is the flexfloat FMA double-rounding
 #     (fma computed in double, the RTL fuses at single precision).
-#   - corev_rand_pulp_{,hwloop_}illegal_instr_test run the base rand TEST with
-#     TEST_CFG_FILE=insert_illegal_instr (regress-yaml alias); they currently
-#     share the base lanes' open FAIL.
-#   - debug-mode tests (debug_hwloop_test, pulp_hardware_loop_debug_test)
-#     exercise a debug flow the reference model does not implement
-#     (ebreak-enters-debug and single-step); they are marked xfail and
-#     reported as KNOWN_FAIL.
+#   - corev_rand_pulp_{,hwloop_}illegal_instr_test run the base rand TEST
+#     with TEST_CFG_FILE=insert_illegal_instr (regress-yaml alias).
+#   - debug-mode tests (debug_hwloop_test, pulp_hardware_loop_debug_test):
+#     the reference model now follows the DUT into debug the informed way
+#     (engine take-debug on the rvvi.debug_mode edge, dpc/hwloop CSRs
+#     forced from the DUT at the entry seam, dret outside debug raises
+#     illegal, dcsr.prv WARL-pinned to M). The residual is a
+#     one-instruction retire misalignment inside the debug ROM when debug
+#     entries re-arm in rapid succession (characterized, root cause open);
+#     still xfail / KNOWN_FAIL.
 #   - fpu_bugs_test (xfail): the remaining mismatches are the on-hold
 #     underflow accrual difference (fflags read back into GPRs), one
 #     subnormal-boundary value and the control-flow knock-on of both; the
 #     FMA lanes also carry a double-rounding artefact (flexfloat computes
 #     fma in double, the RTL fuses at single precision).
-#   - interrupt lanes: corev_rand_interrupt and interrupt_bootstrap PASS;
-#     the other default-config IRQ lanes share open reference-model gaps,
-#     all confirmed on the v1 bridge too (never measured before: the fast2
-#     regression list has its interrupt entries commented out). Signatures:
-#     IRQ taken at a different retire than the RTL (interrupt_test,
-#     _exception, _nested); on the WFI lanes the parked ISS is now released
-#     through the wire path, the residual is a step/compare divergence after
-#     the wake (_wfi: non-fatal rvviRefEventStep failures; _wfi_mem_stress:
-#     mismatch-heavy run that exceeds the per-lane timeout).
-#   - corev_directed_pulp_hwloop_test_with_interrupt: the historical lpcount
-#     off-by-one (RTL hwlp_mask cancels the loop-end instruction the IRQ
-#     preempts; the reference model had already retired it) is fixed - the
-#     IRQ-resync now restores the hwloop CSRs, undoing the rolled-back
-#     decrement. The residual is a small set of GPR mismatches at fixed
-#     loop-body PCs under interrupts (distinct data-path family, in triage);
-#     the gen_rand_int hwloop aliases PASS.
+#   - interrupt lanes: corev_rand_interrupt, corev_rand_interrupt_wfi and
+#     interrupt_bootstrap PASS. The open residual is the async-entry race
+#     (IRQ taken at a different retire than the RTL, or an exception and
+#     an enabled IRQ pending on the same instruction and resolved in
+#     opposite order): interrupt_test, corev_rand_interrupt_exception,
+#     corev_rand_interrupt_nested (mismatch-heavy, exceeds the per-lane
+#     timeout) and corev_rand_pulp_with_priv_instr_test;
+#     _wfi_mem_stress exceeds its shortened TMO=600 the same way. All
+#     confirmed on the v1 bridge too (never measured before: the fast2
+#     regression list has its interrupt entries commented out).
 
 set -o pipefail
 
@@ -94,7 +91,7 @@ gen|corev_rand_jump_stress_test|corev_rand_jump_stress_test|
 gen|corev_rand_instr_long_stall|corev_rand_instr_long_stall|
 gen|corev_rand_interrupt|corev_rand_interrupt|
 gen|corev_rand_interrupt_wfi|corev_rand_interrupt_wfi|
-gen|corev_rand_interrupt_wfi_mem_stress|corev_rand_interrupt_wfi_mem_stress|
+gen|corev_rand_interrupt_wfi_mem_stress|corev_rand_interrupt_wfi_mem_stress|TMO=600
 gen|corev_rand_interrupt_exception|corev_rand_interrupt_exception|
 gen|corev_rand_interrupt_nested|corev_rand_interrupt_nested|
 run|hello-world|hello-world|
@@ -200,8 +197,16 @@ run_one() {
     local cfg=$1 kind=$2 label=$3 tc=$4 extra=$5
     local gen=""
     case $kind in gen|gen_xfail) gen="gen_corev-dv";; esac
+    # Optional per-lane wall-clock cap: a TMO=<seconds> token in the extra
+    # field overrides the 2400s default (used by lanes known to run to the
+    # timeout - same TIMEOUT verdict, less gate wall clock).
+    local tmo=2400
+    case "$extra" in
+        *TMO=*) tmo=${extra##*TMO=}; tmo=${tmo%% *}
+                extra=${extra//TMO=$tmo/};;
+    esac
     local t0=$(date +%s)
-    eval timeout 2400 make $gen test COREV=YES TEST=$tc CV_CORE=cv32e40p \
+    eval timeout $tmo make $gen test COREV=YES TEST=$tc CV_CORE=cv32e40p \
         CFG=$cfg COREV=1 SIMULATOR=vsim COMP=0 USE_ISS=YES ISS=GVSOC COV=NO \
         SEED=1 GEN_START_INDEX=0 RUN_INDEX=0 TEST_CFG_FILE= ENABLE_TRACE_LOG=NO \
         ${GVSOC_ISS_V2:+GVSOC_ISS_V2=$GVSOC_ISS_V2} $extra \

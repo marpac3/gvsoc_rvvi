@@ -228,6 +228,12 @@ static uint32_t g_dut_mode    = 0;
  * csr_wb timing.
  * ---------------------------------------------------------------------- */
 static bool     g_pending_handler = false;
+/* One-shot arm for the sync-trap entry realign: set at rvviDutTrap, consumed
+ * by the next rvviRefEventStep.  g_pending_handler cannot gate the realign
+ * because it stays armed until a CSR compare row clears it, and the ISS can
+ * spuriously satisfy the handler-entry PC equality on later rows (e.g. after
+ * an IRQ redirect) when the snapshot is stale. */
+static bool     g_sync_trap_seam = false;
 static std::unordered_map<uint32_t, uint32_t> g_trap_csr_snapshot;
 
 /* Exception CSRs requiring snapshot protection across the trap->handler
@@ -240,6 +246,7 @@ static const uint32_t TRAP_CSR_MTVAL   = 0x343U;
 static const uint32_t TRAP_CSR_MSTATUS = 0x300U;  /* trap entry updates MPIE/MIE - also needs snapshot protection */
 static const uint32_t CSR_MTVEC        = 0x305U;  /* trap-vector base+mode (informed-inject entry-detect) */
 static const uint32_t CSR_DCSR         = 0x7B0U;  /* debug control: cause[8:6] read on informed debug entry */
+static const uint32_t CSR_DPC          = 0x7B1U;  /* debug PC: forced from DUT at the informed debug entry seam */
 
 /* DUT debug-mode level at the previous retire: the informed debug entry
  * fires on the 0->1 transition (first debug-ROM retire). */
@@ -1005,6 +1012,42 @@ void rvviDutVrSet(uint32_t /*hartId*/, uint32_t /*vrIndex*/,
                   uint32_t /*byteIndex*/, uint8_t /*data*/) {}
 void rvviDutCycleCountSet(uint64_t /*cycleCount*/) {}
 
+/* Restore the entry-seam CSRs (dpc + hwloop 0xCC0-2 / 0xCC4-6) from the DUT
+ * mirror. These are the compared state that the asynchronous informed-entry
+ * reconstruction cannot get bit-exact:
+ *
+ *  - hwloop counters: when the ISS already retired the loop-end instruction the
+ *    DUT cancelled (hwlp_mask fires on both interrupt and debug entry), its
+ *    extra decrement must be undone from the DUT reference.
+ *
+ *  - dpc (0x7B1): an ebreak that enters debug mode retires on CV32E40P and sets
+ *    dpc to the ebreak's own PC, but the ISS advances current_insn past it
+ *    before Cv32e40pIrq::check() captures depc = current_insn, so depc lands
+ *    one instruction size high (e.g. +2 for a c.ebreak). The DUT dpc is
+ *    authoritative for the entry point; forcing it here also fixes the resume
+ *    PC after dret. Haltreq/single-step entries already agree, so this is a
+ *    no-op there.
+ *
+ * The IRQ force-resync covers hwloop through its generic compared-CSR restore;
+ * the debug entry has no generic restore, so it calls this targeted one. No-op
+ * when the states already agree. */
+static void force_debug_entry_csrs_from_dut(void)
+{
+    static const uint32_t addrs[] = {CSR_DPC, 0xCC0u, 0xCC1u, 0xCC2u,
+                                     0xCC4u, 0xCC5u, 0xCC6u};
+    for (uint32_t addr : addrs) {
+        auto it = g_dut_csr.find(addr);
+        if (it == g_dut_csr.end()) continue;
+        uint32_t iss_val = 0;
+        gvsoc_engine_get_csr(addr, &iss_val);
+        if (iss_val != it->second) {
+            BRIDGE_LOG_HOT("debug-entry force CSR[0x%03x]: ISS=0x%08x -> DUT=0x%08x",
+                           addr, iss_val, it->second);
+            gvsoc_engine_set_csr(addr, it->second);
+        }
+    }
+}
+
 void rvviDutRetire(uint32_t /*hartId*/, uint64_t dutPc,
                    uint64_t dutInsBin, bool_t debugMode)
 {
@@ -1036,6 +1079,8 @@ void rvviDutRetire(uint32_t /*hartId*/, uint64_t dutPc,
             BRIDGE_ERR("informed debug entry: ISS did NOT enter debug "
                        "(cause=%u rc=%d) - the step-and-compare will surface "
                        "a PC mismatch", cause, rc);
+        else
+            force_debug_entry_csrs_from_dut();
     }
     g_prev_dut_debug = (debugMode != 0);
 }
@@ -1056,6 +1101,7 @@ void rvviDutTrap(uint32_t /*hartId*/, uint64_t dutPc, uint64_t dutInsBin)
             g_trap_csr_snapshot[addr] = it->second;
     }
     g_pending_handler = true;
+    g_sync_trap_seam = true;
 
     /* RVVI-TEXT: a trap retire bypasses rvviRefRetireAndCompare (the SV batch
      * call is gated on !trap), so we emit its line HERE.  Per RVVI-TRACE a
@@ -1142,12 +1188,16 @@ static int net_to_cause_bit(int net)
 static bool try_wake_on_net(int net)
 {
     gvsoc_engine_set_irq((uint64_t)net, 1);      /* assert, hold */
-    if (gvsoc_engine_is_wfi()) {
-        /* Not woken by the assert edge alone (deferred wire propagation):
-         * force one step with the wire still high and skip_irq re-asserted. */
-        gvsoc_engine_skip_irq(true);
-        gvsoc_engine_step();
-    }
+    /* Always hold the wire through one forced step before releasing, even if
+     * the wfi flag already reads clear after the assert edge: the edge alone
+     * can clear the flag while the core is still RETAINED (the wake trio's
+     * terminate/drain completes only when the ISS steps with the pending bit
+     * high), and a momentary edge then leaves the next step timing out with
+     * wfi re-asserted (the rvviRefEventStep FAILED residue).  skip_irq stays
+     * asserted so the wire path releases the WFI without the ISS also taking
+     * the IRQ architecturally. */
+    gvsoc_engine_skip_irq(true);
+    gvsoc_engine_step();
     bool awake = !gvsoc_engine_is_wfi();
     gvsoc_engine_set_irq((uint64_t)net, 0);      /* release: parked value is 0 */
     return awake;
@@ -1239,6 +1289,13 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
         return RVVI_TRUE;
     }
 
+    /* Consume the sync-trap seam here, into a local, so no later early-return
+     * (IRQ/WFI force-resync, sim-ended) can leak it armed onto an unrelated
+     * row with a stale snapshot.  The trap-row early-return above keeps it
+     * armed on purpose: the seam targets THIS first post-trap step. */
+    bool sync_trap_seam = g_sync_trap_seam;
+    g_sync_trap_seam = false;
+
     int rc = gvsoc_engine_step();
     if (rc == 0 && gvsoc_engine_finished()) {
         static bool ended_once = false;
@@ -1280,11 +1337,39 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
             /* MIE is bit 3 of mstatus.  IRQ taken = DUT MIE=0, ISS MIE=1 */
             bool dut_mie = (dut_mstatus >> 3) & 1;
             bool iss_mie = (iss_mstatus >> 3) & 1;
+            /* The MIE-skew detector goes blind once a previous force-resync
+             * has synced the ISS mstatus to the DUT's (MIE already 0 on both
+             * sides), e.g. a WFI wake straight into a handler after an IRQ
+             * storm.  Second, DUT-side-only signal immune to the forces: an
+             * interrupt take writes mepc = resume PC, which is exactly where
+             * the ISS (which did not take the IRQ) is sitting.  Also covers
+             * nested takes, where DUT MIE stays 0 across the entry.
+             * The mcause/mepc mirrors are sticky, and loop bodies revisit
+             * PCs, so mepc==iss_pc alone misfires in hwloop/debug lanes: the
+             * take is only accepted when the DUT row sits exactly on the
+             * mtvec-derived entry for the mirrored cause (vector slots are
+             * never ordinary loop/ROM rows). */
+            bool dut_irq_take_here = false;
+            {
+                auto mc = g_dut_csr.find(TRAP_CSR_MCAUSE);
+                auto me = g_dut_csr.find(TRAP_CSR_MEPC);
+                auto mt = g_dut_csr.find(0x305u /*mtvec*/);
+                if (mc != g_dut_csr.end() && (mc->second & 0x80000000u) &&
+                    me != g_dut_csr.end() && me->second == iss_pc &&
+                    mt != g_dut_csr.end()) {
+                    uint32_t base   = mt->second & ~0x3u;
+                    uint32_t code   = mc->second & 0x1fu;
+                    uint32_t target = (mt->second & 0x3u) ? base + 4u * code
+                                                          : base;
+                    dut_irq_take_here = ((uint32_t)g_retire.pc == target);
+                }
+            }
             /* When informed-injection is ON it OWNS the async-IRQ entry (the ISS
              * takes the IRQ and computes the entry itself); the reactive
              * force-set-PC must NOT also fire or it re-introduces the stale-fetch
              * garbage.  WFI-stuck handling below stays active regardless. */
-            bool is_new_irq = !g_informed_irq_enabled && (!dut_mie && iss_mie);
+            bool is_new_irq = !g_informed_irq_enabled &&
+                              ((!dut_mie && iss_mie) || dut_irq_take_here);
             bool is_wfi_stuck = (rc == 0 && gvsoc_engine_is_wfi());
 
             if (is_new_irq || is_wfi_stuck) {
@@ -1303,12 +1388,25 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
 
                 /* WFI-stuck: release the held WFI through the wire path first
                  * (fix R1), so the following set_pc redirect does not bail on
-                 * a parked ISS and corrupt the commit stream. */
+                 * a parked ISS and corrupt the commit stream.
+                 *
+                 * A successful wire wake retires the WFI instruction itself.
+                 * On a MIE=0 wake-without-trap the DUT row IS that WFI, so the
+                 * wake alone already satisfied the row: redirecting to
+                 * g_retire.pc would re-execute the just-retired WFI with the
+                 * wire released and park the ISS again (the rvviRefEventStep
+                 * FAILED residue).  Skip both the redirect and the extra step;
+                 * the diff-gated state forces below still run.  When the DUT
+                 * instead woke into a handler, the retired-PC check fails and
+                 * the reactive redirect proceeds as before. */
+                bool woke_on_row = false;
                 if (is_wfi_stuck)
-                    wake_wfi_via_wire();
+                    woke_on_row = wake_wfi_via_wire() &&
+                                  gvsoc_engine_get_pc() == g_retire.pc;
 
                 /* Force ISS PC to DUT handler entry */
-                gvsoc_engine_set_pc(g_retire.pc);
+                if (!woke_on_row)
+                    gvsoc_engine_set_pc(g_retire.pc);
 
                 /* Force the DUT trap CSRs AND the full architectural CSR set
                  * the compare tracks - not just the 4 trap CSRs (fix R2).  A
@@ -1358,8 +1456,9 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
 
                 /* Step the ISS from the forced PC so it actually retires the
                  * instruction at g_retire.pc.  This keeps ISS and DUT at the
-                 * same retire count instead of leaving the ISS one step behind. */
-                rc = gvsoc_engine_step();
+                 * same retire count instead of leaving the ISS one step behind.
+                 * (Already done by the wire wake when the row was the WFI.) */
+                rc = woke_on_row ? 1 : gvsoc_engine_step();
                 return (rc == 1) ? RVVI_TRUE : RVVI_FALSE;
             }
         }
@@ -1410,6 +1509,39 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
                            iss_pc, g_retire.pc,
                            (unsigned long long)g_phase_realign_count);
             rc = gvsoc_engine_step();
+        }
+    }
+
+    /* Sync-trap entry seam: once the ISS sits on the DUT handler entry with a
+     * trap snapshot pending, realign mstatus and mepc from the snapshot taken
+     * at rvviDutTrap.  In reactive resync the ISS mstatus.MIE timeline is
+     * force-managed for the asynchronous interrupts (skip_irq), so a sync
+     * exception landing inside an IRQ storm computes its trap entry from a
+     * knowingly skewed MIE: the saved MPIE then differs from the DUT by
+     * exactly that bit, and the skew leaks through the whole handler.  Only
+     * the two async-skew carriers are forced - mcause and mtval derive from
+     * the faulting instruction alone and stay honestly compared, so a real
+     * trap-cause model bug is still caught (a wrong trap target would diverge
+     * on PC regardless).  mstatus goes through the set_csr write mask, so
+     * only FS/MPP/MPIE/MIE can move.  Diff-gated: a converged entry writes
+     * nothing.  Only mstatus is forced: mepc derives from the faulting PC
+     * alone (not async-skewed), so it stays in the honest compare - forcing
+     * it would mask a real mepc-computation bug on this very row.
+     * Consume-once: the seam local was captured right after the trap-row
+     * early-return, so this runs exactly on the first post-trap non-trap row
+     * (the handler entry); if the ISS is not on the handler entry here the
+     * realign is skipped and the divergence surfaces honestly. */
+    if (sync_trap_seam && g_force_trap_enabled && rc == 1 &&
+        gvsoc_engine_get_pc() == g_retire.pc) {
+        auto it = g_trap_csr_snapshot.find(TRAP_CSR_MSTATUS);
+        if (it != g_trap_csr_snapshot.end()) {
+            uint32_t iss_val = 0;
+            gvsoc_engine_get_csr(TRAP_CSR_MSTATUS, &iss_val);
+            if (iss_val != it->second) {
+                BRIDGE_LOG_HOT("sync-trap resync CSR[0x%03x]: ISS=0x%08x -> DUT=0x%08x",
+                               TRAP_CSR_MSTATUS, iss_val, it->second);
+                gvsoc_engine_set_csr(TRAP_CSR_MSTATUS, it->second);
+            }
         }
     }
 
@@ -1671,6 +1803,7 @@ bool_t rvviRefCsrsCompare(uint32_t /*hartId*/)
     /* Consume the trap snapshot after all CSR comparisons for this retire. */
     if (g_pending_handler) {
         g_pending_handler = false;
+        g_sync_trap_seam = false;
         g_trap_csr_snapshot.clear();
     }
     return pass;

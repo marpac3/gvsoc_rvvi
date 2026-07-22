@@ -327,12 +327,19 @@ fires in the same cycle as the RTL. Since `skip_irq_check` is held asserted
 (the ISS never takes IRQs on its own), the force-resync path in
 `rvviRefEventStep` realigns PC, CSRs and GPR/FPR from the DUT when the DUT
 enters an asynchronous trap — RVFI does not set `rvfi_trap` for async
-traps, so the bridge has to detect the entry itself. The CSR restore
-covers the four trap CSRs plus every compared non-volatile CSR (`mip`
-excluded: it mirrors the interrupt wires); a WFI-parked ISS is first
-released through the legitimate wire path (a wake edge held across one
-step on a `mie`-enabled cause) so the redirect never lands on a stalled
-core.
+traps, so the bridge has to detect the entry itself. Detection uses two
+signatures: the MIE skew (DUT `mstatus.MIE` already 0, ISS still 1), and —
+because the CSR sync can align `mstatus` before the divergence surfaces —
+a DUT-side one: `mcause` with the interrupt bit set, `mepc` equal to the
+PC the ISS currently sits on, and the row PC equal to the vectored target
+(`mtvec_base + 4*cause`). The CSR restore covers the four trap CSRs plus
+every compared non-volatile CSR (`mip` excluded: it mirrors the interrupt
+wires); a WFI-parked ISS is first released through the legitimate wire
+path (a wake edge held across one step on a `mie`-enabled cause) so the
+redirect never lands on a stalled core — and when that wake step already
+lands the ISS on the row's PC, it counts as the retire itself: no
+redirect, no extra step (a second step would run past the just-retired
+WFI).
 
 On the v2 bridge the same entry point drives wires instead: each net index
 maps to one of the 19 lines of the `cv32e40p_irq_injector` component
@@ -364,14 +371,33 @@ word and is processed normally.
 
 ## Debug / haltreq
 
-`haltreq` is net index 19. In `gvsoc_engine_set_irq` it lands on a special
-branch that writes `iss.irq.req_debug = true` and sets `dcsr.cause`. But
-the ISS `debug_req()` method — the one that performs the real side effects
-(WFI exit, switch to full execution) — is not linkable at DPI time, so it
-is never invoked. Debug single-stepping therefore remains partial: the
-state is set, the debug-entry state machine does not run. It is the same
-limit as `irq.check_interrupts()`: the bridge can write public structs, it
-can never invoke ISS logic.
+On the v1 bridge, `haltreq` is net index 19: `gvsoc_engine_set_irq` lands
+on a special branch that writes `iss.irq.req_debug = true` and sets
+`dcsr.cause`, but the ISS `debug_req()` method — the one that performs the
+real side effects (WFI exit, switch to full execution) — is not linkable
+at DPI time, so it is never invoked. v1 debug support stays partial by
+construction: the state is set, the debug-entry state machine does not
+run. It is the same limit as `irq.check_interrupts()`: the bridge can
+write public structs, it can never invoke ISS logic.
+
+The v2 bridge follows the DUT into debug mode the informed way, mirroring
+the informed-IRQ pattern: the SV layer drives `rvvi.debug_mode` per
+retire, and on its 0→1 edge the bridge calls
+`gvsoc_engine_take_debug_for_one_step(cause)` so the ISS performs the
+entry itself (dcsr.cause from the DUT, redirect into the debug ROM). At
+the entry seam the bridge force-syncs from the DUT the CSRs the two sides
+legitimately disagree on: `dpc` — CV32E40P *retires* the ebreak that
+enters debug, so the ISS has already advanced past it and would capture
+dpc one instruction high — and the hwloop CSRs (0xCC0-0xCC6: a preempted
+hardware loop rolls back differently on the two sides). On the model
+side, `dret` executed outside debug mode raises an illegal instruction
+(per the Debug spec) instead of jumping through a stale dpc, and
+`dcsr.prv` is WARL-pinned to M (the core implements no other privilege
+mode). The residual, visible in the two debug×hwloop lanes (KNOWN_FAIL in
+`test/quick_val.sh`), is a one-instruction retire misalignment inside the
+debug ROM when debug entries re-arm in rapid succession; it is
+characterized in the validation evidence but the root cause is still
+open.
 
 ## RVVI conformance
 
