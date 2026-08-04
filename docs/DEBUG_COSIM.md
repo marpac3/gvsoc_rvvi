@@ -101,7 +101,7 @@ All read once in `rvviRefInit`:
 | `CV_RVVI_BRIDGE_VERBOSE=1` | per-call bridge logging in the transcript |
 | `RVVI_TEXT_TRACE=<dir>` | RVVI-TEXT `dut.rvvi`/`ref.rvvi` (see RVVI_TEXT_TRACING.md) |
 | `CV_RVVI_BRIDGE_PROFILE=1` | ns counters per `rvviRef*` call, dumped at shutdown |
-| `GVSOC_FORCE_TRAP_CSR=0` | disable force-resync on IRQ traps (v1 path; the v2 bridge handles the trap seam through its commit stream) |
+| `GVSOC_FORCE_TRAP_CSR=0` | disable force-resync on trap entry (shared code path, affects v1 AND v2: it gates the async-trap resync and the synchronous-trap seam realign) |
 | `CV_RVVI_VOLATILE_CSR_SYNC=0` | disable the DUT-value sync of performance-counter CSR reads (cycle/instret/hpm); disabling it forks the co-sim on any program that consumes a counter value |
 
 For behavioural (not source-level) ISS analysis, the standalone path avoids

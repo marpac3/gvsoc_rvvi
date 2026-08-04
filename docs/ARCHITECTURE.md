@@ -499,9 +499,13 @@ P1 — behavioral (false mismatches / stalls):
 P2 — localized:
 
 - trap-CSR snapshot and the 2-step realign are sensitive to the number of
-  steps a trap entry takes;
-- partial debug entry (see Debug / haltreq): a permanent functional limit
-  while staying DPI.
+  steps a trap entry takes. The synchronous-trap seam adds a consume-once
+  flag (`g_sync_trap_seam`, armed in `rvviDutTrap`, consumed at the first
+  `rvviRefEventStep` after it) that realigns mstatus only — forcing mepc
+  there proved harmful and is deliberately avoided;
+- partial debug entry is a permanent functional limit **of the v1 bridge
+  only** (see Debug / haltreq): the v2 bridge follows the DUT into debug
+  mode through the informed entry path.
 
 ## Future improvements
 
