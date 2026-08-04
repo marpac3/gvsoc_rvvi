@@ -59,8 +59,8 @@
 #
 # Seed: generated lanes default to SEED=1 (deterministic snapshot, sweeps
 # directly comparable). Set QV_SEED=<n> to run the SAME lane list at a
-# different seed - the multi-seed depth axis that used to be fast2's job
-# (a low-probability timing race was only ever caught by a non-1 seed).
+# different seed - the multi-seed depth axis (a low-probability timing race
+# was only ever caught by a non-1 seed).
 
 set -o pipefail
 

@@ -216,5 +216,5 @@ through `dlopen`, based on the paths in `gvsoc_config.json`.
   are not triggered because the method is not linkable via DPI. Debug single-stepping
   remains limited.
 
-For the current regression status (which tests pass in DPI vs `GVSOC_TRACE`) refer
-to the parent repo's regression report, not to this README.
+For the current validation status refer to the latest `test/quick_val.sh`
+run in the parent repo, not to this README.

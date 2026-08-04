@@ -49,12 +49,10 @@ All commands from `cv32e40p/sim/uvmt/` in the core-v-verif tree.
 | Compile the TB for co-simulation | `make comp USE_ISS=YES ISS=GVSOC [CFG=...]` |
 | Run one test in step-and-compare co-simulation | `make test TEST=hello-world USE_ISS=YES ISS=GVSOC [CFG=...]` |
 | Same, skipping recompilation | append `COMP=NO` |
-| Offline trace comparison (RTL vs standalone GVSOC, no DPI) | `make test TEST=hello-world ISS=GVSOC_TRACE COMP=NO` |
 | RVVI-TEXT traces (RTL-only / bridge / dual) | see the "How to run" section of [`RVVI_TEXT_TRACING.md`](RVVI_TEXT_TRACING.md) |
 | Conformance-check a produced trace | `make check-rvvi RVVI_TRACE_DIR=<dir>` |
 | Formatter unit tests (no license needed) | `micromamba run -n gvsoc_env_3_12 make -C vendor_lib/gvsoc_rvvi test` |
 | Standard validation gate (quick sweep, 4 configs, SEED=1) | `vendor_lib/gvsoc_rvvi/test/quick_val.sh [out-dir] [cfg ...]` |
-| Full validation sweep (unit + one lane per coverage axis) | `vendor_lib/gvsoc_rvvi/test/validation_matrix.sh [out-dir]` |
 
 A few things that save time:
 
@@ -72,8 +70,8 @@ A few things that save time:
   `pulp_fpu_zfinx`), with generated tests pinned at SEED=1 so two sweeps on
   the same build are directly comparable. Verdicts are PASS / FAIL /
   TIMEOUT / NO_SIM, plus XFAIL and SKIP for known-open lanes; the exit code
-  is 0 only when no lane reports FAIL/TIMEOUT/NO_SIM. `validation_matrix.sh`
-  remains available as the full sweep, but the quick sweep is the gate.
+  is 0 only when no lane reports FAIL/TIMEOUT/NO_SIM. It is the single
+  validation flow: the earlier matrix/regression-list sweeps are retired.
 - `CFG` selects the core configuration (`cv32e40p/tests/cfg/*.yaml`: `pulp`,
   `pulp_fpu`, `pulp_fpu_zfinx`, latency variants, ...). Changing `CFG`,
   `USE_ISS` or `RVVI_TRACE` changes compile-time defines, so the TB must be
