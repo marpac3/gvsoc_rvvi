@@ -9,6 +9,9 @@
 # cv32e40pv2_{xpulp,fpu,fpu_zfinx}_instr yamls (PULP/FPU configs); the
 # interrupt lanes come from the same no_pulp yaml (CFG=default) and from
 # cv32e40pv2_interrupt_debug_short.yaml (CFG=pulp, gen_rand_int aliases).
+# The debug axis covers every (TEST, test_cfg) combination of
+# cv32e40p_debug.yaml and cv32e40pv2_interrupt_debug.yaml (one lane each,
+# characterized 2026-08-04).
 #
 # Usage:   test/quick_val.sh [output-dir] [cfg ...]
 #            cfg list optional (default: default pulp pulp_fpu pulp_fpu_zfinx)
@@ -41,6 +44,17 @@
 #     one-instruction retire misalignment inside the debug ROM when debug
 #     entries re-arm in rapid succession (characterized, root cause open);
 #     still xfail / KNOWN_FAIL.
+#   - debug axis (characterized 2026-08-04, evidence
+#     /data2/.../debug_axis_char_20260804): 6 of 58 lanes PASS
+#     (debug_test_known_miscompares, riscv_ebreak_test_0, and the pulp
+#     hwloop_debug base, hwloop_exception single-step / int+trigger,
+#     hwloop_in_debug_rom). The 52 xfail lanes group into three signatures:
+#     (a) lpcount1 (0xcc6) off-by-one while stepping the debug ROM - the
+#     hwloop-counter/debug residual above; (b) DUT enters the debug ROM
+#     (PC 0x1a110800, dcsr.cause=haltreq) at a retire where the reference
+#     model does not - the async debug-entry class (random halt requests);
+#     (c) tdata1 (0x7a1) bit 2 (execute match enable) reads back set on the
+#     DUT and clear in the model on trigger tests.
 #   - fpu_bugs_test (xfail): the remaining mismatches are the on-hold
 #     underflow accrual difference (fflags read back into GPRs), one
 #     subnormal-boundary value and the control-flow knock-on of both; the
@@ -128,6 +142,15 @@ run|perf_counters_instructions|perf_counters_instructions|
 run|requested_csr_por|requested_csr_por|
 run|riscv_arithmetic_basic_test_0|riscv_arithmetic_basic_test_0|
 run|riscv_arithmetic_basic_test_1|riscv_arithmetic_basic_test_1|
+gen_xfail|corev_rand_debug|corev_rand_debug|
+gen_xfail|corev_rand_debug_ebreak|corev_rand_debug_ebreak|
+gen_xfail|corev_rand_debug_single_step|corev_rand_debug_single_step|
+gen_xfail|corev_rand_interrupt_debug|corev_rand_interrupt_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
+xfail|debug_test|debug_test|
+xfail|debug_test_boot_set|debug_test_boot_set|
+run|debug_test_known_miscompares|debug_test_known_miscompares|CFG_PLUSARGS="+UVM_TIMEOUT=20000000"
+xfail|debug_test_reset|debug_test_reset|
+run|riscv_ebreak_test_0|riscv_ebreak_test_0|CFG_PLUSARGS="+UVM_TIMEOUT=20000000"
 '
 
 TESTS_pulp='
@@ -171,6 +194,51 @@ run|pulp_vectorial_max|pulp_vectorial_max|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|pulp_vectorial_min|pulp_vectorial_min|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|pulp_vectorial_shift|pulp_vectorial_shift|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|pulp_vectorial_shuffle_pack|pulp_vectorial_shuffle_pack|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
+gen_xfail|corev_directed_pulp_hwloop_debug|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
+gen_xfail|corev_directed_pulp_hwloop_debug_ebreak|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_ebreak
+gen_xfail|corev_directed_pulp_hwloop_debug_single_step|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_single_step_en
+gen_xfail|corev_directed_pulp_hwloop_debug_trigger|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic
+gen_xfail|corev_directed_pulp_hwloop_debug_trigger_with_ebreak|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic,debug_ebreak
+gen_xfail|corev_directed_pulp_hwloop_debug_trigger_with_single_step|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic,debug_single_step_en
+gen_xfail|corev_directed_pulp_hwloop_debug_with_int_debug_ebreak|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_ebreak
+gen_xfail|corev_directed_pulp_hwloop_debug_with_int_debug_trigger|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic
+gen_xfail|corev_directed_pulp_hwloop_debug_with_int_debug_trigger_and_ebreak|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_ebreak
+gen_xfail|corev_directed_pulp_hwloop_debug_with_int_debug_trigger_single_step|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_single_step_en
+gen_xfail|corev_directed_pulp_hwloop_debug_with_interrupt|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int
+gen_xfail|corev_directed_pulp_hwloop_test_with_random_debug|corev_directed_pulp_hwloop_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_debug_req
+gen_xfail|corev_rand_debug_ebreak_xpulp|corev_rand_debug_ebreak_xpulp|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
+gen_xfail|corev_rand_debug_single_step_xpulp|corev_rand_debug_single_step_xpulp|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
+gen|corev_rand_pulp_hwloop_debug|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
+gen_xfail|corev_rand_pulp_hwloop_debug_ebreak|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_ebreak
+gen_xfail|corev_rand_pulp_hwloop_debug_single_step|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_single_step_en
+gen_xfail|corev_rand_pulp_hwloop_debug_trigger|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic
+gen_xfail|corev_rand_pulp_hwloop_debug_trigger_with_ebreak|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic,debug_ebreak
+gen_xfail|corev_rand_pulp_hwloop_debug_trigger_with_single_step|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic,debug_single_step_en
+gen_xfail|corev_rand_pulp_hwloop_debug_with_int_debug_ebreak|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_ebreak
+gen_xfail|corev_rand_pulp_hwloop_debug_with_int_debug_trigger|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic
+gen_xfail|corev_rand_pulp_hwloop_debug_with_int_debug_trigger_and_ebreak|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_ebreak
+gen_xfail|corev_rand_pulp_hwloop_debug_with_int_debug_trigger_single_step|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_single_step_en
+gen_xfail|corev_rand_pulp_hwloop_debug_with_interrupt|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int
+gen_xfail|corev_rand_pulp_hwloop_exception_debug_trigger|corev_rand_pulp_hwloop_exception|CFG_PLUSARGS="+UVM_TIMEOUT=20000000" TEST_CFG_FILE=debug_trigger_basic,gen_limit_debug_req
+gen|corev_rand_pulp_hwloop_exception_single_step_debug|corev_rand_pulp_hwloop_exception|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_single_step_en
+gen|corev_rand_pulp_hwloop_exception_with_int_debug_trigger|corev_rand_pulp_hwloop_exception|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic
+gen|corev_rand_pulp_hwloop_in_debug_rom|corev_rand_pulp_hwloop_in_debug_rom|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
+gen_xfail|corev_rand_pulp_hwloop_test_with_random_debug|corev_rand_pulp_hwloop_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_debug_req
+gen_xfail|corev_rand_pulp_instr_debug_ebreak_with_random_debug_req|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_ebreak,gen_rand_debug_req
+gen_xfail|corev_rand_pulp_instr_debug_single_step_with_random_debug_req|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_single_step_en,gen_rand_debug_req
+gen_xfail|corev_rand_pulp_instr_debug_test_with_int_and_debug_ebreak|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_ebreak
+gen_xfail|corev_rand_pulp_instr_debug_test_with_int_and_debug_single_step|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_single_step_en
+gen_xfail|corev_rand_pulp_instr_debug_test_with_int_and_debug_trigger|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic
+gen_xfail|corev_rand_pulp_instr_debug_test_with_int_debug_trigger_and_ebreak|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_ebreak
+gen_xfail|corev_rand_pulp_instr_debug_test_with_int_debug_trigger_and_single_step|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_single_step_en
+gen_xfail|corev_rand_pulp_instr_debug_trigger_test|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_trigger_basic
+gen_xfail|corev_rand_pulp_instr_debug_trigger_with_ebreak|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_trigger_basic,debug_ebreak
+gen_xfail|corev_rand_pulp_instr_debug_trigger_with_random_debug_req|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_trigger_basic,gen_rand_debug_req
+gen_xfail|corev_rand_pulp_instr_debug_trigger_with_single_step|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_trigger_basic,debug_single_step_en
+gen_xfail|corev_rand_pulp_instr_ebreak_debug_test|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_ebreak
+gen_xfail|corev_rand_pulp_instr_interrupt_debug_test|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,gen_rand_debug_req
+gen_xfail|corev_rand_pulp_instr_random_debug_test|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_debug_req
+gen_xfail|corev_rand_pulp_instr_single_step_debug_test|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_single_step_en
 '
 
 # Shared FPU lanes; the func_cov programs are ISA-specific (F uses f-registers,
@@ -192,6 +260,10 @@ gen_xfail|corev_rand_fp_instr_w_special_ops_test|corev_rand_fp_instr_w_special_o
 gen|corev_fp_mstatus_fs_test|corev_fp_mstatus_fs_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" TEST_CFG_FILE=floating_pt_instr_en
 run|fpu_func_cov_improve_test|fpu_func_cov_improve_test|CFG_PLUSARGS="+UVM_TIMEOUT=100000000"
 skip|zfinx_func_cov_improve_test|zfinx_func_cov_improve_test|Zfinx-only program (F-config assembler rejects x-register FP operands)
+gen_xfail|corev_rand_fp_instr_debug_test_with_int_and_debug|corev_rand_fp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int
+gen_xfail|corev_rand_fp_instr_debug_test_with_int_and_debug_single_step|corev_rand_fp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_single_step_en
+gen_xfail|corev_rand_fp_instr_debug_test_with_int_and_debug_trigger|corev_rand_fp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic
+gen_xfail|corev_rand_fp_instr_debug_test_with_int_debug_trigger_and_single_step|corev_rand_fp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_single_step_en
 '
 
 TESTS_pulp_fpu_zfinx="$TESTS_fpu_common"'gen|corev_rand_fp_instr_test|corev_rand_fp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=5000000" TEST_CFG_FILE=floating_pt_zfinx_instr_en
