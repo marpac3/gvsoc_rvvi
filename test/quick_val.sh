@@ -53,6 +53,20 @@
 #     model does not - the async debug-entry class (random halt requests);
 #     (c) tdata1 (0x7a1) bit 2 (execute match enable) reads back set on the
 #     DUT and clear in the model on trigger tests.
+#   - coverage-gap lanes (second pass 2026-08-04, evidence
+#     /data2/.../gap_char_20260804): the last test types the regress yamls
+#     run and quick_val did not. Six pass and are plain lanes (matmul int/
+#     float, the directed hwloop/interrupt covg tests - the interrupt one
+#     generates only under pulp_fpu with floating_pt_instr_en, the rand FP
+#     registry constraint again - and the pulp_instr_test debug_ebreak /
+#     single_step aliases). Four are known-open: corev_rand_illegal_instr
+#     (mepc trap-snapshot skew, the sync-trap-seam class),
+#     debug_test_trigger (tdata1.execute / tdata2 not modelled, the model
+#     misses trigger-match debug entries), interrupt_test on Zfinx (the
+#     async-entry class of its default sibling), and coremark (one GPR
+#     mismatch in 4.9M retires: the program reads a live TB device value
+#     the reference memory returns 0 for - the no-device class; ~40 min
+#     wall, hence the dedicated TMO).
 #   - fpu_bugs_test (xfail): the remaining mismatches are the on-hold
 #     underflow accrual difference (fflags read back into GPRs), one
 #     subnormal-boundary value and the control-flow knock-on of both; the
@@ -149,6 +163,10 @@ xfail|debug_test_boot_set|debug_test_boot_set|
 run|debug_test_known_miscompares|debug_test_known_miscompares|CFG_PLUSARGS="+UVM_TIMEOUT=20000000"
 xfail|debug_test_reset|debug_test_reset|
 run|riscv_ebreak_test_0|riscv_ebreak_test_0|CFG_PLUSARGS="+UVM_TIMEOUT=20000000"
+gen_xfail|corev_rand_illegal_instr_test|corev_rand_illegal_instr_test|
+xfail|debug_test_trigger|debug_test_trigger|
+run|matmul_32b_int|matmul_32b_int|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
+xfail|coremark|coremark|CFG_PLUSARGS="+UVM_TIMEOUT=20000000" TMO=3600
 '
 
 TESTS_pulp='
@@ -237,6 +255,9 @@ gen_xfail|corev_rand_pulp_instr_ebreak_debug_test|corev_rand_pulp_instr_debug|CF
 gen_xfail|corev_rand_pulp_instr_interrupt_debug_test|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,gen_rand_debug_req
 gen_xfail|corev_rand_pulp_instr_random_debug_test|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_debug_req
 gen_xfail|corev_rand_pulp_instr_single_step_debug_test|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_single_step_en
+gen|corev_directed_for_hwloop_covg_test|corev_directed_for_hwloop_covg_test|CFG_PLUSARGS="+UVM_TIMEOUT=60000000"
+gen|corev_rand_pulp_instr_test_debug_ebreak|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_ebreak
+gen|corev_rand_pulp_instr_test_debug_single_step|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_single_step_en
 '
 
 # Shared FPU lanes; the func_cov programs are ISA-specific (F uses f-registers,
@@ -257,6 +278,8 @@ gen|corev_rand_fp_instr_mlt_cyc_test|corev_rand_fp_instr_mlt_cyc_test|CFG_PLUSAR
 gen_xfail|corev_rand_fp_instr_w_special_ops_test|corev_rand_fp_instr_w_special_ops_test|CFG_PLUSARGS="+UVM_TIMEOUT=5000000" TEST_CFG_FILE=floating_pt_instr_en
 gen|corev_fp_mstatus_fs_test|corev_fp_mstatus_fs_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" TEST_CFG_FILE=floating_pt_instr_en
 run|fpu_func_cov_improve_test|fpu_func_cov_improve_test|CFG_PLUSARGS="+UVM_TIMEOUT=100000000"
+run|matmul_32b_float|matmul_32b_float|CFG_PLUSARGS="+UVM_TIMEOUT=2000000"
+gen|corev_directed_for_interrupt_covg_test|corev_directed_for_interrupt_covg_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=floating_pt_instr_en
 skip|zfinx_func_cov_improve_test|zfinx_func_cov_improve_test|Zfinx-only program (F-config assembler rejects x-register FP operands)
 gen_xfail|corev_rand_fp_instr_debug_test_with_int_and_debug|corev_rand_fp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int
 gen_xfail|corev_rand_fp_instr_debug_test_with_int_and_debug_single_step|corev_rand_fp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_single_step_en
@@ -272,6 +295,7 @@ gen_xfail|corev_rand_fp_instr_w_special_ops_test|corev_rand_fp_instr_w_special_o
 gen|corev_fp_mstatus_fs_test|corev_fp_mstatus_fs_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" TEST_CFG_FILE=floating_pt_zfinx_instr_en
 skip|fpu_func_cov_improve_test|fpu_func_cov_improve_test|F-only program (Zfinx config has no F register file)
 run|zfinx_func_cov_improve_test|zfinx_func_cov_improve_test|CFG_PLUSARGS="+UVM_TIMEOUT=100000000"
+xfail|interrupt_test_zfinx_cfg|interrupt_test|TEST_CFG_FILE=floating_pt_zfinx_instr_en
 '
 
 run_one() {
