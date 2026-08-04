@@ -18,12 +18,12 @@ GVSOC is split across three submodules:
 | submodule | SHA | nature | contents |
 |---|---|---|---|
 | `engine` | `a8c57439` | upstream `gvsoc/gvsoc-engine`, not forked | TimeEngine, ClockEngine, `gv::Gvsoc` API, DPI/SystemC/proxy drivers, gdbserver-engine |
-| `core` | `d4f37777` | fork of `FondazioneChipsIT/gvsoc-core` | hardware models, the ISS (v1 `iss/` and the shared `iss_v2/` framework), gdbserver-iss |
+| `core` | `d4f37777` | fork of `FondazioneChipsIT/gvsoc-core` | hardware models, the ISS frameworks (the original `iss/` and the modular `iss_v2/` the co-sim runs on), gdbserver-iss |
 | `pulp` | `9d9835a` | fork of `FondazioneChipsIT/gvsoc-pulp` | PULP targets and platforms; the out-of-tree CV32E40P iss_v2 personality (`cpu/iss_v2/`) |
 
-Our CV32E40P changes live in `core` (the v1 ISS), in `pulp` (the iss_v2
-personality, the v2 platforms and the IRQ injector) and in the bridge, not
-in the engine. The vendored engine lags upstream main by roughly 77 commits as of
+Our CV32E40P changes live in `core` (the shared iss_v2 framework), in
+`pulp` (the iss_v2 personality, the v2 platforms and the IRQ injector) and
+in the bridge, not in the engine. The vendored engine lags upstream main by roughly 77 commits as of
 July 2026 — see "Upstream drift" at the end.
 
 ## From config to component tree
@@ -36,7 +36,7 @@ and described by a Python configuration. Two Python tools (`gvsoc/gvrun/`,
    frequencies), ports, bindings, plus the `target/gvsoc` section
    (`include_dirs`, `platform_tree`). Generated, not versioned.
 2. The "compiled platform tree" — a per-target shared object
-   (`libplatform_tree_cv32e40p_standalone.so`) exporting
+   (`libplatform_tree_cv32e40p_v2_standalone.so`) exporting
    `vp_get_platform_tree()`, which returns a statically compiled
    `ComponentTreeNode` tree: hierarchy, module names, bindings, typed config
    structs.
@@ -211,22 +211,24 @@ thread at all: the engine runs inline in the caller's thread. We use
 deterministic lockstep. The engine is runnable when
 `run_count == clients.size() && lock_count == 0`.
 
-## How the ISS hooks in and runs (v1 layout)
+## How the ISS hooks in and runs
 
-`class IssWrapper : public vp::Component`
-(`core/models/cpu/iss/include/cores/cv32e40p/class.hpp`) contains `Iss iss` by
-value. The `Iss` itself is not a tree of sub-components: it is an aggregate of
-public by-value sub-blocks, in declaration order `regfile, exec, insn_cache,
-timing, core, prefetcher, decode, irq, gdbserver, lsu, dbgunit, syscalls,
-trace, csr, exception, memcheck`. Those public fields are what make the
-bridge's reach-in possible. The component path is `soc/core`;
-`get_component("soc/core")` returns it as `void*` and the bridge casts to
-`IssWrapper*`.
+The co-simulation runs on `iss_v2` (`core/models/cpu/iss_v2/`), a modular
+ISS. There is no wrapper component: the component at path `soc/core` —
+returned by `get_component("soc/core")` as `void*` — is the `Iss` object
+itself, an aggregate of public by-value sub-blocks (`regfile`, `exec`,
+`timing`, `csr`, `irq`, `lsu`, ...). Those public fields are what make the
+bridge's reach-in possible. The subsystems are compile-time slots that a
+core personality fills by substituting classes — the shared iss_v2 sources
+carry no core-specific `#ifdef`. The CV32E40P personality lives out of
+tree in the pulp repo (`cpu/iss_v2/{include,src}/cores/cv32e40p/`),
+assembled by the recipe `pulp/cpu/iss/cv32e40p_v2.py` (slots: Csr, Irq,
+Core, Exception, Regfile, Events, Exec, priv); the `Events` slot maintains
+the architectural commit stream the engine wrapper consumes — see "The v2
+bridge" in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-The CV32E40P model (`pulp_cores.py`) is configured TIMED: `scoreboard=True,
-timed=True, riscv_exceptions=True` — real fetch through the prefetcher,
-modeled stalls. `EXEC_SCOREBOARD` stays off (the class does not pass
-`modules`, so the default `[ExecInOrder()]` with `scoreboard=False` applies).
+The CV32E40P target runs the timed configuration: real fetch through the
+prefetcher, modeled stalls.
 
 ### Fast and slow handlers
 
@@ -251,8 +253,8 @@ stall the core on an asynchronous refill (`stalled_inc` / `fetch_response`).
 Execution itself is `current_insn = insn->fast_handler(iss, insn, pc)`: the
 handler's return value is the next PC, so a retire is precisely a mutation of
 `exec.current_insn`. Note that `csr.instret` is a plain `CsrReg` that does not
-auto-increment — which is why the bridge detects retires through the
-`current_insn` change and not through `instret`.
+auto-increment — it cannot serve as a retire counter, which is why the
+personality records retires in the commit stream the bridge consumes.
 
 ### Traps and IRQs inside the ISS
 
@@ -262,25 +264,10 @@ saves `mepc`, updates `mstatus`, but does not redirect immediately: it sets
 the slow handler (`current_insn = exception_pc`). This is the "trap = 2 ISS
 steps" shape the bridge has to handle.
 
-For CV32E40P there is a combinational decode-stage IRQ check before fetch in
-both the fast and slow handlers, under `#ifdef CONFIG_GVSOC_ISS_CV32E40P`.
-`Irq::check()` runs inside the ISS run loop; the bridge never calls it.
-
-### The iss_v2 layout
-
-`iss_v2` (in `core/models/cpu/iss_v2/`) is a modular rewrite of the same
-ISS. There is no `IssWrapper`: the component behind
-`get_component("soc/core")` is the `Iss` object itself. The subsystems are
-compile-time slots that a core personality fills by substituting classes —
-the shared iss_v2 sources carry no core-specific `#ifdef`. The CV32E40P
-personality lives out of tree in the pulp repo
-(`cpu/iss_v2/{include,src}/cores/cv32e40p/`), assembled by the recipe
-`pulp/cpu/iss/cv32e40p_v2.py` (slots: Csr, Irq, Core, Exception, Regfile,
-Events, Exec, priv). Execution keeps the same event-driven shape as v1;
-what changes for the bridge is that the `Events` slot maintains an
-architectural commit stream the v2 engine wrapper consumes instead of
-polling for PC changes — see "The v2 bridge" in
-[`ARCHITECTURE.md`](ARCHITECTURE.md).
+For CV32E40P there is a decode-stage IRQ check before fetch in both the
+fast and slow handlers; the CV32E40P-specific ranking comes from the
+personality's `Irq` slot. The check runs inside the ISS run loop; the
+bridge never calls it.
 
 ## Service subsystems
 
@@ -333,20 +320,15 @@ does step-and-compare. That is why our bridge deviates — retire-based
 stepping plus the reach-in. The full comparison is in
 [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-Our own usage, in one line — the v1 bridge: `Api_mode_sync`;
-`gvsoc_new → bind(BridgeUser) → open → start → get_component("soc/core") →
-cast to IssWrapper*`; a `step(20000 ps)` loop with PC-change retire
-detection; reach-in on `iss.regfile/csr/exec/irq`; no `step_until`, no
-`get_next_event_time`, no `wire_bind`. The bridge workarounds — CSR read
-fixups, write masks, force-reset, `skip_irq_check` re-assert, the runaway
-detector, IRQ injection through `mip` — all descend from the missing state
-API and from the symbol isolation described next.
-
-The v2 bridge (`gvsoc_engine_v2.cpp`, the co-simulation default) keeps the
-same lifecycle and the same reach-in but replaces the two mechanisms that
-hurt most: retires are popped from the personality's commit stream instead
-of being inferred from PC changes, and IRQs are driven over `wire_bind`
-into a dedicated injector component instead of being poked into `mip`.
+Our own usage, in one line: `Api_mode_sync`;
+`gvsoc_new → bind(BridgeUser) → open → start → get_component("soc/core")`;
+one `step(20000 ps)` per clock, gated by the personality's commit stream
+(one pop per retire); IRQs driven over `wire_bind` into the
+`cv32e40p_irq_injector` component; reach-in on `iss.regfile/csr/exec/irq`;
+no `step_until`, no `get_next_event_time`. The bridge workarounds — CSR
+read fixups, write masks, force-reset, `skip_irq_check` re-assert, the
+runaway detector — all descend from the missing state API and from the
+symbol isolation described next.
 
 ## Why we did not use the gdbserver
 
@@ -358,19 +340,18 @@ by a linking barrier. The bridge reads state only through public struct
 fields, never through ISS methods (`get_csr`, `access`, ...), because those
 methods are compiled into the model's `.so` and are not linkable from a
 DPI-loaded library — `RTLD_DEEPBIND` isolates the model's symbols. The
-bridge's own design comment in `gvsoc_engine.cpp` says exactly this, and the
 bridge was born in a single commit (`42d2781`) with the reach-in already in
 place.
 
 Second, the component is simply not there on our platform. The gdbserver is
 an opt-in `vp::Component` instantiated explicitly only on pulp_open,
-siracusa, cheshire and magia; neither `cv32e40p-standalone.py` nor
-`pulp_cores.py` creates it. (Upstream later added per-target
+siracusa, cheshire and magia; the `cv32e40p-v2-standalone*` platforms do
+not create it. (Upstream later added per-target
 auto-instantiation — see "Upstream drift".) There was, and is, no
 `Gdbserver_core` on `soc/core` to talk to.
 
 Third, even if it were instantiated, the ISS implementation
-(`core/models/cpu/iss/src/gdbserver.cpp`) is structurally unsuitable for
+(`core/models/cpu/iss_v2/src/gdbserver.cpp`) is structurally unsuitable for
 step-and-compare:
 
 - `gdbserver_regs_get` exposes 33 registers — 32 GPRs plus
@@ -400,16 +381,13 @@ engine. The one risk is calibration against retire detection, so it should
 land as a prototype plus a full regression pass. If we pursue only one item
 on this list, it is this one.
 
-IRQ over `wire_bind()` — implemented by the v2 bridge. Architecturally the
-right thing (it is what the official dpi-wrapper does), and the v2 bridge
-does it: `gvsoc_engine_v2.cpp` binds the 19 lines of the
-`cv32e40p_irq_injector` component (pulp repo,
+IRQ over `wire_bind()` — done. Architecturally the right thing (it is what
+the official dpi-wrapper does): `gvsoc_engine_v2.cpp` binds the 19 lines
+of the `cv32e40p_irq_injector` component (pulp repo,
 `pulp/cv32e40p_irq_injector/`) at init and drives them from
-`rvviRefNetSet`, replacing the direct `mip` write. The desync worry proved
-manageable because the settle logic and the informed injection were kept on
-top of the wires — see "IRQ injection" in
-[`ARCHITECTURE.md`](ARCHITECTURE.md). On the v1 path the direct `mip` write
-remains; haltreq is still partial on both.
+`rvviRefNetSet`. The desync worry proved manageable because the settle
+logic and the informed injection were kept on top of the wires — see
+"IRQ injection" in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 Engine bump plus `gv_api_version()`. Upstream now versions the control API;
 adopting it turns a stale-`.so` SIGSEGV into a fail-fast version error. See
@@ -430,18 +408,15 @@ instead would cost more, for the reasons above.
 Upstream per-instruction step or retire hook. A `step_instructions(n)`
 built on a retire budget that pauses the time engine, or a registrable retire
 callback, gated the way the gdbserver already gates fast mode (zero cost when
-off). This would remove the per-cycle poll loop, the PC-changed heuristic,
-the branch-to-self special case, `STEP_MAX_CYCLES` and the runaway detector
-in one move — one engine crossing per retire instead of up to 2000. The
-pause-on-event mechanism and the fast-mode gating both exist already; the
-design work is the retire semantics around traps and IRQ entry.
-The v2 bridge achieves most of this without an engine change: the CV32E40P
-personality's `Events` slot records commits in a ring the bridge pops one
-per retire, so the PC-changed heuristic and the branch-to-self special case
-are gone on the v2 path. A bounded cycle budget and the runaway net remain
-as safety checks (a v2 timeout means "no new commit showed up"), and an
+off). The pause-on-event mechanism and the fast-mode gating both exist
+already; the design work is the retire semantics around traps and IRQ entry.
+The commit stream already gives the bridge most of this without an engine
+change — the CV32E40P personality's `Events` slot records commits in a ring
+the bridge pops one per retire, with a bounded cycle budget and the runaway
+net as safety checks (a timeout means "no new commit showed up") — but an
 upstream retire hook would still be the cleaner engine-level version of the
-same idea.
+same idea: one engine crossing per retire instead of clocking cycle-by-cycle
+while the ring is empty.
 
 Runtime trace control and the debug-memory backdoor. Both exist upstream and
 come with the engine bump: `trace_level_set`/`trace_subscribe` make ISS
@@ -475,10 +450,9 @@ memory model, a small change in our fork.
 
 Not verified: checkpoint/restart is absent from the vendored engine (the
 upstream `restart()` is in the missing commits); the exact `prefetcher_size`
-for the `cv32e40p` class and where the branch penalty is accounted. One
-former open point is now settled empirically: `iss/` vs `iss_v2/` accuracy
-for our cores — the v2 bridge passes the full no-pulp regression, exceeding
-the v1 baseline.
+for the `cv32e40p` class and where the branch penalty is accounted. The
+`iss_v2` accuracy question is settled empirically: the bridge passes the
+full no-pulp regression.
 
 ## Upstream drift and what a bump would take
 
@@ -524,27 +498,14 @@ regenerate the config, then `make check-rvvi` plus a dual-trace
 `illegal_instr_test` and `hello-world` with `USE_ISS=YES` before trusting any
 regression score.
 
-Related: the core repo also ships `iss_v2`, a modular rewrite of the ISS —
-compile-time subsystem slots, no `IssWrapper`, core personalities can live
-out of tree. The pulp fork's RI5CY was the first core to run on it with an
-out-of-tree `Ri5kyCsr`, and CV32E40P has since followed: a complete
-out-of-tree personality lives in the pulp repo (see "The iss_v2 layout"
-above), the bridge has a dedicated v2 engine wrapper
-(`gvsoc_engine_v2.cpp`), the Makefile builds against the generated
-`isa_cv32e40p_v2_*` ISA headers, and the v2 platforms are the co-simulation
-default (`GVSOC_ISS_V2 ?= YES` in core-v-verif's `mk/Common.mk`;
-`GVSOC_ISS_V2=NO` selects the legacy v1 path). The parity re-validation was
-done with `test/quick_val.sh` across the four supported configs, and the v2
-bridge passes the full no-pulp regression, exceeding the v1 baseline. One
-expectation to keep straight: migrating did not remove the reach-in. The v2
-gdbserver is unchanged (still no CSR readback), so the bridge still
-acquires the core through `get_component` and reads public struct members —
-in v2 the component is the `Iss` object itself — with `static_assert`
-layout tripwires and a runtime canary as the mitigation. What v2 does
-change is the retire and IRQ mechanics: retires come from an architectural
-commit stream maintained by the personality, and IRQs enter over
-`wire_bind` through a dedicated injector — see "The v2 bridge" in
-[`ARCHITECTURE.md`](ARCHITECTURE.md).
+One expectation to keep straight for any core bump: the reach-in is still
+there. The iss_v2 gdbserver exposes no CSR readback, so the bridge acquires
+the core through `get_component` and reads public struct members — the
+component is the `Iss` object itself — with the `static_assert` layout
+tripwires and the runtime canary as the mitigation. The Makefile builds the
+engine wrapper against the generated `isa_cv32e40p_v2_*` ISA headers, so a
+core bump must be followed by a full library rebuild before any validation
+run.
 
 ## References
 
@@ -556,18 +517,17 @@ and `include/vp/controller.hpp` · `time/time_engine.{hpp,cpp}` ·
 `dpi-wrapper/src/dpi.cpp` · `src/proxy.cpp`
 
 Core / ISS (`gvsoc/core/models/`):
-`cpu/iss/include/cores/cv32e40p/class.hpp` ·
-`cpu/iss/{src/exec/exec_inorder.cpp,include/exec/exec_inorder*.hpp}` ·
-`cpu/iss/include/insn_cache.hpp` · `cpu/iss/include/prefetch/*` ·
-`cpu/iss/src/{exception,syscalls,htif,gdbserver}.cpp` ·
-`cpu/iss_v2/` (shared v2 framework) ·
+`cpu/iss_v2/` (the shared framework) ·
+`cpu/iss_v2/{src/exec/exec_inorder.cpp,include/exec/exec_inorder*.hpp}` ·
+`cpu/iss_v2/include/insn_cache.hpp` · `cpu/iss_v2/include/prefetch/` ·
+`cpu/iss_v2/src/{exception,syscalls,htif,gdbserver}.cpp` ·
 `interco/router/router.cpp` · `interco/{bus_watchpoint,testandset}.cpp` ·
 `memory/memory.cpp` · `gdbserver/{gdbserver,rsp}.cpp`
 
-Platform (`gvsoc/pulp/`): `cv32e40p-standalone.py` ·
+Platform (`gvsoc/pulp/`):
 `cv32e40p-v2-standalone{,-fpu,-zfinx,-nopulp}.py` ·
-`pulp/cpu/iss/pulp_cores.py` · `pulp/cpu/iss/cv32e40p_v2.py` (v2 recipe) ·
-`cpu/iss_v2/{include,src}/cores/cv32e40p/` (v2 personality) ·
+`pulp/cpu/iss/cv32e40p_v2.py` (the personality recipe) ·
+`cpu/iss_v2/{include,src}/cores/cv32e40p/` (the personality) ·
 `pulp/cv32e40p_irq_injector/cv32e40p_irq_injector.{cpp,py}` ·
 `pulp/cv32e40p_exit/cv32e40p_exit_device.cpp`
 

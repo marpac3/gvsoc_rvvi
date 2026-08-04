@@ -56,14 +56,12 @@ All commands from `cv32e40p/sim/uvmt/` in the core-v-verif tree.
 
 A few things that save time:
 
-- The reference model runs on the iss_v2 core by default (`GVSOC_ISS_V2 ?=
-  YES` in `mk/Common.mk`): the run loads `libgvsoc_rvvi_v2.so` (or
-  `libgvsoc_rvvi_v2_zfinx.so` on ZFINX CFGs) and the
-  `gvsoc_config_v2_<CFG>.json` template. `GVSOC_ISS_V2=NO` on the make line
-  falls back to the legacy v1 bridge (`libgvsoc_rvvi.so`,
-  `gvsoc_config_<CFG>.json`). Both selections are made at run time — the
-  `.so` is loaded at vsim startup — so toggling the switch does not require
-  a TB recompile.
+- The reference model runs on the iss_v2 core: the run loads
+  `libgvsoc_rvvi_v2.so` (or `libgvsoc_rvvi_v2_zfinx.so` on ZFINX CFGs) and
+  the `gvsoc_config_v2_<CFG>.json` template. There is no core selector —
+  the testbench Makefile fails with an explicit error if `GVSOC_ISS_V2=NO`
+  is passed on the make line. The `.so` is loaded at vsim startup, not
+  linked into the TB objects.
 - `test/quick_val.sh [out-dir] [cfg ...]` is the standard validation gate
   before trusting a bridge or ISS change: one run of every test type in
   each of the four configs (`default`, `pulp`, `pulp_fpu`,
@@ -163,8 +161,7 @@ them.
    license.
 6. Turn up bridge visibility on a rerun when the mechanics of the sync are in
    question: `CV_RVVI_BRIDGE_VERBOSE=1` for per-call logging;
-   `GVSOC_FORCE_TRAP_CSR=0` (v1 path only — the v2 bridge handles the trap
-   seam through its commit stream) or `CV_RVVI_VOLATILE_CSR_SYNC=0` to
+   `GVSOC_FORCE_TRAP_CSR=0` or `CV_RVVI_VOLATILE_CSR_SYNC=0` to
    isolate the effect of the sync mechanisms (expect forks — that is the
    point).
 7. Go source-level when a hypothesis needs stepping through the ISS: gdb
@@ -180,7 +177,7 @@ them.
 | `CV_SW_TOOLCHAIN not defined` | Non-interactive shell, env not exported | shell setup above |
 | `SIMULATION FAILED`, mismatches > 0 | Real divergence | triage above |
 | PASSED but `phase realigns` non-zero | Bridge recovered a retire misalignment — benign if mismatches = 0, still worth a look in the traces | dual-trace diff |
-| `RUNAWAY detected: N consecutive stuck-PC timeouts` | ISS stopped retiring while the DUT kept going (v1: the PC-change poll timed out; v2: no new commit within the engine's cycle budget) | dual-trace diff at the reported PC; `DEBUG_COSIM.md` |
+| `RUNAWAY detected: N consecutive stuck-PC timeouts` | ISS stopped retiring while the DUT kept going (no new commit within the engine's cycle budget) | dual-trace diff at the reported PC; `DEBUG_COSIM.md` |
 | Sim hangs mid-run, log stopped growing | Deadlock (often around WFI/interrupt sync) | attach gdb (`DEBUG_COSIM.md`), inspect both step loops |
 | Dual-trace run produces no `dut.rvvi` | TB compiled without `RVVI_TRACE=YES`, or flag missing on the run line | recompile / rerun with the flag |
 | ISS edits appear to have no effect | Stale `.so` | rebuild in the submodule, then rerun |

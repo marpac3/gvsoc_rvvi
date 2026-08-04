@@ -17,8 +17,6 @@
 #            cfg list optional (default: default pulp pulp_fpu pulp_fpu_zfinx)
 # Expects: simulator environment already set up (see docs/TESTING.md) and a
 #          compiled toolchain; run from anywhere inside the core-v-verif tree.
-# The iss_v2 reference core is the default (Common.mk); set GVSOC_ISS_V2=NO
-# in the environment to run against the legacy v1 core.
 #
 # Exit code: 0 only when no lane reports FAIL/TIMEOUT/NO_SIM. Known-fail
 # lanes (kind xfail) and skips do not affect it.
@@ -96,7 +94,7 @@ cd "$UVMT" || exit 1
 PASS=0; FAIL=0; XFAIL=0; SKIP=0
 : > "$OUT/SUMMARY.txt"
 echo "quick_val start: $(date -Iseconds)" >> "$OUT/SUMMARY.txt"
-echo "reference core: $([ "${GVSOC_ISS_V2:-YES}" = "NO" ] && echo v1 || echo iss_v2)" >> "$OUT/SUMMARY.txt"
+echo "reference core: iss_v2" >> "$OUT/SUMMARY.txt"
 echo "configs: $CFGS" >> "$OUT/SUMMARY.txt"
 echo "seed: ${QV_SEED:-1}" >> "$OUT/SUMMARY.txt"
 
@@ -292,7 +290,7 @@ run_one() {
     eval timeout $tmo make $gen test COREV=YES TEST=$tc CV_CORE=cv32e40p \
         CFG=$cfg COREV=1 SIMULATOR=vsim COMP=0 USE_ISS=YES ISS=GVSOC COV=NO \
         SEED=${QV_SEED:-1} GEN_START_INDEX=0 RUN_INDEX=0 TEST_CFG_FILE= ENABLE_TRACE_LOG=NO \
-        ${GVSOC_ISS_V2:+GVSOC_ISS_V2=$GVSOC_ISS_V2} $extra \
+        $extra \
         > "$OUT/$cfg/$label.log" 2>&1
     local rc=$? t1=$(date +%s)
     local verdict
@@ -318,7 +316,7 @@ sweep_cfg() {
     local t0=$(date +%s)
     make comp comp_corev-dv CV_CORE=cv32e40p CFG=$cfg SIMULATOR=vsim \
         USE_ISS=YES ISS=GVSOC COV=NO \
-        ${GVSOC_ISS_V2:+GVSOC_ISS_V2=$GVSOC_ISS_V2} > "$OUT/$cfg/comp.log" 2>&1
+        > "$OUT/$cfg/comp.log" 2>&1
     local rc=$?
     echo "comp rc=$rc wall=$(( $(date +%s) - t0 ))s" >> "$OUT/SUMMARY.txt"
     if [ $rc -ne 0 ]; then

@@ -96,11 +96,11 @@ void rvvi_text_write_line  (FILE*, const RvviTextWriteSet&);
 ```
 
 It is linked into three shared objects (`vendor_lib/gvsoc_rvvi/Makefile`):
-`libgvsoc_rvvi.so` and `libgvsoc_rvvi_zfinx.so` (the DPI co-simulation
-bridge, `rvvi_api2gvsoc.cpp`, calls it through a thin adapter fed from the
-bridge's DUT-push state and the ISS getters) and `librvvi_text.so` (a
-standalone DPI shim, `rvvi_text_dpi.{hpp,cpp}` — the `rvviText*` functions,
-zero GVSOC dependency — used by the SV tracer).
+`libgvsoc_rvvi_v2.so` and `libgvsoc_rvvi_v2_zfinx.so` (the DPI
+co-simulation bridge, `rvvi_api2gvsoc.cpp`, calls it through a thin adapter
+fed from the bridge's DUT-push state and the ISS getters) and
+`librvvi_text.so` (a standalone DPI shim, `rvvi_text_dpi.{hpp,cpp}` — the
+`rvviText*` functions, zero GVSOC dependency — used by the SV tracer).
 
 ### The two producers
 
@@ -248,11 +248,7 @@ to anything but GVSOC, `RVVI_TRACE=YES` is ignored and make prints
   the loop). It would need per-retire write-set capture inside the engine
   wrapper — the bridge derives the write-set from the DUT push, which does
   not exist without a DUT — and would have to bypass `rvviRefEventStep`,
-  which on the v1 bridge force-resyncs the ISS to the (absent) DUT state.
-- The trace path itself is bridge-agnostic: emission lives in
-  `rvvi_api2gvsoc.cpp`, which is compiled into both the v1 and the v2
-  bridge libraries, so RVVI-TEXT output works identically under
-  `GVSOC_ISS_V2=YES` (the default) and `=NO`.
+  which force-resyncs the ISS to the (absent) DUT state.
 - Dual-trace has been exercised on CFG `default`, `pulp` and `pulp_fpu`;
   `pulp_fpu_zfinx` and the FPU-trap path have not. When diffing
   `dut.rvvi`/`ref.rvvi` on the PULP CFGs, expect a few ref-side deltas that
