@@ -144,11 +144,14 @@ static bool          g_runaway = false;         /* sticky once latched */
 /* Set when mip bits are asserted, cleared after settle */
 static bool          g_irq_pending_settle = false;
 
-/* Interrupt wire bindings on the platform irq injector, indexed by RVVI net:
+/* Wire bindings on the platform irq injector, indexed by RVVI net:
  * 0=MSWInterrupt->msi, 1=MTimerInterrupt->mti, 2=MExternalInterrupt->mei,
- * 3..18=LocalInterrupt0..15->external_irq_16..31. haltreq (net 19) is a
- * debug request, not an interrupt wire (see gvsoc_engine_set_irq). */
-static constexpr int  IRQ_NB_WIRES = 19;
+ * 3..18=LocalInterrupt0..15->external_irq_16..31, 19=haltreq (RTL
+ * debug_req_i). haltreq travels the wire path like the interrupt lines:
+ * Cv32e40pIrq::haltreq_sync arms req_debug AND wakes a WFI-parked hart
+ * with the full release sequence, which a bridge-side struct write cannot
+ * do (insn_terminate is not callable across the .so boundary). */
+static constexpr int  IRQ_NB_WIRES = 21;
 static gv::Wire_binding *g_irq_wire[IRQ_NB_WIRES] = {};
 /* Callback sink required by wire_bind; the ISS never drives these wires
  * back, so it stays empty. */
@@ -160,6 +163,8 @@ static const char *const g_irq_wire_name[IRQ_NB_WIRES] = {
     "external_irq_20", "external_irq_21", "external_irq_22", "external_irq_23",
     "external_irq_24", "external_irq_25", "external_irq_26", "external_irq_27",
     "external_irq_28", "external_irq_29", "external_irq_30", "external_irq_31",
+    "haltreq",
+    "wfi_wake",
 };
 
 /* --------------------------------------------------------------------------
@@ -1099,25 +1104,22 @@ void gvsoc_engine_set_irq(uint64_t net_index, int value)
 
     if (net_index >= IRQ_NB_WIRES)
     {
-        /* haltreq (net_index=19): inject a debug request via direct struct
-         * write only. The ISS debug_req() method is compiled into the model
-         * .so and not available at DPI link time; its side effects (exit WFI,
-         * switch to full exec mode) are therefore NOT triggered here. */
-        if (net_index == 19 && value)
-        {
-            g_iss->irq.req_debug = true;
-            /* dcsr.cause is written by Cv32e40pIrq::check() atomically with
-             * the debug entry, as the RTL does; an eager write here would be
-             * visible retires before the entry. */
-            ENGINE_LOG("set_irq: haltreq asserted -> req_debug=true");
-        }
-        else if (net_index > 19)
-        {
-            ENGINE_ERR("set_irq: unmapped net index %llu (value=%d)",
-                       (unsigned long long)net_index, value);
-        }
+        ENGINE_ERR("set_irq: unmapped net index %llu (value=%d)",
+                   (unsigned long long)net_index, value);
         return;
     }
+
+    /* haltreq (net 19) rides the wire path below like the interrupt lines;
+     * Cv32e40pIrq::haltreq_sync arms req_debug (dcsr.cause is written by
+     * check() atomically with the entry) and wakes a WFI-parked hart. It
+     * never touches mip, so the settle logic naturally no-ops. */
+    if (net_index == 19 && value)
+        ENGINE_LOG("set_irq: haltreq asserted -> wire");
+
+    /* wfi_wake (net 20): bridge-driven pulse releasing a WFI-parked hart
+     * (Cv32e40pIrq::wfi_wake_sync), no architectural effect, mip untouched. */
+    if (net_index == 20 && value)
+        ENGINE_LOG("set_irq: wfi_wake pulse -> wire");
 
     iss_reg_t old_mip = g_iss->csr.mip.value;
 
@@ -1331,7 +1333,7 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
     return rc;
 }
 
-int gvsoc_engine_take_debug_for_one_step(int dcsr_cause)
+int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id)
 {
     if (!g_running || !g_gvsoc || g_finished || !g_iss)
         return 0;
@@ -1345,6 +1347,16 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause)
      * commit against the DUT's entry row. */
     if (g_iss->exec.debug_mode)
     {
+        /* A collision id has nowhere to go on this branch: the spontaneous
+         * entry already happened without the take. Loud, not silent - if
+         * this ever fires, the mstatus/mcause divergence at the ROM rows
+         * has THIS discard as its root cause. */
+        if (collide_irq_id >= 0)
+        {
+            ENGINE_ERR("take_debug: spontaneous entry discards an informed "
+                       "IRQ collision (id=%d) - the model entered without "
+                       "the take", collide_irq_id);
+        }
         ENGINE_LOG("take_debug: ISS already in debug mode (cause=%d), "
                    "spontaneous trigger entry - no injection", dcsr_cause);
         return 1;
@@ -1358,6 +1370,12 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause)
      * (cause 3) and the insn after the stepped one (cause 4). */
     g_iss->irq.req_debug_cause = dcsr_cause & 0x7;
     g_iss->irq.req_debug = true;
+
+    /* Informed interrupt+debug collision: the DUT's entry row carried the
+     * CSR writes of an interrupt take, so check() must take exactly that
+     * line before the entry (dpc = the vectored handler entry, mstatus/
+     * mepc/mcause from the take). -1 = no collision observed. */
+    g_iss->irq.collide_irq_id = collide_irq_id;
 
     /* A WFI-parked ISS cannot spontaneously wake for an injected take (same
      * diagnostic as take_irq): report it, the step loop below will surface
@@ -1533,6 +1551,9 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause)
      * success check() already consumed it, so this is a no-op there. */
     g_iss->irq.req_debug = false;
     g_iss->irq.req_debug_cause = 3;
+    /* Same latching hazard: an unconsumed collision id would make a later
+     * entry take a stale interrupt. On success check() already reset it. */
+    g_iss->irq.collide_irq_id = -1;
 
     /* depc is logged so a wrong entry point is visible here, without the
      * engine having to know the DUT's dpc (only the bridge holds it). */

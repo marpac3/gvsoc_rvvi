@@ -270,10 +270,15 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id);
  * for the caller's step-and-compare. The v1 engine does not implement the
  * debug entry and stubs this to 0.
  *
- * @param dcsr_cause  debug entry cause for dcsr[8:6].
+ * @param dcsr_cause      debug entry cause for dcsr[8:6].
+ * @param collide_irq_id  interrupt cause id the DUT took at the same entry
+ *                        (its entry row carried the take's CSR writes), or
+ *                        -1. The model takes that line before the entry, so
+ *                        dpc lands on the handler entry and mstatus/mepc/
+ *                        mcause carry the take, as in the RTL.
  * @return 1 if the debug entry landed a commit, 0 otherwise.
  */
-int gvsoc_engine_take_debug_for_one_step(int dcsr_cause);
+int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id);
 
 #ifdef __cplusplus
 }

@@ -297,6 +297,25 @@ static uint64_t g_informed_irq_count = 0;   /* diagnostic: injections applied */
 static bool g_volatile_sync_enabled = true;
 static uint64_t g_volatile_sync_count = 0;  /* diagnostic: syncs applied */
 
+/* Volatile memory windows (same ImperasDV-informed semantics as the counter
+ * sync above, for memory-mapped state). The testbench declares them via the
+ * standard RVVI call rvviRefMemorySetVolatile() at init - the GVSOC wrap
+ * mirrors the Imperas wrap's window (0x15001000-0x15001007: the TB virtual
+ * peripheral random-number generator and cycle counter). A load whose
+ * DUT-side effective address (RVFI mem_addr/mem_rmask, passed down the batch
+ * DPI) falls in a window reads device state no functional model can predict:
+ * the value is excluded from verification and the DUT's rd write-back is
+ * copied into the ISS GPR so downstream control flow stays in lockstep.
+ * Reads only - a store to a volatile window needs no sync (the device value
+ * never feeds back through the ISS's own memory). */
+static std::vector<std::pair<uint64_t, uint64_t>> g_mem_volatile;
+static uint64_t g_volatile_mem_sync_count = 0;  /* diagnostic: syncs applied */
+
+/* dpc forces applied at debug-entry seams (decision G): each one where the
+ * ISS disagreed with the DUT is a direct gauge of an entry-ordering error,
+ * so it is logged unthrottled and counted for the shutdown summary. */
+static uint64_t g_dpc_force_count = 0;
+
 /* --------------------------------------------------------------------------
  * Phase-shift re-alignment on synchronous exceptions.
  *
@@ -458,15 +477,22 @@ static std::string create_temp_config(const char *template_path,
 
 /* Throttled mismatch logging.
  * Increments the counter and returns true if the caller should log.
- * Emits a "suppressing further" message on the last allowed log. */
-static constexpr uint64_t MAX_MISMATCH_LOG = 10;
+ * Emits a "suppressing further" message on the last allowed log.
+ * The budget is per category and configurable via CV_RVVI_MISMATCH_LOG_MAX
+ * (read at init; 0 = unlimited): the default 10 keeps a diverged run's log
+ * bounded, but hides whether a mismatch is sustained or transient - raise
+ * it (or set 0) when that distinction matters. The authoritative count is
+ * always `Total Reference model mismatches`, never the printed lines. */
+static uint64_t g_mismatch_log_max = 10;
 
 static inline bool throttle_check(uint64_t &counter, const char *category)
 {
     counter++;
-    if (counter > MAX_MISMATCH_LOG)
+    if (g_mismatch_log_max == 0)
+        return true;
+    if (counter > g_mismatch_log_max)
         return false;
-    if (counter == MAX_MISMATCH_LOG)
+    if (counter == g_mismatch_log_max)
         BRIDGE_ERR("(suppressing further %s mismatch messages)", category);
     return true;
 }
@@ -690,12 +716,38 @@ bool_t rvviRefInit(const char *programPath)
     BRIDGE_LOG("volatile-counter read sync: %s",
                g_volatile_sync_enabled ? "ENABLED" : "DISABLED");
 
-    /* Reset the retire lifecycle and diagnostic counters for this run. */
+    /* Per-category mismatch log budget (0 = unlimited). A malformed value
+     * keeps the default: strtoull would return 0 on "abc" and stop early
+     * on "10x", silently flipping the fail-safe default into unlimited
+     * logging - the opposite of what a typo should do. */
+    {
+        const char *v = getenv("CV_RVVI_MISMATCH_LOG_MAX");
+        if (v && v[0] != '\0') {
+            char *end = nullptr;
+            uint64_t parsed = strtoull(v, &end, 10);
+            if (end != nullptr && *end == '\0')
+                g_mismatch_log_max = parsed;
+            else
+                BRIDGE_ERR("CV_RVVI_MISMATCH_LOG_MAX='%s' is not a number - "
+                           "keeping the default %llu", v,
+                           (unsigned long long)g_mismatch_log_max);
+        }
+        BRIDGE_LOG("mismatch log budget per category: %llu%s",
+                   (unsigned long long)g_mismatch_log_max,
+                   g_mismatch_log_max == 0 ? " (unlimited)" : "");
+    }
+
+    /* Reset the retire lifecycle and diagnostic counters for this run.
+     * The volatile memory windows are re-declared by the testbench's
+     * ref_init right after this call, so clear them too. */
     g_pending             = {};
     g_retire              = {};
     g_phase_realign_count = 0;
     g_force_resync_count  = 0;
     g_volatile_sync_count = 0;
+    g_volatile_mem_sync_count = 0;
+    g_dpc_force_count     = 0;
+    g_mem_volatile.clear();
 
     if (programPath && strlen(programPath) > 0) {
         /* Drop any temp config from a previous init so a re-init does not leak
@@ -802,6 +854,11 @@ bool_t rvviRefShutdown(void)
         BRIDGE_LOG("  phase realigns : %llu", (unsigned long long)g_phase_realign_count);
     if (g_volatile_sync_count > 0)
         BRIDGE_LOG("  volatile syncs : %llu", (unsigned long long)g_volatile_sync_count);
+    if (g_volatile_mem_sync_count > 0)
+        BRIDGE_LOG("  volatile mem syncs : %llu", (unsigned long long)g_volatile_mem_sync_count);
+    if (g_dpc_force_count > 0)
+        BRIDGE_LOG("  dpc forces (debug-entry ordering gauge) : %llu",
+                   (unsigned long long)g_dpc_force_count);
     if (g_metric_state_deferred > 0)
         BRIDGE_LOG("  state-deferred retires : %llu (commit bursts, PC-only compare)",
                    (unsigned long long)g_metric_state_deferred);
@@ -1035,7 +1092,7 @@ void rvviDutCycleCountSet(uint64_t /*cycleCount*/) {}
  * The IRQ force-resync covers hwloop through its generic compared-CSR restore;
  * the debug entry has no generic restore, so it calls this targeted one. No-op
  * when the states already agree. */
-static void force_debug_entry_csrs_from_dut(void)
+static void force_debug_entry_csrs_from_dut(uint32_t cause)
 {
     static const uint32_t addrs[] = {CSR_DPC, 0xCC0u, 0xCC1u, 0xCC2u,
                                      0xCC4u, 0xCC5u, 0xCC6u};
@@ -1045,10 +1102,109 @@ static void force_debug_entry_csrs_from_dut(void)
         uint32_t iss_val = 0;
         gvsoc_engine_get_csr(addr, &iss_val);
         if (iss_val != it->second) {
-            BRIDGE_LOG_HOT("debug-entry force CSR[0x%03x]: ISS=0x%08x -> DUT=0x%08x",
-                           addr, iss_val, it->second);
+            if (addr == CSR_DPC && cause != 1) {
+                /* A dpc force with a non-zero delta is the direct gauge of a
+                 * debug-entry ordering error (the ISS's entry point was not
+                 * the DUT's): log it unthrottled so the force never silently
+                 * masks the diagnosis it repairs. Ebreak entries (cause 1)
+                 * are excluded from the gauge: their dpc delta is the
+                 * structural retire-vs-capture offset documented above, not
+                 * an ordering error - counting them would flood the log and
+                 * blunt the signal. */
+                g_dpc_force_count++;
+                BRIDGE_LOG("debug-entry dpc force #%llu: ISS=0x%08x -> DUT=0x%08x "
+                           "(delta=%+d bytes - entry-ordering gauge)",
+                           (unsigned long long)g_dpc_force_count,
+                           iss_val, it->second,
+                           (int)(iss_val - it->second));
+            } else {
+                BRIDGE_LOG_HOT("debug-entry force CSR[0x%03x]: ISS=0x%08x -> DUT=0x%08x",
+                               addr, iss_val, it->second);
+            }
             gvsoc_engine_set_csr(addr, it->second);
         }
+    }
+}
+
+/* Informed debug entry: on the DUT's first debug-mode retire (the debug
+ * ROM entry row) the ISS is still parked at the interrupted boundary -
+ * the RTL's entry has no architectural retire of its own, so nothing in
+ * the step-and-compare stream makes the ISS enter debug. Arm the entry
+ * with the DUT's own dcsr.cause (haltreq wire, ebreak or single-step all
+ * land here) and let the ISS compute dpc/dcsr and redirect to the ROM;
+ * the queued debug-ROM commit is then served against this retire row.
+ * The ISS-lag term de-latches the edge detector: a debug re-entry whose
+ * exit edge this stream never observed (rapid re-arm, back-to-back
+ * entries) leaves g_prev_dut_debug stale and the seam silently blind -
+ * fire whenever the DUT is in debug and the ISS is lagging behind.
+ * The PC term covers entries the debugMode flag misses entirely:
+ * rvfi_dbg_mode is an entry MARKER (asserted only while the tracer sees
+ * the DBG_TAKEN_* FSM states), and some haltreq entry paths retire the
+ * first debug-ROM row without it - the row then arrives with
+ * debugMode=0 and no later row carries the flag either. The DUT retire
+ * PC landing exactly on the ISS's configured debug-ROM entry address
+ * (dm_halt_addr) while the ISS is not in debug is an unambiguous entry
+ * row; deeper ROM rows do not match, so a failed injection does not
+ * retry-spam.
+ * Called from BOTH retire paths: a plain entry row arrives through
+ * rvviDutRetire, but an entry that collided with an interrupt take is a
+ * TRAP row (the take's CSR writes ride it) and arrives through
+ * rvviDutTrap - skipping it there left the ISS entering without the
+ * take (mstatus.MIE/mcause divergence at the ROM rows). */
+static void maybe_informed_debug_entry(uint64_t dutPc, bool debug_mode_flag)
+{
+    bool entry_row = debug_mode_flag ||
+                     ((uint32_t)dutPc == gvsoc_engine_get_debug_handler() &&
+                      !gvsoc_engine_is_debug_mode());
+    if (entry_row && (!g_prev_dut_debug || !gvsoc_engine_is_debug_mode()) &&
+        gvsoc_engine_is_running())
+    {
+        uint32_t cause = 3;
+        auto it = g_dut_csr.find(CSR_DCSR);
+        if (it != g_dut_csr.end())
+            cause = (it->second >> 6) & 0x7u;
+        /* Interrupt+debug collision, decided by the DUT: when the RTL takes
+         * an interrupt and enters debug in the same arbitration, the entry
+         * row carries the take's CSR writes - a fresh mcause write with the
+         * interrupt bit set on THIS row (g_retire.csr_writes, not the sticky
+         * mirror) is the unambiguous signature, and its id tells the model
+         * exactly which line to take ahead of the entry. First-match scan:
+         * assumes at most one distinct MCAUSE push per row (the documented
+         * duplications - generic scan + explicit trap push - carry the same
+         * value); if that invariant ever changes, switch to last-match like
+         * the sticky mirror. */
+        int collide_irq_id = -1;
+        for (const auto &w : g_retire.csr_writes) {
+            if (w.first == TRAP_CSR_MCAUSE && (w.second & 0x80000000u)) {
+                collide_irq_id = (int)(w.second & 0x1fu);
+                break;
+            }
+        }
+        /* The id is DUT-provided state, never trusted blindly: only the
+         * wired lines (MSI 3, MTI 7, MEI 11, fast 16..31 - the RTL
+         * int_controller IRQ_MASK) can collide with an entry. Anything
+         * else (a software mcause write riding an entry row) would fall
+         * through cv32e40p_irq_pick's default and take a phantom MTI. */
+        if (collide_irq_id >= 0 &&
+            !(collide_irq_id == 3 || collide_irq_id == 7 ||
+              collide_irq_id == 11 ||
+              (collide_irq_id >= 16 && collide_irq_id <= 31))) {
+            BRIDGE_ERR("informed debug entry: mcause id %d on the entry row "
+                       "is not a wired interrupt line - collision ignored",
+                       collide_irq_id);
+            collide_irq_id = -1;
+        }
+        BRIDGE_LOG_HOT("informed debug entry: DUT PC=0x%08x cause=%u%s",
+                       (uint32_t)dutPc, cause,
+                       collide_irq_id >= 0 ? " (+interrupt collision)" : "");
+        int rc = gvsoc_engine_take_debug_for_one_step((int)cause, collide_irq_id);
+        if (rc != 1)
+            BRIDGE_ERR("informed debug entry not certified (cause=%u rc=%d) - "
+                       "the ISS either did not enter debug or entered off the "
+                       "DUT's boundary; the step-and-compare will surface the "
+                       "divergence", cause, rc);
+        else
+            force_debug_entry_csrs_from_dut(cause);
     }
 }
 
@@ -1062,48 +1218,12 @@ void rvviDutRetire(uint32_t /*hartId*/, uint64_t dutPc,
      * before rvviRefCsrsCompare, so the trap-CSR snapshot must stay active for
      * the comparison.  It is cleared in rvviRefCsrsCompare after consumption. */
 
-    /* Informed debug entry: on the DUT's first debug-mode retire (the debug
-     * ROM entry row) the ISS is still parked at the interrupted boundary -
-     * the RTL's entry has no architectural retire of its own, so nothing in
-     * the step-and-compare stream makes the ISS enter debug. Arm the entry
-     * with the DUT's own dcsr.cause (haltreq wire, ebreak or single-step all
-     * land here) and let the ISS compute dpc/dcsr and redirect to the ROM;
-     * the queued debug-ROM commit is then served against this retire row.
-     * The v1 engine stubs the take to 0: the legacy divergence stays.
-     * The ISS-lag term de-latches the edge detector: a debug re-entry whose
-     * exit edge this stream never observed (rapid re-arm, back-to-back
-     * entries) leaves g_prev_dut_debug stale and the seam silently blind -
-     * fire whenever the DUT is in debug and the ISS is lagging behind.
-     * The PC term covers entries the debugMode flag misses entirely:
-     * rvfi_dbg_mode is an entry MARKER (asserted only while the tracer sees
-     * the DBG_TAKEN_* FSM states), and some haltreq entry paths retire the
-     * first debug-ROM row without it - the row then arrives with
-     * debugMode=0 and no later row carries the flag either. The DUT retire
-     * PC landing exactly on the ISS's configured debug-ROM entry address
-     * (dm_halt_addr) while the ISS is not in debug is an unambiguous entry
-     * row; deeper ROM rows do not match, so a failed injection does not
-     * retry-spam. */
-    bool entry_row = debugMode ||
-                     ((uint32_t)dutPc == gvsoc_engine_get_debug_handler() &&
-                      !gvsoc_engine_is_debug_mode());
-    if (entry_row && (!g_prev_dut_debug || !gvsoc_engine_is_debug_mode()) &&
-        gvsoc_engine_is_running())
-    {
-        uint32_t cause = 3;
-        auto it = g_dut_csr.find(CSR_DCSR);
-        if (it != g_dut_csr.end())
-            cause = (it->second >> 6) & 0x7u;
-        BRIDGE_LOG_HOT("informed debug entry: DUT PC=0x%08x cause=%u",
-                       (uint32_t)dutPc, cause);
-        int rc = gvsoc_engine_take_debug_for_one_step((int)cause);
-        if (rc != 1)
-            BRIDGE_ERR("informed debug entry not certified (cause=%u rc=%d) - "
-                       "the ISS either did not enter debug or entered off the "
-                       "DUT's boundary; the step-and-compare will surface the "
-                       "divergence", cause, rc);
-        else
-            force_debug_entry_csrs_from_dut();
-    }
+    maybe_informed_debug_entry(dutPc, debugMode != 0);
+    /* Edge-detector state, updated on this path ONLY: the trap path never
+     * carries debugMode, so a trap row must not fake a 1->0 edge. The
+     * asymmetry is covered by the seam's second OR-term
+     * (!gvsoc_engine_is_debug_mode()), which blocks re-triggering while
+     * the ISS is already in debug - keep both in mind when refactoring. */
     g_prev_dut_debug = (debugMode != 0);
 }
 
@@ -1112,6 +1232,16 @@ void rvviDutTrap(uint32_t /*hartId*/, uint64_t dutPc, uint64_t dutInsBin)
     g_metric_retires++;
     g_metric_traps++;
     take_retire_event(dutPc, dutInsBin, /*is_trap=*/true);
+
+    /* A debug entry that collided with an interrupt take arrives as a TRAP
+     * row (the take's CSR writes ride the entry row, so the tracer flags
+     * it): run the same informed-entry detection as the plain-retire path,
+     * or the ISS would reach the ROM without the take. The injected entry
+     * leaves the ROM row0 commit queued; the caller's silent EventStep for
+     * this trap row consumes it, exactly like an exception's faulting-step
+     * commit. Normal synchronous exceptions never match: their trap row
+     * retires at the mtvec handler, not at dm_halt_addr. */
+    maybe_informed_debug_entry(dutPc, /*debug_mode_flag=*/false);
 
     /* Snapshot the exception CSRs before the pipeline-flush retire (PC=0x0)
      * can corrupt them.  The sync bridge pushes these values into g_dut_csr
@@ -1151,140 +1281,39 @@ void rvviDutTrap(uint32_t /*hartId*/, uint64_t dutPc, uint64_t dutInsBin)
  * SECTION 8 - RVVI API: reference model stepping
  * ========================================================================== */
 
-/* Release a WFI-parked ISS through the legitimate wire path (fix R1).  In
- * reactive resync the ISS can reach WFI *after* the DUT's level-sensitive
- * interrupt has already de-asserted (mirrored to mip=0), so no rising edge
- * remains to drive the ISS check_interrupts() and the WFI never releases; the
- * force-resync set_pc then bails on the parked ISS and the step-and-compare
- * aborts.  Replay a momentary wake edge on the wire of a cause enabled in mie:
- * gvsoc_engine_set_irq -> wire update -> the ISS check_interrupts runs the
- * legitimate wake trio (clear wfi, retain_dec, terminate the held WFI entry),
- * keeping the commit FIFO consistent - unlike a manual flag clear.
- * assert+deassert leaves mip and the wire value unchanged: while parked the
- * bit is necessarily 0 (else mie&mip!=0 and the ISS would not be in WFI).
- * Uses only the engine API present in every engine variant (this file is
- * linked into all three .so).  Returns true if the ISS left WFI. */
-/* mcause[4:0] -> RVVI net index, matching the engine's g_irq_wire_name order:
- * MSI(3)->0, MTI(7)->1, MEI(11)->2, local fast 16..31 -> 3..18.
- * Returns -1 for a code with no wire mapping. */
-static int cause_code_to_net(uint32_t code)
-{
-    if (code == 3)  return 0;
-    if (code == 7)  return 1;
-    if (code == 11) return 2;
-    if (code >= 16 && code <= 31) return 3 + (int)(code - 16);
-    return -1;
-}
-
-/* Number of RVVI interrupt-wire nets (mirrors gvsoc_engine_v2.cpp IRQ_NB_WIRES,
- * kept local so this shared file does not depend on an engine-side symbol):
- * nets 0..18 = MSI, MTI, MEI, then local fast 16..31 - the exact range
- * cause_code_to_net maps. */
-static constexpr int WFI_WAKE_NB_NETS = 19;
-
-/* Inverse of cause_code_to_net: RVVI net index -> mip/mie bit position.
- * net 0->3(MSI), 1->7(MTI), 2->11(MEI), 3..18 -> 16..31 (local fast). */
-static int net_to_cause_bit(int net)
-{
-    if (net == 0) return 3;
-    if (net == 1) return 7;
-    if (net == 2) return 11;
-    if (net >= 3 && net <= 18) return 16 + (net - 3);
-    return -1;
-}
-
-/* Drive one candidate wire high and HOLD it across a forced step, then release.
- *
- * Round-2 asserted+deasserted with no step in between: the wire edge and the
- * ISS check_interrupts()/wake trio effectively need mip to stay asserted THROUGH
- * a step, so the momentary edge returned mip to 0 before the wake ran and the
- * WFI never released (Int-2).  Here the wire is held high; a single forced step
- * lets the wire propagation reach check_interrupts() with (mie&mip)!=0 so the
- * legitimate wake trio (wfi.set(false)/retain_dec/insn_terminate) runs and the
- * terminated WFI entry drains into the commit FIFO consistently.  skip_irq is
- * re-asserted for that step so the wire path releases WFI without the ISS also
- * taking the IRQ architecturally (the take path IrqRiscv::check() is skip-gated;
- * the wake trio in check_interrupts() is not) - avoids a double take.
- * The wire is deasserted afterwards (its parked value is 0: the ISS could not be
- * in WFI with the bit already pending). Returns true iff the ISS left WFI. */
-static bool try_wake_on_net(int net)
-{
-    gvsoc_engine_set_irq((uint64_t)net, 1);      /* assert, hold */
-    /* Always hold the wire through one forced step before releasing, even if
-     * the wfi flag already reads clear after the assert edge: the edge alone
-     * can clear the flag while the core is still RETAINED (the wake trio's
-     * terminate/drain completes only when the ISS steps with the pending bit
-     * high), and a momentary edge then leaves the next step timing out with
-     * wfi re-asserted (the rvviRefEventStep FAILED residue).  skip_irq stays
-     * asserted so the wire path releases the WFI without the ISS also taking
-     * the IRQ architecturally. */
-    gvsoc_engine_skip_irq(true);
-    gvsoc_engine_step();
-    bool awake = !gvsoc_engine_is_wfi();
-    gvsoc_engine_set_irq((uint64_t)net, 0);      /* release: parked value is 0 */
-    return awake;
-}
+/* Release a WFI-parked ISS through the dedicated wfi_wake wire.  The DUT is
+ * the oracle of the wake: this runs only when its retire stream has already
+ * advanced past its own wfi (the RTL retires wfi at execute and sleeps
+ * after), so the ISS park must end NOW whatever the wake source was - an
+ * enabled interrupt whose edge was consumed before the park, a
+ * level-sensitive debug_req, or a source with no wire mapping at all.  The
+ * pulse reaches Cv32e40pIrq::wfi_wake_sync inside the model .so, which runs
+ * the full release trio (clear wfi, retain_dec, terminate the held WFI
+ * entry) with NO architectural side effect: mip, mie and the interrupt
+ * wires stay untouched, and the terminated entry drains into the commit
+ * FIFO, serving the DUT's own wfi retire.  Replaces the mie-guided wire
+ * replay (cause_code_to_net / try_wake_on_net fallthrough), which could
+ * not release a wake the interrupt wires cannot carry (debug_req with
+ * mie=0) and re-derived what the DUT had already proven.
+ * Net index mirrors gvsoc_engine_v2.cpp g_irq_wire_name order (haltreq=19,
+ * wfi_wake=20).  Returns true if the ISS left WFI. */
+static constexpr uint64_t WFI_WAKE_NET = 20;
 
 static bool wake_wfi_via_wire(void)
 {
     if (!gvsoc_engine_is_wfi())
         return true;
 
-    /* Sync mie from the DUT before the wake edge: the wire only releases WFI
-     * when (mip & mie)!=0 on the driven bit, so a stale/diverged ISS mie would
-     * make even the correct edge a no-op.  mie is in the compared set and is
-     * force-resynced by the caller a few lines later anyway - doing it here
-     * just makes the wake reliable. */
-    {
-        auto mie_it = g_dut_csr.find(0x304u /*mie*/);
-        if (mie_it != g_dut_csr.end())
-            gvsoc_engine_set_csr(0x304u, mie_it->second);
-    }
-    uint32_t mie = 0;
-    gvsoc_engine_get_csr(0x304u /*mie*/, &mie);
+    gvsoc_engine_set_irq(WFI_WAKE_NET, 1);
+    gvsoc_engine_set_irq(WFI_WAKE_NET, 0);
 
-    /* Preferred candidate: the cause the DUT actually took out of WFI
-     * (mcause[4:0]).  g_dut_csr is a sticky mirror, never cleared, so this can
-     * be STALE on a MIE=0 wake-without-trap (Int-3 / review MEDIUM).  Rather
-     * than gate it on a freshness flag, we simply try it FIRST and, if the WFI
-     * does not release, FALL THROUGH to every other mie-enabled wire-mapped
-     * cause below.  A stale/wrong mcause therefore costs one failed attempt,
-     * never a stuck WFI, and the wake becomes exhaustive. */
-    int preferred = -1;
-    {
-        auto mc = g_dut_csr.find(TRAP_CSR_MCAUSE);
-        if (mc != g_dut_csr.end() && (mc->second & 0x80000000u)) {
-            uint32_t code = mc->second & 0x1fu;
-            int dut_net = cause_code_to_net(code);
-            if (dut_net >= 0 && (mie & (1u << code)))
-                preferred = dut_net;
-        }
-    }
-
-    if (preferred >= 0 && try_wake_on_net(preferred)) {
-        BRIDGE_LOG_HOT("wfi-wake: released via net=%d (dut-mcause, mie=0x%08x)",
-                       preferred, mie);
+    if (!gvsoc_engine_is_wfi()) {
+        BRIDGE_LOG_HOT("wfi-wake: released via wfi_wake wire");
         return true;
     }
 
-    /* Fallthrough: try every mie-enabled wire-mapped cause in wire order
-     * (MSI, MTI, MEI, then local 16..31).  Handles a stale/wrong preferred
-     * candidate and a MIE=0 wake where mcause is not an interrupt. */
-    for (int net = 0; net < WFI_WAKE_NB_NETS; net++) {
-        if (net == preferred)
-            continue;
-        int bit = net_to_cause_bit(net);
-        if (bit < 0 || !(mie & (1u << bit)))
-            continue;
-        if (try_wake_on_net(net)) {
-            BRIDGE_LOG_HOT("wfi-wake: released via net=%d (fallthrough, mie=0x%08x)",
-                           net, mie);
-            return true;
-        }
-    }
-
-    BRIDGE_ERR("wfi-wake: WFI still set after held-step wake on all mie-enabled "
-               "causes (mie=0x%08x) - set_pc will bail as before", mie);
+    BRIDGE_ERR("wfi-wake: WFI still set after the wfi_wake pulse - "
+               "set_pc will bail as before");
     return false;
 }
 
@@ -1319,6 +1348,19 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
     g_sync_trap_seam = false;
 
     int rc = gvsoc_engine_step();
+
+    /* Step timeout with the ISS parked in WFI: the DUT's stream is serving
+     * this retire, so the DUT already executed its wfi (the RTL retires it
+     * at execute and sleeps after) - the park must end now, whatever the
+     * wake source was (a debug_req level, an edge consumed before the park,
+     * a source with no wire mapping). Release through the wfi_wake wire and
+     * serve the retire with one retry; the terminated WFI entry drains as
+     * the matching commit. */
+    if (rc == 0 && !gvsoc_engine_finished() && gvsoc_engine_is_wfi()) {
+        if (wake_wfi_via_wire())
+            rc = gvsoc_engine_step();
+    }
+
     if (rc == 0 && gvsoc_engine_finished()) {
         static bool ended_once = false;
         if (!ended_once) {
@@ -1885,13 +1927,22 @@ bool_t rvviRefCsrSetVolatileMask(uint32_t /*hartId*/, uint32_t csrIndex,
 
 bool_t rvviRefCsrSetOneWayCompare(uint32_t /*hartId*/, uint32_t /*csrIndex*/,
                                    bool_t /*enable*/)                              { return RVVI_TRUE; }
-/* Memory comparison is not implemented in this bridge (rvviRefMemoryRead is
- * also a stub).  Volatile ranges are accepted and logged but not stored.
- * If memory comparison is added in the future, these ranges must be persisted
- * and excluded from comparison. */
+/* Volatile memory windows: standard RVVI declaration, consumed by
+ * sync_volatile_memory_read() on every retire whose DUT-side load address
+ * falls inside a window (see g_mem_volatile above). addressHigh is
+ * inclusive, matching the ImperasDV call convention. */
 bool_t rvviRefMemorySetVolatile(uint64_t addressLow, uint64_t addressHigh)
 {
-    BRIDGE_LOG("memory volatile: 0x%08llx - 0x%08llx",
+    if (addressLow > addressHigh) {
+        /* An inverted window would never match in the sync loop: fail loud
+         * instead of silently disabling what the testbench asked for. */
+        BRIDGE_ERR("memory volatile window rejected: low 0x%08llx > high "
+                   "0x%08llx", (unsigned long long)addressLow,
+                   (unsigned long long)addressHigh);
+        return RVVI_FALSE;
+    }
+    g_mem_volatile.emplace_back(addressLow, addressHigh);
+    BRIDGE_LOG("memory volatile window: 0x%08llx - 0x%08llx",
                (unsigned long long)addressLow, (unsigned long long)addressHigh);
     return RVVI_TRUE;
 }
@@ -1997,6 +2048,61 @@ static void sync_volatile_counter_read(void)
                    (unsigned long long)g_volatile_sync_count);
 }
 
+/* Volatile-memory read sync (see g_mem_volatile above). Runs after the ISS
+ * stepped the current retire, before the compares and the RVVI-TEXT emit, so
+ * both observe the synced value - the exact placement of the counter sync.
+ * The DUT-side effective address and byte mask come from RVFI
+ * (rvfi_mem_addr / rvfi_mem_rmask) through the batch DPI: no instruction
+ * decode, so every load form (C.LW, post-increment, misaligned) is covered.
+ * All GPRs the DUT wrote on this retire are forced, not just a decoded rd: a
+ * post-increment load also writes the base register, whose value matches on
+ * both sides anyway, so the extra write is idempotent. ACCEPTED COVERAGE
+ * GAP: forcing the whole written set means an honest ISS divergence on a
+ * side-effect register of the SAME instruction (e.g. a post-increment
+ * address bug) is repaired instead of reported when it lands on a load
+ * from a volatile window - the price of staying decode-free. The windows
+ * are tiny (8 bytes today), so the exposure is negligible. Gated on a PC-aligned
+ * row: during a divergence the resync paths own the state and this sync must
+ * not blur the honest mismatch. */
+static void sync_volatile_memory_read(uint64_t addr, uint32_t rmask)
+{
+    if (!g_volatile_sync_enabled || rmask == 0 || g_mem_volatile.empty())
+        return;
+    /* The CV32E40P tracer expands each byte-enable lane to 8 mask BITS
+     * (be_to_mask), so the byte count is popcount/8; the lanes of one
+     * access are contiguous from addr. Clamp to >=1 byte so a producer
+     * with a byte-granular mask cannot underflow the span. */
+    uint32_t bytes = (uint32_t)__builtin_popcount(rmask) / 8;
+    if (bytes == 0)
+        bytes = 1;
+    uint64_t last = addr + bytes - 1;
+    bool hit = false;
+    for (const auto &w : g_mem_volatile) {
+        if (addr <= w.second && last >= w.first) {
+            hit = true;
+            break;
+        }
+    }
+    if (!hit)
+        return;
+    if (gvsoc_engine_get_pc() != g_retire.pc)
+        return;
+    for (uint32_t i = 1; i < 32; i++) {
+        if (!(g_retire.gpr_mask & (1u << i)))
+            continue;
+        uint32_t iss_val = gvsoc_engine_get_gpr(i);
+        if (iss_val == g_dut_gpr[i])
+            continue;
+        gvsoc_engine_set_gpr(i, g_dut_gpr[i]);
+        g_volatile_mem_sync_count++;
+        BRIDGE_LOG_HOT("volatile mem read @ PC=0x%08x addr=0x%08llx: "
+                       "x%u ISS=0x%08x -> DUT=0x%08x (sync #%llu)",
+                       g_retire.pc, (unsigned long long)addr, i, iss_val,
+                       g_dut_gpr[i],
+                       (unsigned long long)g_volatile_mem_sync_count);
+    }
+}
+
 /* Batched DPI path - one SV->C crossing per retire instead of six.
  * Combines EventStep + PcCompare + GprsCompareWritten + CsrsCompare +
  * FprsCompare + InsBinCompare.  rvviDutRetire is NOT called here:
@@ -2016,12 +2122,17 @@ static void sync_volatile_counter_read(void)
  * NOT call vpiFinish here - termination is left to the SV side so the test
  * surfaces a UVM-visible error (SIMULATION FAILED), not a silent finish.
  *
- * dutInsn/debugMode are unused; kept for API symmetry with the SV import. */
+ * dutInsn/debugMode are unused; kept for API symmetry with the SV import.
+ * dutMemAddr/dutMemRmask carry the retire's RVFI data-memory read (address
+ * and byte mask, 0 when the instruction did no read) for the volatile
+ * memory window sync. */
 int rvviRefRetireAndCompare(
     uint32_t /*hartId*/,
     uint64_t dutPc,
     uint32_t /*dutInsn*/,
-    uint8_t  /*debugMode*/)
+    uint8_t  /*debugMode*/,
+    uint64_t dutMemAddr,
+    uint32_t dutMemRmask)
 {
     const uint32_t hart_id = 0;  /* single-hart sim */
 
@@ -2040,6 +2151,7 @@ int rvviRefRetireAndCompare(
 
         int result = 0x01;  /* step OK */
         sync_volatile_counter_read();
+        sync_volatile_memory_read(dutMemAddr, dutMemRmask);
         if (rvviRefPcCompare(hart_id))                      result |= 0x02;
         if (rvviRefGprsCompareWritten(hart_id, RVVI_TRUE))  result |= 0x04;
         if (rvviRefCsrsCompare(hart_id))                    result |= 0x08;

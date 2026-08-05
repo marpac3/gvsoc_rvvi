@@ -21,10 +21,26 @@ module rvvi_trace2api
     parameter int RETIRE = 1
 )
 (
-    rvviTrace  rvvi
+    rvviTrace  rvvi,
+    // Data-memory access of the retiring instruction (RVFI mem_addr /
+    // mem_rmask, single-retire): consumed by the bridge's volatile memory
+    // window sync (rvviRefMemorySetVolatile). Tied off when the wrap has no
+    // RVFI memory visibility. Deliberately NOT [NHART][RETIRE]-shaped like
+    // the rvvi channels: they carry "the retire" and are only meaningful
+    // on a single-retire hart (asserted below).
+    input logic [31:0] dut_mem_addr  = '0,
+    input logic [31:0] dut_mem_rmask = '0
 );
 
     int client_id;
+
+    initial begin
+        // dut_mem_addr/rmask are flat scalars: with RETIRE > 1 they could
+        // not name which retire slot they belong to and the volatile
+        // memory window sync would silently read the wrong access.
+        assert (NHART == 1 && RETIRE == 1)
+        else $fatal(1, "rvvi_trace2api: dut_mem_addr/dut_mem_rmask support NHART=1, RETIRE=1 only (got %0d/%0d)", NHART, RETIRE);
+    end
 
     initial begin
         // RVVI v1.37 client_register(recv_nets, recv_memory).
@@ -39,12 +55,16 @@ module rvvi_trace2api
 
 `ifdef USE_GVSOC
     // GVSOC-specific batch DPI: collapses step + 5 compares into one crossing.
-    // Returns a bitmask of the CMP_* localparams below.
+    // Returns a bitmask of the CMP_* localparams below. dutMemAddr/dutMemRmask
+    // carry the retire's RVFI data-memory read for the volatile memory window
+    // sync (0 when the instruction did no read).
     import "DPI-C" function int rvviRefRetireAndCompare(
         input int unsigned  hartId,
         input longint unsigned dutPc,
         input int unsigned  dutInsn,
-        input byte unsigned debugMode);
+        input byte unsigned debugMode,
+        input longint unsigned dutMemAddr,
+        input int unsigned  dutMemRmask);
 
     // Informed IRQ injection (OVPSim-style "deferint"): on an external-interrupt
     // trap retire, tell the reference ISS to TAKE the IRQ and COMPUTE the entry
@@ -243,7 +263,9 @@ module rvvi_trace2api
                             h,
                             rvvi.pc_rdata[h][r],
                             rvvi.insn[h][r],
-                            rvvi.debug_mode[h][r]);
+                            rvvi.debug_mode[h][r],
+                            dut_mem_addr,
+                            dut_mem_rmask);
                         if (!(cmp_result & CMP_STEP)) begin
                             if (err_step_count < MAX_ERR_LOG) begin
                                 $error("RVVI Bridge: rvviRefEventStep FAILED for hart %0d at retire #%0d (PC=0x%08x)",
