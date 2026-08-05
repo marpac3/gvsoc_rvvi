@@ -76,8 +76,11 @@ The load-bearing design points, in one screen:
   before flushing the commit stream: while an instruction sits in the
   commit FIFO or an LSU response is in flight, dropping it would leave its
   load-use scoreboard bit set forever and deadlock the next reader. The
-  drain is bounded and skipped on a held WFI; the architectural state is
-  forced from the DUT after the redirect either way.
+  drain is bounded, skipped on a held WFI, and stops early when the drain
+  itself executes the stream into a WFI (the held entry would never
+  drain) — the bridge then wakes the parked ISS through the wire path and
+  redoes the redirect once. The architectural state is forced from the
+  DUT after the redirect either way.
 - **Hwloop CSRs in the compare set.** `gvsoc_engine_get_csr` resolves
   `lpstart`/`lpend`/`lpcount` (0xCC0-0xCC6) through the hwloop module
   accessors and the personality's architectural `lpend` shadow (the module
@@ -249,7 +252,9 @@ cascades:
 - read fixups are re-implemented by hand: reading `.value` directly
   bypasses the ISS CSR access callbacks, so the getter reproduces them —
   e.g. rebuilding the mstatus SD bit from FS/XS and forcing MPP=M, or
-  forcing mtval/tdata2 to 0 because they read as 0 in the RTL;
+  forcing mtval to 0 because it reads as 0 in the RTL (tdata1/tdata2 need
+  no fixup since 2026-08-05: the model latches them debug-gated like the
+  RTL, so the raw values are already what the DUT reads);
 - write masks are re-implemented by hand: `gvsoc_engine_set_csr` applies
   the CV32E40P write mask itself (e.g. mstatus `0x7888`);
 - reset forcing after the acquire: some CSRs (depc, mepc, mcause, …) are
@@ -341,22 +346,40 @@ word and is processed normally.
 
 The bridge follows the DUT into debug mode the informed way, mirroring
 the informed-IRQ pattern: the SV layer drives `rvvi.debug_mode` per
-retire, and on its 0→1 edge the bridge calls
+retire, and the bridge calls
 `gvsoc_engine_take_debug_for_one_step(cause)` so the ISS performs the
-entry itself (dcsr.cause from the DUT, redirect into the debug ROM). At
-the entry seam the bridge force-syncs from the DUT the CSRs the two sides
-legitimately disagree on: `dpc` — CV32E40P *retires* the ebreak that
-enters debug, so the ISS has already advanced past it and would capture
-dpc one instruction high — and the hwloop CSRs (0xCC0-0xCC6: a preempted
-hardware loop rolls back differently on the two sides). On the model
-side, `dret` executed outside debug mode raises an illegal instruction
-(per the Debug spec) instead of jumping through a stale dpc, and
-`dcsr.prv` is WARL-pinned to M (the core implements no other privilege
-mode). The residual, visible in the two debug×hwloop lanes (KNOWN_FAIL in
-`test/quick_val.sh`), is a one-instruction retire misalignment inside the
-debug ROM when debug entries re-arm in rapid succession; it is
-characterized in the validation evidence but the root cause is still
-open.
+entry itself (dcsr.cause from the DUT, redirect into the debug ROM). The
+seam fires on the `debug_mode` 0→1 edge, when the DUT is in debug and the
+ISS lags behind (a re-entry whose exit edge the stream never observed),
+and on a retire whose PC equals the model's configured `dm_halt_addr`
+while the ISS is not in debug: `rvfi_dbg_mode` is an entry *marker*
+(asserted only while the tracer sees the DBG_TAKEN_* FSM states) and some
+haltreq entry paths retire the first ROM row without it — the PC term is
+the only signal left on those. At the entry seam the bridge force-syncs
+from the DUT the CSRs the two sides legitimately disagree on: `dpc` —
+CV32E40P *retires* the ebreak that enters debug, so the ISS has already
+advanced past it and would capture dpc one instruction high — and the
+hwloop CSRs (0xCC0-0xCC6: a preempted hardware loop rolls back
+differently on the two sides). On the model side, `dret` executed outside
+debug mode raises an illegal instruction (per the Debug spec) instead of
+jumping through a stale dpc, `dcsr.prv` is WARL-pinned to M (the core
+implements no other privilege mode), `wfi` executes as a nop in debug and
+single-step mode (the RTL controller leaves the WFI state immediately in
+both), and a compressed `c.ebreak` in debug mode re-enters the ROM like
+the 32-bit form.
+
+The engine certifies an injected entry only on positive proof: the entry
+observed on its own dispatch (a `trap_seq` bump), exactly one new commit
+above the pre-injection count, and that commit stamped with the
+post-entry `trap_seq` — a program instruction draining after the entry is
+rejected loudly instead of silently certified. The remaining KNOWN_FAIL
+residual of the debug axis has a proven architectural root cause: at some
+async entries the ISS has already *executed* the instruction the DUT
+killed in ID — its retire parked in the exec commit FIFO behind a held
+LSU load, where the commit-count boundary check cannot see it. The
+writeback is real, so no seam can repair it without a pipeline rewind;
+the engine's boundary diagnostics (`inflight_pending`, stale-commit
+check) now name these cases explicitly.
 
 ## RVVI conformance
 
@@ -491,7 +514,11 @@ desync the informed injection was built to eliminate. The wires of the
 `cv32e40p_irq_injector` component are therefore only the injection channel,
 not the timing control: `settle_irq`, the `skip_irq_check` discipline and
 the informed injection keep deciding *when* the entry is taken. Parity was
-validated with `test/quick_val.sh` across the four supported configs.
+validated with `test/quick_val.sh` across the four supported configs on
+the REACTIVE path only: `+rvvi_informed_irq` is off by default, no harness
+passes it, and a targeted probe (2026-08-05) showed the informed path
+regressing even a reactively-passing interrupt lane — treat it as
+unvalidated until it gets its own bring-up.
 
 ## References
 
