@@ -1025,8 +1025,12 @@ void rvviDutCycleCountSet(uint64_t /*cycleCount*/) {}
  *    before Cv32e40pIrq::check() captures depc = current_insn, so depc lands
  *    one instruction size high (e.g. +2 for a c.ebreak). The DUT dpc is
  *    authoritative for the entry point; forcing it here also fixes the resume
- *    PC after dret. Haltreq/single-step entries already agree, so this is a
- *    no-op there.
+ *    PC after dret. Haltreq/single-step entries agree only when the ISS was
+ *    parked exactly at the DUT's boundary at injection: with a commit-FIFO
+ *    lag (an instruction executed but parked behind a held LSU head) the ISS
+ *    depc lands one instruction high there too, and this force repairs the
+ *    entry point but NOT the extra architectural writeback (see the engine's
+ *    boundary diagnostics in take_debug).
  *
  * The IRQ force-resync covers hwloop through its generic compared-CSR restore;
  * the debug entry has no generic restore, so it calls this targeted one. No-op
@@ -1065,8 +1069,25 @@ void rvviDutRetire(uint32_t /*hartId*/, uint64_t dutPc,
      * with the DUT's own dcsr.cause (haltreq wire, ebreak or single-step all
      * land here) and let the ISS compute dpc/dcsr and redirect to the ROM;
      * the queued debug-ROM commit is then served against this retire row.
-     * The v1 engine stubs the take to 0: the legacy divergence stays. */
-    if (debugMode && !g_prev_dut_debug && gvsoc_engine_is_running())
+     * The v1 engine stubs the take to 0: the legacy divergence stays.
+     * The ISS-lag term de-latches the edge detector: a debug re-entry whose
+     * exit edge this stream never observed (rapid re-arm, back-to-back
+     * entries) leaves g_prev_dut_debug stale and the seam silently blind -
+     * fire whenever the DUT is in debug and the ISS is lagging behind.
+     * The PC term covers entries the debugMode flag misses entirely:
+     * rvfi_dbg_mode is an entry MARKER (asserted only while the tracer sees
+     * the DBG_TAKEN_* FSM states), and some haltreq entry paths retire the
+     * first debug-ROM row without it - the row then arrives with
+     * debugMode=0 and no later row carries the flag either. The DUT retire
+     * PC landing exactly on the ISS's configured debug-ROM entry address
+     * (dm_halt_addr) while the ISS is not in debug is an unambiguous entry
+     * row; deeper ROM rows do not match, so a failed injection does not
+     * retry-spam. */
+    bool entry_row = debugMode ||
+                     ((uint32_t)dutPc == gvsoc_engine_get_debug_handler() &&
+                      !gvsoc_engine_is_debug_mode());
+    if (entry_row && (!g_prev_dut_debug || !gvsoc_engine_is_debug_mode()) &&
+        gvsoc_engine_is_running())
     {
         uint32_t cause = 3;
         auto it = g_dut_csr.find(CSR_DCSR);
@@ -1076,9 +1097,10 @@ void rvviDutRetire(uint32_t /*hartId*/, uint64_t dutPc,
                        (uint32_t)dutPc, cause);
         int rc = gvsoc_engine_take_debug_for_one_step((int)cause);
         if (rc != 1)
-            BRIDGE_ERR("informed debug entry: ISS did NOT enter debug "
-                       "(cause=%u rc=%d) - the step-and-compare will surface "
-                       "a PC mismatch", cause, rc);
+            BRIDGE_ERR("informed debug entry not certified (cause=%u rc=%d) - "
+                       "the ISS either did not enter debug or entered off the "
+                       "DUT's boundary; the step-and-compare will surface the "
+                       "divergence", cause, rc);
         else
             force_debug_entry_csrs_from_dut();
     }
@@ -1400,13 +1422,31 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
                  * instead woke into a handler, the retired-PC check fails and
                  * the reactive redirect proceeds as before. */
                 bool woke_on_row = false;
-                if (is_wfi_stuck)
-                    woke_on_row = wake_wfi_via_wire() &&
+                if (gvsoc_engine_is_wfi()) {
+                    /* Attempt the wake whenever the ISS is parked, not only
+                     * in the rc==0 stuck case: with rc==1 a backlog commit
+                     * was just served while the ISS already executed the WFI
+                     * and parked, and the set_pc redirect below would bail on
+                     * the held entry and corrupt the commit stream.
+                     * woke_on_row keeps the historical rc==0 semantics: with
+                     * rc==1 the DUT row was already served, so the redirect
+                     * must always proceed. */
+                    bool woke = wake_wfi_via_wire();
+                    woke_on_row = woke && is_wfi_stuck &&
                                   gvsoc_engine_get_pc() == g_retire.pc;
+                }
 
                 /* Force ISS PC to DUT handler entry */
-                if (!woke_on_row)
+                if (!woke_on_row) {
                     gvsoc_engine_set_pc(g_retire.pc);
+                    /* The drain inside set_pc can execute the pre-resync
+                     * stream into a WFI and park the ISS mid-redirect (the
+                     * set_pc WFI bail): release it through the wire path and
+                     * redo the redirect once, now unparked. On a failed wake
+                     * (mie=0) this is the same bail as before, not worse. */
+                    if (gvsoc_engine_is_wfi() && wake_wfi_via_wire())
+                        gvsoc_engine_set_pc(g_retire.pc);
+                }
 
                 /* Force the DUT trap CSRs AND the full architectural CSR set
                  * the compare tracks - not just the 4 trap CSRs (fix R2).  A

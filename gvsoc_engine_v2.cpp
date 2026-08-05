@@ -851,8 +851,13 @@ void gvsoc_engine_set_pc(uint32_t pc)
         int steps = 0;
         try
         {
+            /* A WFI executed by the drain itself parks the ISS with the held
+             * entry pending: it will never drain, so stop immediately instead
+             * of spinning to the budget (the caller sees the WFI report below
+             * and can wake through the wire path). */
             while ((g_iss->lsu.get_nb_pending_accesses() > 0 ||
-                    g_iss->timing.inflight_pending()) && steps < STEP_MAX_CYCLES)
+                    g_iss->timing.inflight_pending()) &&
+                   !g_iss->exec.wfi.get() && steps < STEP_MAX_CYCLES)
             {
                 /* skip_irq_check is one-shot, consumed every dispatch cycle:
                  * re-assert per step or the ISS takes the pending wire-driven
@@ -870,7 +875,8 @@ void gvsoc_engine_set_pc(uint32_t pc)
         }
         ENGINE_LOG("set_pc: drained pipeline in %d steps before redirect (PC=0x%08x)",
                    steps, pc);
-        if (g_iss->lsu.get_nb_pending_accesses() > 0 || g_iss->timing.inflight_pending())
+        if (!g_iss->exec.wfi.get() &&
+            (g_iss->lsu.get_nb_pending_accesses() > 0 || g_iss->timing.inflight_pending()))
             ENGINE_ERR("set_pc: pipeline still busy after drain budget (PC=0x%08x)", pc);
     }
     g_iss->exec.current_insn = (iss_reg_t)pc;
@@ -904,6 +910,18 @@ bool gvsoc_engine_is_wfi(void)
 {
     if (!g_iss) return false;
     return g_iss->exec.wfi.get();
+}
+
+bool gvsoc_engine_is_debug_mode(void)
+{
+    if (!g_iss) return false;
+    return g_iss->exec.debug_mode;
+}
+
+uint32_t gvsoc_engine_get_debug_handler(void)
+{
+    if (!g_iss) return 0;
+    return (uint32_t)g_iss->irq.debug_handler;
 }
 
 uint32_t gvsoc_engine_get_gpr(uint32_t index)
@@ -975,10 +993,6 @@ int gvsoc_engine_get_csr(uint32_t csr_addr, uint32_t *value)
      * values (direct writes from exception handling, or writes that bypass
      * write_mask enforcement); force the RTL read value (0). */
     if (csr_addr == 0x343)  /* mtval - hardwired to 0 */
-    {
-        raw = 0;
-    }
-    if (csr_addr == 0x7A2)  /* tdata2 - writable only from Debug Mode */
     {
         raw = 0;
     }
@@ -1322,6 +1336,20 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause)
     if (!g_running || !g_gvsoc || g_finished || !g_iss)
         return 0;
 
+    /* Spontaneous entry: the model's own execute-trigger match
+     * (Cv32e40pIrq::check) can enter debug before the DUT edge reaches
+     * this injection, with the first debug-ROM commit already queued.
+     * Arming req_debug now would leave it pending across the session
+     * (check() only consumes it outside debug mode) and fire a spurious
+     * re-entry after dret: report success, the caller serves the queued
+     * commit against the DUT's entry row. */
+    if (g_iss->exec.debug_mode)
+    {
+        ENGINE_LOG("take_debug: ISS already in debug mode (cause=%d), "
+                   "spontaneous trigger entry - no injection", dcsr_cause);
+        return 1;
+    }
+
     /* Arm the debug request with the DUT-observed cause; Cv32e40pIrq::check()
      * writes dcsr.cause and dpc atomically with the entry and redirects to
      * the debug ROM. Because the entry runs BEFORE the fetch of the current
@@ -1360,38 +1388,120 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause)
     ENGINE_LOG("take_debug: arming debug entry (cause=%d), single-step inject",
                dcsr_cause);
 
-    /* Commits already queued at the injection: the ISS ran past the DUT's
-     * debug-entry boundary. Report and let the compare surface it. */
+    /* The arm above lands dpc = the insn the DUT killed only if the ISS is
+     * parked exactly at that boundary, with current_insn still pointing at
+     * the unexecuted insn. Two independent lags can put it past the
+     * boundary, and the commit ring only shows one of them:
+     *
+     *  - stale commits: retires already visible in the ring, not yet served
+     *    by the step-and-compare.
+     *
+     *  - a non-empty exec commit FIFO: its head is a held insn (LSU async
+     *    load) and every sync insn dispatched behind it has ALREADY executed
+     *    - result in the regfile, current_insn advanced (the sync-follower
+     *    branch of exec_instr_check_all) - while its retire is parked in the
+     *    inflight ring by Cv32e40pEvents::event_retire_account instead of
+     *    the commit ring. commit_push does not move for it, so this lag is
+     *    invisible to the stale count even though the ISS is architecturally
+     *    ahead of the boundary.
+     *
+     * In the second case the entry can no longer be placed before the killed
+     * insn: that insn already retired inside the model, and its writeback
+     * cannot be undone from here. Report it - the loop below refuses to
+     * certify such an entry - and let the compare surface the divergence.
+     * A WFI-parked ISS also holds a FIFO entry (its own parked WFI, from
+     * sleep_enter) which is not an over-execution: the WFI diagnostic above
+     * already covers that case. */
+    bool at_boundary = true;
     uint64_t stale = g_iss->timing.commit_push - g_iss->timing.commit_pop;
     if (stale > 0)
     {
+        at_boundary = false;
         ENGINE_ERR("take_debug: %llu stale commits at injection - ISS ran "
                    "past the DUT's debug-entry boundary",
                    (unsigned long long)stale);
     }
+    if (g_iss->timing.inflight_pending() && !g_iss->exec.wfi.get())
+    {
+        at_boundary = false;
+        ENGINE_ERR("take_debug: insn parked in the commit FIFO at injection "
+                   "(ISS at 0x%08x) - the ISS already executed past the DUT's "
+                   "debug-entry boundary, dpc cannot be placed before it",
+                   (unsigned)g_iss->exec.current_insn);
+    }
 
     /* Step until the entry lands its first debug-ROM commit, and LEAVE the
      * commit queued: the caller's step-and-compare serves it against the
-     * DUT's first debug-ROM retire row. */
+     * DUT's first debug-ROM retire row.
+     *
+     * Success needs the entry to be observed BEFORE any new commit, not just
+     * together with one. Testing debug_mode at the moment a commit appears
+     * cannot tell "the pending insn retired, then the entry fired at the
+     * next dispatch" (dpc one insn too high, the retire served against the
+     * ROM row, the stream permanently slipped) from "the entry fired, then
+     * the ROM row retired" (correct): both show a new commit with
+     * debug_mode set. Watching the entry on its own dispatch separates
+     * them, since Cv32e40pIrq::check() enters before the fetch of
+     * current_insn and pushes no commit of its own.
+     *
+     * The queued commit is then proven to belong to the entry by its
+     * trap_seq stamp: check() bumps timing.trap_seq atomically with the
+     * entry, and each retire is stamped when it EXECUTES (in the inflight
+     * ring for held/parked ones). A pre-entry insn draining after the entry
+     * therefore still carries the older stamp and is rejected. */
     int rc = 0;
+    bool entered = false;
+    uint64_t entry_trap_seq = 0;
     try
     {
         for (int i = 0; i < STEP_MAX_CYCLES; i++)
         {
-            if (g_iss->timing.commit_push - g_iss->timing.commit_pop > stale)
+            if (!entered && g_iss->exec.debug_mode)
             {
-                /* A new commit alone does not prove the entry: only trust it
-                 * if the ISS actually switched into debug mode - anything
-                 * else means an unrelated instruction retired first and the
-                 * ISS ran past the DUT's debug-entry boundary. */
-                if (g_iss->exec.debug_mode)
+                entered = true;
+                entry_trap_seq = g_iss->timing.trap_seq;
+            }
+
+            uint64_t queued = g_iss->timing.commit_push - g_iss->timing.commit_pop;
+            if (queued > stale)
+            {
+                uint64_t idx = (g_iss->timing.commit_push - 1) %
+                               Cv32e40pEvents::COMMIT_RING;
+                if (!entered)
                 {
-                    rc = 1;
+                    ENGINE_ERR("take_debug: unrelated commit (PC=0x%08x) while "
+                               "the debug request was pending - entry not taken",
+                               (unsigned)g_iss->timing.commit_pc[idx]);
+                }
+                else if (queued != stale + 1)
+                {
+                    ENGINE_ERR("take_debug: %llu commits queued by the entry "
+                               "window (expected 1) - a pre-entry retire is "
+                               "queued ahead of the debug-ROM row",
+                               (unsigned long long)(queued - stale));
+                }
+                else if (g_iss->timing.commit_trap_seq[idx] != entry_trap_seq)
+                {
+                    ENGINE_ERR("take_debug: queued commit (PC=0x%08x) executed "
+                               "before the entry - it would be served against "
+                               "the DUT's debug-ROM row, dpc is one insn past "
+                               "the DUT's",
+                               (unsigned)g_iss->timing.commit_pc[idx]);
+                }
+                else if (!at_boundary)
+                {
+                    /* The entry itself is well formed, but the ISS was not at
+                     * the DUT's boundary when it was armed (reported above):
+                     * the row served against the debug-ROM retire is the
+                     * pre-boundary commit still ahead of it in the ring, and
+                     * dpc belongs to an insn the DUT never reached. */
+                    ENGINE_ERR("take_debug: entry taken off the DUT's boundary "
+                               "(depc=0x%08x) - not certifying the injection",
+                               (unsigned)g_iss->csr.depc);
                 }
                 else
                 {
-                    ENGINE_ERR("take_debug: unrelated commit while the debug "
-                               "request was pending - entry not taken");
+                    rc = 1;
                 }
                 break;
             }
@@ -1424,10 +1534,12 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause)
     g_iss->irq.req_debug = false;
     g_iss->irq.req_debug_cause = 3;
 
-    ENGINE_LOG("take_debug: rc=%d, debug-ROM commit queued, ISS at 0x%08x "
-               "(dcsr=0x%08x)",
-               rc, (unsigned)g_iss->exec.current_insn,
-               (unsigned)g_iss->csr.dcsr);
+    /* depc is logged so a wrong entry point is visible here, without the
+     * engine having to know the DUT's dpc (only the bridge holds it). */
+    ENGINE_LOG("take_debug: rc=%d, entered=%d, debug-ROM commit queued, "
+               "ISS at 0x%08x (dcsr=0x%08x, depc=0x%08x)",
+               rc, (int)entered, (unsigned)g_iss->exec.current_insn,
+               (unsigned)g_iss->csr.dcsr, (unsigned)g_iss->csr.depc);
 
     return rc;
 }

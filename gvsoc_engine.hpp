@@ -157,6 +157,12 @@ void gvsoc_engine_skip_irq(bool skip);
 /** @return true if the ISS is in WFI (stalled waiting for an interrupt). */
 bool gvsoc_engine_is_wfi(void);
 
+/** @return true if the ISS is in debug mode (executing the debug ROM). */
+bool gvsoc_engine_is_debug_mode(void);
+
+/** @return the ISS's configured debug-ROM entry address (dm_halt_addr). */
+uint32_t gvsoc_engine_get_debug_handler(void);
+
 /* ---- State query: registers ---- */
 
 /** Read a GPR. Index 0-31 (x0 always returns 0). */
