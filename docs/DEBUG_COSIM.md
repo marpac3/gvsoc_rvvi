@@ -100,6 +100,7 @@ All read once in `rvviRefInit`:
 | `CV_RVVI_BRIDGE_PROFILE=1` | ns counters per `rvviRef*` call, dumped at shutdown |
 | `GVSOC_FORCE_TRAP_CSR=0` | disable force-resync on trap entry (gates the async-trap resync and the synchronous-trap seam realign) |
 | `CV_RVVI_VOLATILE_CSR_SYNC=0` | disable the DUT-value sync of performance-counter CSR reads (cycle/instret/hpm); disabling it forks the co-sim on any program that consumes a counter value |
+| `CV_RVVI_MISMATCH_LOG_MAX=<n>` | per-category budget of printed mismatch messages (default 10, `0` = unlimited); the authoritative count is always `Total Reference model mismatches`, never the printed lines — raise it when "sustained vs transient" matters |
 
 For behavioural (not source-level) ISS analysis, the standalone path avoids
 Questa entirely: `make trace BINARY=<elf>` produces the instruction trace.

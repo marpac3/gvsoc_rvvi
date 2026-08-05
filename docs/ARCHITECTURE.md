@@ -213,10 +213,24 @@ through `instret` — GVSOC's `csr.instret` does not auto-increment, so it is
 not a reliable retire counter; the commit stream is recorded by the
 personality itself, so a commit is a commit, whatever the PC does.
 
+The platform is configured with **zero memory latency** on every
+interconnect port (`latency=0` in `cv32e40p_v2_standalone.py`, mirrored in
+the generated `gvsoc_config_v2_*.json`). With a nonzero latency every load
+is held one cycle (`insn_hold`), sync followers execute ahead and park
+their retires in the inflight ring — the ISS ends up architecturally ahead
+of the served commit stream, which broke every boundary-sensitive seam
+(debug entry, informed IRQ: dpc/mepc systematically one instruction high).
+At latency 0 every access — including misaligned ones — completes inline,
+so the ISS always sits exactly at the commit boundary. The load-use timing
+model is lost, which is irrelevant in co-sim: cycle-dependent state is
+covered by the volatile-counter sync.
+
 Two safety nets bound the clocking:
 
 - timeout (`STEP_MAX_CYCLES` (=2000) cycles without a new commit): returns
-  "no retire" plus diagnostics;
+  "no retire" plus diagnostics; if the ISS is WFI-parked at the timeout,
+  the `wfi_wake` release runs and the step is retried once (see IRQ
+  injection);
 - runaway detection: consecutive timeouts with an unchanged, non-WFI PC are
   counted; at `RUNAWAY_THRESHOLD` (=16) the sticky `g_runaway` flag latches
   (cleared only by init). A clean retire resets the counter; WFI is
@@ -283,6 +297,7 @@ by the front-end.
 | `rvviRefPcGet`/`GprGet`/`FprGet`/`CsrGet` | readback from the ISS |
 | `rvviRefPcCompare`/`GprsCompare`/`CsrsCompare`/`FprsCompare` | DUT state vs ISS readback |
 | `rvviRefCsrSetVolatile`/`Mask` | configure the compare (CSRs the ISS does not model cycle-by-cycle) |
+| `rvviRefMemorySetVolatile` | volatile memory windows (ImperasDV semantics): on a load whose DUT address overlaps a window, the DUT rd value is copied into the ISS destination registers after the step — TB virtual peripherals (the random-number generator at 0x15001000, coremark's cycle counter) cannot fork the two sides. The window list is declared by the wrap's `ref_init`, mirroring `imperas_dv_wrap.sv` |
 | `rvviRefGprSet`/`FprSet`/`CsrSet` | direct injection into the ISS (used in `ref_init`, e.g. mtvec) |
 | `rvviRefRetireAndCompare` | GVSOC-only batch (see below); also syncs performance-counter CSR reads — after the step, the ISS rd of a cycle/instret/hpm read is overwritten with the DUT rd value, so counter-dependent control flow (e.g. printing a cycle delta) cannot fork the two sides. `CV_RVVI_VOLATILE_CSR_SYNC=0` disables this |
 | `rvviRefInjectIrq` / `rvviRefSetInformedIrq` | informed injection (see IRQ injection) |
@@ -316,12 +331,15 @@ a DUT-side one: `mcause` with the interrupt bit set, `mepc` equal to the
 PC the ISS currently sits on, and the row PC equal to the vectored target
 (`mtvec_base + 4*cause`). The CSR restore covers the four trap CSRs plus
 every compared non-volatile CSR (`mip` excluded: it mirrors the interrupt
-wires); a WFI-parked ISS is first released through the legitimate wire
-path (a wake edge held across one step on a `mie`-enabled cause) so the
-redirect never lands on a stalled core — and when that wake step already
-lands the ISS on the row's PC, it counts as the retire itself: no
-redirect, no extra step (a second step would run past the just-retired
-WFI).
+wires); a WFI-parked ISS is first released through the dedicated
+`wfi_wake` injector wire, whose model-side sync runs the full three-step
+release (wfi clear, `retain_dec`, terminate of the held entry) with no
+architectural side effect. The DUT is the oracle of the wake: the release
+runs only when its retire stream has already advanced past its own wfi
+(the RTL retires wfi at execute and sleeps after), which also covers wake
+sources the interrupt wires cannot carry — a level-sensitive `debug_req`
+with `mie=0`, or an edge consumed before the park. The same pulse backs
+the step-timeout retry in `rvviRefEventStep`.
 
 Informed, in the style of OVPSim's "deferint" (opt-in via the
 `+rvvi_informed_irq` plusarg). `rvviRefInjectIrq` detects the vectored
@@ -344,42 +362,77 @@ word and is processed normally.
 
 ## Debug entry
 
-The bridge follows the DUT into debug mode the informed way, mirroring
-the informed-IRQ pattern: the SV layer drives `rvvi.debug_mode` per
-retire, and the bridge calls
-`gvsoc_engine_take_debug_for_one_step(cause)` so the ISS performs the
-entry itself (dcsr.cause from the DUT, redirect into the debug ROM). The
-seam fires on the `debug_mode` 0→1 edge, when the DUT is in debug and the
-ISS lags behind (a re-entry whose exit edge the stream never observed),
-and on a retire whose PC equals the model's configured `dm_halt_addr`
-while the ISS is not in debug: `rvfi_dbg_mode` is an entry *marker*
-(asserted only while the tracer sees the DBG_TAKEN_* FSM states) and some
-haltreq entry paths retire the first ROM row without it — the PC term is
-the only signal left on those. At the entry seam the bridge force-syncs
-from the DUT the CSRs the two sides legitimately disagree on: `dpc` —
-CV32E40P *retires* the ebreak that enters debug, so the ISS has already
-advanced past it and would capture dpc one instruction high — and the
-hwloop CSRs (0xCC0-0xCC6: a preempted hardware loop rolls back
+All four Debug-spec entry causes are modelled NATIVELY in the CV32E40P
+personality (`Cv32e40pIrq`), so the model computes every entry itself —
+dcsr.cause and dpc written atomically by `check()`, redirect into the
+debug ROM — and the co-sim injection below is an overlay that arms the
+same request, not a separate mechanism:
+
+- **haltreq (cause 3)** is a first-class injector wire (like the
+  interrupt lines): `haltreq_sync` arms `req_debug` and wakes a
+  WFI-parked hart with the full release sequence. The level is tracked
+  (`haltreq_level`): RTL `debug_req_i` is level-sensitive — a hart
+  re-halts right after `dret` while the line stays high — but the wire
+  itself only syncs on changes, so `check()` re-arms from the recorded
+  level. A pending `req_debug` also degrades `wfi` to a nop (the RTL
+  sleep unit refuses to sleep with `debug_req_i` asserted).
+- **ebreak (cause 1)** with `dcsr.ebreakm=1` arms the request from
+  `ebreak_exec`/`c_ebreak_exec` (gated by the personality define
+  `CONFIG_GVSOC_ISS_CV32E40P_V2`) and returns without retiring: the entry
+  lands on the next dispatch boundary, mcause/mepc stay untouched and the
+  ROM row is the first commit — the same seam shape as an exception.
+- **single-step (cause 4)**: `dret` with `dcsr.step=1` opens a one-shot
+  window (`dret_step_check`); `check()` re-enters once the stepped
+  instruction is done, detected as `current_insn != step_pc` — which also
+  lands an exception-during-step on the handler address, as the spec
+  requires. Interrupts inside the window are masked unless `dcsr.stepie`.
+  Any entry closes a live window (no stale re-entry).
+- **trigger match (cause 2)**: execute-address match on `tdata2`,
+  evaluated at the dispatch boundary before the matched instruction.
+
+Arming order in `check()` encodes the spec's cause priority
+(trigger > haltreq > step); each block yields to an already-armed
+request.
+
+The co-sim seam (`maybe_informed_debug_entry`, called from BOTH retire
+paths — a plain entry row arrives through `rvviDutRetire`, an entry that
+collided with an interrupt take is a *trap* row and arrives through
+`rvviDutTrap`) fires on the `debug_mode` 0→1 edge, when the DUT is in
+debug and the ISS lags behind, and on a retire whose PC equals the
+model's configured `dm_halt_addr` while the ISS is not in debug. It arms
+the entry with the DUT's own dcsr.cause and, on an
+**interrupt+debug collision**, passes the taken cause id
+(`collide_irq_id`): the DUT's entry row carries the take's CSR writes, so
+a fresh interrupt-flagged `mcause` write on that row is the unambiguous
+signature, and the model takes exactly that line ahead of the entry —
+dpc lands on the vectored handler entry and mstatus/mepc/mcause carry the
+take, as in the RTL. The model never guesses the collision on its own:
+the arbitration outcome depends on cycle timing only the DUT can observe.
+At the seam the bridge still force-syncs `dpc` (now a gauge: the force
+count and per-force delta are logged as the "entry-ordering gauge") and
+the hwloop CSRs (0xCC0-0xCC6: a preempted hardware loop rolls back
 differently on the two sides). On the model side, `dret` executed outside
-debug mode raises an illegal instruction (per the Debug spec) instead of
-jumping through a stale dpc, `dcsr.prv` is WARL-pinned to M (the core
-implements no other privilege mode), `wfi` executes as a nop in debug and
-single-step mode (the RTL controller leaves the WFI state immediately in
-both), and a compressed `c.ebreak` in debug mode re-enters the ROM like
-the 32-bit form.
+debug mode raises an illegal instruction (per the Debug spec), `dcsr.prv`
+is WARL-pinned to M, and `wfi` executes as a nop in debug and single-step
+mode.
 
 The engine certifies an injected entry only on positive proof: the entry
 observed on its own dispatch (a `trap_seq` bump), exactly one new commit
 above the pre-injection count, and that commit stamped with the
 post-entry `trap_seq` — a program instruction draining after the entry is
 rejected loudly instead of silently certified. The remaining KNOWN_FAIL
-residual of the debug axis has a proven architectural root cause: at some
-async entries the ISS has already *executed* the instruction the DUT
-killed in ID — its retire parked in the exec commit FIFO behind a held
-LSU load, where the commit-count boundary check cannot see it. The
-writeback is real, so no seam can repair it without a pipeline rewind;
-the engine's boundary diagnostics (`inflight_pending`, stale-commit
-check) now name these cases explicitly.
+residual of the debug axis (`debug_test`) is a DUT-side tracer artifact,
+not a model or seam defect: on a haltreq entry through DBG_TAKEN_ID the
+RVFI tracer emits a retire for the instruction *killed in ID* — complete
+with a register write that never reached the architectural state (proven
+by the debugger's own save/restore of that register reading the OLD value
+on the DUT) — so the ISS, fed that row, executes it for real and enters
+one instruction late (the dpc-force gauge shows a systematic +4). The
+killed instruction re-executes after `dret` on both sides, so the
+divergence is transient, but the debugger-stack save/restore of the
+affected register mismatches. Same defect family as the rmask/wmask swap
+fixed in the tracer (`cv32e40p_rvfi.sv`); a tracer-side fix needs
+dedicated pipeline-replica surgery.
 
 ## RVVI conformance
 
@@ -459,14 +512,13 @@ P0 — certain breakage on submodule bumps / ISS refactors:
 
 P1 — behavioral (false mismatches / stalls):
 
-- register comparison is currently neutralized: the SV side clears the
-  GPR/FPR write-masks right before the batched compare call, so the masked
-  compares skip every register and the unmasked variants are never
-  invoked — register-value divergences surface only indirectly, through PC
-  or CSR effects. The instruction-binary compare has no SV call-site at
-  all; its "comparisons performed" counter is incremented as a proxy, so
-  the end-of-test sanity checks pass either way. PC and the enabled CSR set
-  are the effective detectors today;
+- register comparison runs inside the batched call on the *written* set
+  only (`g_retire.gpr_mask`/`fpr_mask` from the RVFI write-back flags): a
+  register the DUT never rewrites after a divergence is not re-checked, so
+  a stale value can sit latent until something reads or rewrites it. The
+  instruction-binary compare has no SV call-site at all; its "comparisons
+  performed" counter is incremented as a proxy, so the end-of-test sanity
+  checks pass either way;
 - hand re-implemented CSR read fixups and write masks: every CSR semantics
   change in the ISS must be mirrored manually in the bridge, so drift over
   time is guaranteed;
@@ -480,9 +532,11 @@ P2 — localized:
   flag (`g_sync_trap_seam`, armed in `rvviDutTrap`, consumed at the first
   `rvviRefEventStep` after it) that realigns mstatus only — forcing mepc
   there proved harmful and is deliberately avoided;
-- debug entry has one known residual: a one-instruction retire misalignment
-  inside the debug ROM when debug entries re-arm in rapid succession (the
-  two debug×hwloop KNOWN_FAIL lanes — see Debug entry).
+- debug entry has one known residual: the RVFI tracer's killed-instruction
+  artifact on haltreq entries through DBG_TAKEN_ID (a retire emitted for an
+  instruction the RTL killed in ID, register write included — see the last
+  paragraph of Debug entry). A DUT-side tracer defect: the seam serves the
+  stream it is given.
 
 ## Future improvements
 
