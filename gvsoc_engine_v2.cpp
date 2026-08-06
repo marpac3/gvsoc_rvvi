@@ -1470,14 +1470,34 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id)
     int rc = 0;
     bool entered = false;
     uint64_t entry_trap_seq = 0;
+    uint64_t base_trap_seq  = g_iss->timing.trap_seq;
     try
     {
         for (int i = 0; i < STEP_MAX_CYCLES; i++)
         {
-            if (!entered && g_iss->exec.debug_mode)
+            /* The entry is an EVENT; exec.debug_mode is a LEVEL. Polling the
+             * level alone misses entries whose flag is not up at any poll
+             * boundary of this loop (measured: 228/228 haltreq entries of
+             * the pulp interrupt+debug lane broke here, reported as
+             * "unrelated commit" at the halt address itself). The edge is
+             * observable regardless: check() bumps timing.trap_seq
+             * atomically with the entry and writes dcsr.cause; requiring
+             * the ARMED cause on dcsr attributes the bump to this entry
+             * rather than to an IRQ take in the same window (a stale
+             * same-cause dcsr can in principle mis-attribute, but the
+             * commit-stamp and PC compares downstream surface that
+             * loudly). */
+            if (!entered)
             {
-                entered = true;
-                entry_trap_seq = g_iss->timing.trap_seq;
+                bool level = g_iss->exec.debug_mode;
+                bool edge  = (g_iss->timing.trap_seq != base_trap_seq) &&
+                             (((g_iss->csr.dcsr >> 6) & 0x7u) ==
+                              (uint32_t)dcsr_cause);
+                if (level || edge)
+                {
+                    entered = true;
+                    entry_trap_seq = g_iss->timing.trap_seq;
+                }
             }
 
             uint64_t queued = g_iss->timing.commit_push - g_iss->timing.commit_pop;
