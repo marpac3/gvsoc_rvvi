@@ -45,32 +45,43 @@
 #     entries re-arm in rapid succession (characterized, root cause open);
 #     still xfail / KNOWN_FAIL.
 #   - debug axis (characterized 2026-08-04, evidence
-#     /data2/.../debug_axis_char_20260804): 6 of 58 lanes PASS
-#     (debug_test_known_miscompares, riscv_ebreak_test_0, and the pulp
-#     hwloop_debug base, hwloop_exception single-step / int+trigger,
-#     hwloop_in_debug_rom). The xfail lanes group into signatures:
+#     /data2/.../debug_axis_char_20260804; RESOLVED in bulk 2026-08-05
+#     night, gate quickval_gate_20260805_night: 139/160 PASS, 33 debug
+#     lanes flipped KNOWN_FAIL->PASS in one sweep). Signatures:
 #     (a) hwloop counters (0xcc2 AND 0xcc6, both directions, debug-ROM and
 #     application PCs) - reviewed 2026-08-05: NOT an hwloop-model gap (the
 #     spec mandates the counters keep updating in debug mode, the RTL has
 #     no debug term in the decrement path, and hwloop_in_debug_rom PASSes);
-#     it is the hwloop-visible projection of class (b), do NOT gate the
-#     model's decrement on debug mode.
+#     it was the hwloop-visible projection of class (b) and fell with it -
+#     every hwloop-debug lane now expected-pass. Do NOT gate the model's
+#     decrement on debug mode.
 #     (b) async debug-entry, decomposed 2026-08-05 into five sub-signatures:
-#     B1/B2/B3 (~29 lanes) share one architectural root cause - at the
-#     injection the ISS has already executed the instruction the DUT killed
-#     in ID (its retire parked in the exec commit FIFO behind a held LSU
-#     load; commit_push does not move, so the boundary looked clean). The
-#     writeback is real, so no seam can repair it without a pipeline
-#     rewind: keep-xfail, now honestly diagnosed (take_debug certifies an
-#     entry only on its own trap_seq at the DUT's boundary - no more silent
-#     rc=1 on wrong entries). B4 FIXED 2026-08-05 by three stacked fixes:
+#     B1/B2/B3 root cause ELIMINATED 2026-08-05 evening: the over-execution
+#     came from soc/mem latency=1 holding every load (sync followers parked
+#     in the inflight ring, ISS architecturally ahead of the boundary) -
+#     latency=0 on every port (cv32e40p_v2_standalone.py) plus the native
+#     debug-entry model (haltreq wire + level, ebreakm, dret single-step
+#     window, wfi-as-nop on pending debug, wfi_wake release wire) turned
+#     the WHOLE class around: 33 debug lanes (corev_rand_debug and
+#     _single_step first, then every hwloop-debug / random-debug-req /
+#     int+debug-trigger combination) went KNOWN_FAIL->PASS in the
+#     2026-08-05 night gate and are expected-pass now.
+#     The residual on debug_test is a DUT-side TRACER artifact: on a
+#     haltreq entry through DBG_TAKEN_ID the RVFI tracer emits a retire for
+#     the instruction killed in ID, register write included (proof: the
+#     debugger's save/restore reads the OLD value on the DUT; dpc-force
+#     gauge shows a systematic +4) - keep-xfail, tracer surgery needed.
+#     B4 FIXED 2026-08-05 by three stacked fixes:
 #     entry rows whose rvfi_dbg_mode marker the tracer never asserts are
 #     recognized by PC (== the model's dm_halt_addr) in the bridge; wfi
 #     executes as nop in debug/single-step mode (RTL controller behavior);
 #     c.ebreak in debug mode re-enters the ROM like the 32-bit form
 #     (pulp_instr_ebreak_debug_test revalidated PASS, now gen). B5 (WFI +
-#     haltreq with mie=0, 2 lanes): keep-xfail - the WFI release checks
-#     mie&mip only and the DPI cannot invoke debug_req() (irq_riscv.cpp).
+#     haltreq with mie=0) FIXED 2026-08-05 evening: haltreq is a
+#     first-class injector wire handled inside the model
+#     (Cv32e40pIrq::haltreq_sync arms req_debug and runs the full WFI
+#     release - insn_terminate is only callable model-side), plus the
+#     dedicated wfi_wake wire for wakes the interrupt wires cannot carry.
 #     (c) tdata1 (0x7a1) bit 2 (execute match enable) reads back set on the
 #     DUT and clear in the model on trigger tests - FIXED 2026-08-05
 #     (tdata1/tdata2 debug-gated writes modelled, bridge read clamp
@@ -114,16 +125,31 @@
 #     mtvec base. Both terms of the reactive resync detector go blind
 #     there (ISS MIE already cleared by its trap; DUT mepc != ISS PC), so
 #     the divergence cascades. The informed-IRQ seam (+rvvi_informed_irq)
-#     was probed 2026-08-05 as the principled fix and REGRESSES even the
-#     passing control lane - it stays off/unvalidated; the class stays
-#     xfail. Lanes: corev_rand_interrupt_exception,
+#     was re-probed 2026-08-05 evening with latency=0: the control lanes
+#     now PASS informed (corev_rand_interrupt, interrupt_test,
+#     interrupt_wfi - the wfi_wake retry unblocks the parked-WFI takes)
+#     but the collision lanes stay worse than reactive (exception 51 mm,
+#     nested 122, interrupt_debug 215 vs ~10): reactive stays the default,
+#     informed stays opt-in. Residual informed signature: mepc one insn
+#     high on WFI-wake takes ([trap-snapshot], delta +4). An
+#     interrupt+debug collision on a debug ENTRY is now solved informed
+#     (the entry row's fresh mcause write carries the taken cause id ->
+#     collide_irq_id -> the model takes that line ahead of the entry).
+#     Lanes: corev_rand_interrupt_exception,
 #     corev_rand_pulp_with_priv_instr_test, corev_rand_interrupt_nested
 #     (also exceeds the per-lane timeout); interrupt_test carries a
-#     DIFFERENT open signature (mcause&0x1f read into a GPR diverges with
-#     PCs aligned, ~750 retires before any PC fork). _wfi_mem_stress since
-#     2026-08-05 compares CLEAN (a WFI parked mid-redirect is now woken
-#     and redirected: drain break + wake retry) but stays wall-clock bound
-#     by its ~78k reactive resyncs and exceeds TMO=600.
+#     DIFFERENT root cause, FIXED 2026-08-05: the test reads the TB
+#     virtual-peripheral RNG at 0x15001000 (*(volatile int*)...), which no
+#     functional model can predict - the same volatile-device class as the
+#     vp_cycle_counter read in coremark. Handled the ImperasDV way: the
+#     wrap declares rvviRefMemorySetVolatile('h15001000,'h15001007) and the
+#     bridge copies the DUT rd into the ISS on loads from the window
+#     (RVFI mem_addr/mem_rmask through the batch DPI). _wfi_mem_stress
+#     since 2026-08-05 compares CLEAN (a WFI parked mid-redirect is now
+#     woken and redirected: drain break + wake retry); its TMO=600 cap was
+#     lifted 2026-08-05 (decision E) but the ~78k reactive resyncs do NOT
+#     fit the default per-lane budget either (night gate: rc=124 at
+#     2400s) - clean-but-slow, keep-xfail until the resync cost drops.
 #
 # Seed: generated lanes default to SEED=1 (deterministic snapshot, sweeps
 # directly comparable). Set QV_SEED=<n> to run the SAME lane list at a
@@ -170,7 +196,7 @@ gen|corev_rand_jump_stress_test|corev_rand_jump_stress_test|
 gen|corev_rand_instr_long_stall|corev_rand_instr_long_stall|
 gen|corev_rand_interrupt|corev_rand_interrupt|
 gen|corev_rand_interrupt_wfi|corev_rand_interrupt_wfi|
-gen_xfail|corev_rand_interrupt_wfi_mem_stress|corev_rand_interrupt_wfi_mem_stress|TMO=600
+gen_xfail|corev_rand_interrupt_wfi_mem_stress|corev_rand_interrupt_wfi_mem_stress|
 gen_xfail|corev_rand_interrupt_exception|corev_rand_interrupt_exception|
 gen_xfail|corev_rand_interrupt_nested|corev_rand_interrupt_nested|
 run|hello-world|hello-world|
@@ -187,7 +213,7 @@ run|hpmcounter_hazard_test|hpmcounter_hazard_test|
 run|illegal|illegal|
 run|illegal_instr_test|illegal_instr_test|
 run|interrupt_bootstrap|interrupt_bootstrap|
-xfail|interrupt_test|interrupt_test|
+run|interrupt_test|interrupt_test|
 run|isa_fcov_holes|isa_fcov_holes|
 run|mhpmcounter29_csr_access_test_1|mhpmcounter29_csr_access_test_1|
 run|misalign|misalign|
@@ -196,9 +222,9 @@ run|perf_counters_instructions|perf_counters_instructions|
 run|requested_csr_por|requested_csr_por|
 run|riscv_arithmetic_basic_test_0|riscv_arithmetic_basic_test_0|
 run|riscv_arithmetic_basic_test_1|riscv_arithmetic_basic_test_1|
-gen_xfail|corev_rand_debug|corev_rand_debug|
-gen_xfail|corev_rand_debug_ebreak|corev_rand_debug_ebreak|
-gen_xfail|corev_rand_debug_single_step|corev_rand_debug_single_step|
+gen|corev_rand_debug|corev_rand_debug|
+gen|corev_rand_debug_ebreak|corev_rand_debug_ebreak|
+gen|corev_rand_debug_single_step|corev_rand_debug_single_step|
 gen_xfail|corev_rand_interrupt_debug|corev_rand_interrupt_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
 xfail|debug_test|debug_test|
 xfail|debug_test_boot_set|debug_test_boot_set|
@@ -227,7 +253,7 @@ gen|corev_rand_pulp_hwloop_count_range_test|corev_rand_pulp_hwloop_count_range_t
 gen|tb_hack_obi_gnt_stalls|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" VSIM_USER_FLAGS="+random_instr_stall +random_data_stall +tb_hack_1_obi_gnt_signal"
 run|pulp_hardware_loop|pulp_hardware_loop|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" VSIM_USER_FLAGS="+skip_sampling_uvme_rv32x_hwloop_covg +fixed_data_gnt_stall=3"
 run|pulp_hardware_loop_interrupt_test|pulp_hardware_loop_interrupt_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
-xfail|pulp_hardware_loop_debug_test|pulp_hardware_loop_debug_test|
+run|pulp_hardware_loop_debug_test|pulp_hardware_loop_debug_test|
 xfail|debug_hwloop_test|debug_hwloop_test|
 run|custom_opcode_illegal_test|custom_opcode_illegal_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|cv32e40pv2_illegal_ro_csr_access_test|cv32e40pv2_illegal_ro_csr_access_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
@@ -252,45 +278,45 @@ run|pulp_vectorial_max|pulp_vectorial_max|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|pulp_vectorial_min|pulp_vectorial_min|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|pulp_vectorial_shift|pulp_vectorial_shift|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|pulp_vectorial_shuffle_pack|pulp_vectorial_shuffle_pack|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
-gen_xfail|corev_directed_pulp_hwloop_debug|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
-gen_xfail|corev_directed_pulp_hwloop_debug_ebreak|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_ebreak
-gen_xfail|corev_directed_pulp_hwloop_debug_single_step|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_single_step_en
-gen_xfail|corev_directed_pulp_hwloop_debug_trigger|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic
-gen_xfail|corev_directed_pulp_hwloop_debug_trigger_with_ebreak|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic,debug_ebreak
-gen_xfail|corev_directed_pulp_hwloop_debug_trigger_with_single_step|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic,debug_single_step_en
-gen_xfail|corev_directed_pulp_hwloop_debug_with_int_debug_ebreak|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_ebreak
-gen_xfail|corev_directed_pulp_hwloop_debug_with_int_debug_trigger|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic
-gen_xfail|corev_directed_pulp_hwloop_debug_with_int_debug_trigger_and_ebreak|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_ebreak
-gen_xfail|corev_directed_pulp_hwloop_debug_with_int_debug_trigger_single_step|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_single_step_en
-gen_xfail|corev_directed_pulp_hwloop_debug_with_interrupt|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int
-gen_xfail|corev_directed_pulp_hwloop_test_with_random_debug|corev_directed_pulp_hwloop_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_debug_req
-gen_xfail|corev_rand_debug_ebreak_xpulp|corev_rand_debug_ebreak_xpulp|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
-gen_xfail|corev_rand_debug_single_step_xpulp|corev_rand_debug_single_step_xpulp|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
+gen|corev_directed_pulp_hwloop_debug|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
+gen|corev_directed_pulp_hwloop_debug_ebreak|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_ebreak
+gen|corev_directed_pulp_hwloop_debug_single_step|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_single_step_en
+gen|corev_directed_pulp_hwloop_debug_trigger|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic
+gen|corev_directed_pulp_hwloop_debug_trigger_with_ebreak|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic,debug_ebreak
+gen|corev_directed_pulp_hwloop_debug_trigger_with_single_step|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic,debug_single_step_en
+gen|corev_directed_pulp_hwloop_debug_with_int_debug_ebreak|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_ebreak
+gen|corev_directed_pulp_hwloop_debug_with_int_debug_trigger|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic
+gen|corev_directed_pulp_hwloop_debug_with_int_debug_trigger_and_ebreak|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_ebreak
+gen|corev_directed_pulp_hwloop_debug_with_int_debug_trigger_single_step|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_single_step_en
+gen|corev_directed_pulp_hwloop_debug_with_interrupt|corev_directed_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int
+gen|corev_directed_pulp_hwloop_test_with_random_debug|corev_directed_pulp_hwloop_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_debug_req
+gen|corev_rand_debug_ebreak_xpulp|corev_rand_debug_ebreak_xpulp|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
+gen|corev_rand_debug_single_step_xpulp|corev_rand_debug_single_step_xpulp|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
 gen|corev_rand_pulp_hwloop_debug|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
 gen_xfail|corev_rand_pulp_hwloop_debug_ebreak|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_ebreak
-gen_xfail|corev_rand_pulp_hwloop_debug_single_step|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_single_step_en
+gen|corev_rand_pulp_hwloop_debug_single_step|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_single_step_en
 gen|corev_rand_pulp_hwloop_debug_trigger|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic
 gen_xfail|corev_rand_pulp_hwloop_debug_trigger_with_ebreak|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic,debug_ebreak
 gen|corev_rand_pulp_hwloop_debug_trigger_with_single_step|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic,debug_single_step_en
-gen_xfail|corev_rand_pulp_hwloop_debug_with_int_debug_ebreak|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_ebreak
-gen_xfail|corev_rand_pulp_hwloop_debug_with_int_debug_trigger|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic
-gen_xfail|corev_rand_pulp_hwloop_debug_with_int_debug_trigger_and_ebreak|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_ebreak
-gen_xfail|corev_rand_pulp_hwloop_debug_with_int_debug_trigger_single_step|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_single_step_en
-gen_xfail|corev_rand_pulp_hwloop_debug_with_interrupt|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int
+gen|corev_rand_pulp_hwloop_debug_with_int_debug_ebreak|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_ebreak
+gen|corev_rand_pulp_hwloop_debug_with_int_debug_trigger|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic
+gen|corev_rand_pulp_hwloop_debug_with_int_debug_trigger_and_ebreak|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_ebreak
+gen|corev_rand_pulp_hwloop_debug_with_int_debug_trigger_single_step|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_single_step_en
+gen|corev_rand_pulp_hwloop_debug_with_interrupt|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int
 gen|corev_rand_pulp_hwloop_exception_debug_trigger|corev_rand_pulp_hwloop_exception|CFG_PLUSARGS="+UVM_TIMEOUT=20000000" TEST_CFG_FILE=debug_trigger_basic,gen_limit_debug_req
 gen|corev_rand_pulp_hwloop_exception_single_step_debug|corev_rand_pulp_hwloop_exception|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_single_step_en
 gen|corev_rand_pulp_hwloop_exception_with_int_debug_trigger|corev_rand_pulp_hwloop_exception|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic
 gen|corev_rand_pulp_hwloop_in_debug_rom|corev_rand_pulp_hwloop_in_debug_rom|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
-gen_xfail|corev_rand_pulp_hwloop_test_with_random_debug|corev_rand_pulp_hwloop_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_debug_req
-gen_xfail|corev_rand_pulp_instr_debug_ebreak_with_random_debug_req|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_ebreak,gen_rand_debug_req
-gen_xfail|corev_rand_pulp_instr_debug_single_step_with_random_debug_req|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_single_step_en,gen_rand_debug_req
+gen|corev_rand_pulp_hwloop_test_with_random_debug|corev_rand_pulp_hwloop_test|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_debug_req
+gen|corev_rand_pulp_instr_debug_ebreak_with_random_debug_req|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_ebreak,gen_rand_debug_req
+gen|corev_rand_pulp_instr_debug_single_step_with_random_debug_req|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_single_step_en,gen_rand_debug_req
 gen_xfail|corev_rand_pulp_instr_debug_test_with_int_and_debug_ebreak|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_ebreak
-gen_xfail|corev_rand_pulp_instr_debug_test_with_int_and_debug_single_step|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_single_step_en
-gen_xfail|corev_rand_pulp_instr_debug_test_with_int_and_debug_trigger|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic
-gen_xfail|corev_rand_pulp_instr_debug_test_with_int_debug_trigger_and_ebreak|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_ebreak
-gen_xfail|corev_rand_pulp_instr_debug_test_with_int_debug_trigger_and_single_step|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_single_step_en
+gen|corev_rand_pulp_instr_debug_test_with_int_and_debug_single_step|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_single_step_en
+gen|corev_rand_pulp_instr_debug_test_with_int_and_debug_trigger|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic
+gen|corev_rand_pulp_instr_debug_test_with_int_debug_trigger_and_ebreak|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_ebreak
+gen|corev_rand_pulp_instr_debug_test_with_int_debug_trigger_and_single_step|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic,debug_single_step_en
 gen|corev_rand_pulp_instr_debug_trigger_test|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_trigger_basic
-gen_xfail|corev_rand_pulp_instr_debug_trigger_with_ebreak|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_trigger_basic,debug_ebreak
+gen|corev_rand_pulp_instr_debug_trigger_with_ebreak|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_trigger_basic,debug_ebreak
 gen|corev_rand_pulp_instr_debug_trigger_with_random_debug_req|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_trigger_basic,gen_rand_debug_req
 gen|corev_rand_pulp_instr_debug_trigger_with_single_step|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_trigger_basic,debug_single_step_en
 gen|corev_rand_pulp_instr_ebreak_debug_test|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_ebreak
