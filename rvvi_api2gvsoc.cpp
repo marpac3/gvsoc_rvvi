@@ -316,6 +316,20 @@ static uint64_t g_volatile_mem_sync_count = 0;  /* diagnostic: syncs applied */
  * so it is logged unthrottled and counted for the shutdown summary. */
 static uint64_t g_dpc_force_count = 0;
 
+/* Tracer-fidelity sidecar state (opt-in, +rvvi_tracer_fidelity): explicit
+ * per-row rvfi_intr / rvfi_dbg from the core tracer, plus the cross-check
+ * counters against the legacy detectors. See rvviRefSetTracerFidelity. */
+static bool     g_tracer_fidelity = false;
+static uint32_t g_row_intr = 0;   /* rvfi_intr bundle of the row in flight */
+static uint32_t g_row_dbg  = 0;   /* rvfi_dbg (entry cause) of the row */
+static uint64_t g_fid_intr_rows      = 0;  /* rows flagged intr+interrupt   */
+static uint64_t g_fid_intr_agree     = 0;  /* ...where the detector agreed  */
+static uint64_t g_fid_intr_only      = 0;  /* tracer saw it, detector blind */
+static uint64_t g_fid_det_only       = 0;  /* detector fired, tracer silent */
+static uint64_t g_fid_dbg_rows       = 0;  /* debug entries with rvfi_dbg   */
+static uint64_t g_fid_dbg_agree      = 0;
+static uint64_t g_fid_dbg_mismatch   = 0;
+
 /* --------------------------------------------------------------------------
  * Phase-shift re-alignment on synchronous exceptions.
  *
@@ -862,6 +876,19 @@ bool_t rvviRefShutdown(void)
     if (g_metric_state_deferred > 0)
         BRIDGE_LOG("  state-deferred retires : %llu (commit bursts, PC-only compare)",
                    (unsigned long long)g_metric_state_deferred);
+    if (g_tracer_fidelity) {
+        BRIDGE_LOG("  tracer-fidelity intr rows : %llu (detector agree %llu, "
+                   "tracer-only %llu, detector-only %llu)",
+                   (unsigned long long)g_fid_intr_rows,
+                   (unsigned long long)g_fid_intr_agree,
+                   (unsigned long long)g_fid_intr_only,
+                   (unsigned long long)g_fid_det_only);
+        BRIDGE_LOG("  tracer-fidelity dbg entries : %llu (dcsr agree %llu, "
+                   "mismatch %llu)",
+                   (unsigned long long)g_fid_dbg_rows,
+                   (unsigned long long)g_fid_dbg_agree,
+                   (unsigned long long)g_fid_dbg_mismatch);
+    }
 
     if (g_bridge_profile) {
         BRIDGE_LOG("--- per-function profile (CV_RVVI_BRIDGE_PROFILE=1) ---");
@@ -947,6 +974,34 @@ void rvviRefSetInformedIrq(int enable)
     BRIDGE_LOG("informed IRQ injection %s",
                g_informed_irq_enabled ? "ENABLED (+rvvi_informed_irq)"
                                       : "DISABLED (reactive resync)");
+}
+
+/* --------------------------------------------------------------------------
+ * Tracer-fidelity sidecar (opt-in, +rvvi_tracer_fidelity).
+ *
+ * Explicit per-row rvfi_intr {cause[10:0], interrupt, exception, intr} and
+ * rvfi_dbg (dcsr.cause) from the core tracer, pushed by rvvi_trace2api
+ * before the row's trap/retire handling. When enabled, the explicit data is
+ * the PRIMARY source for (a) async-interrupt handler-entry detection in the
+ * reactive resync and (b) the debug-entry cause; the legacy inference
+ * (mstatus.MIE skew + mtvec-target match, DUT dcsr read) keeps running as a
+ * cross-check, with counters and a loud log on any disagreement. rvfi_intr
+ * needs the tracer patch that drives it (undriven upstream); rvfi_dbg has
+ * always been driven. Default OFF: the sidecar is ignored entirely.
+ * (State lives with the other diagnostic counters near the top.)
+ * ---------------------------------------------------------------------- */
+void rvviRefSetTracerFidelity(int enable)
+{
+    g_tracer_fidelity = (enable != 0);
+    BRIDGE_LOG("tracer-fidelity sidecar %s",
+               g_tracer_fidelity ? "ENABLED (+rvvi_tracer_fidelity)"
+                                 : "DISABLED");
+}
+
+void rvviDutTracerSidecar(uint32_t /*hartId*/, uint32_t intr, uint32_t dbg)
+{
+    g_row_intr = intr;
+    g_row_dbg  = dbg;
 }
 
 /* Inject interrupt `mcause` into the reference ISS for the current retire.
@@ -1163,6 +1218,27 @@ static void maybe_informed_debug_entry(uint64_t dutPc, bool debug_mode_flag)
         auto it = g_dut_csr.find(CSR_DCSR);
         if (it != g_dut_csr.end())
             cause = (it->second >> 6) & 0x7u;
+        /* Tracer-fidelity: rvfi_dbg is CROSS-CHECK ONLY here. Empirical
+         * result 2026-08-06 (corev_rand_debug + debug_test): the tracer's
+         * saved_debug_cause is sampled a cycle off the entry and comes out
+         * STALE on some entries (said 1/ebreak where the DUT's own dcsr
+         * said 3/haltreq at dm_halt_addr) - trusting it regressed PASS
+         * lanes. The dcsr-derived cause stays primary; the counters
+         * quantify the tracer's error rate for the upstream issue. */
+        if (g_tracer_fidelity && (g_row_dbg & 0x7u) != 0) {
+            uint32_t cause_tr = g_row_dbg & 0x7u;
+            g_fid_dbg_rows++;
+            if (cause_tr == cause) {
+                g_fid_dbg_agree++;
+            } else {
+                g_fid_dbg_mismatch++;
+                BRIDGE_ERR("tracer-fidelity: rvfi_dbg entry cause %u != "
+                           "dcsr-derived %u at PC=0x%08x - keeping dcsr "
+                           "(rvfi_dbg capture is timing-unreliable, see "
+                           "upstream issue)",
+                           cause_tr, cause, (uint32_t)dutPc);
+            }
+        }
         /* Interrupt+debug collision, decided by the DUT: when the RTL takes
          * an interrupt and enters debug in the same arbitration, the entry
          * row carries the take's CSR writes - a fresh mcause write with the
@@ -1434,6 +1510,35 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
              * garbage.  WFI-stuck handling below stays active regardless. */
             bool is_new_irq = !g_informed_irq_enabled &&
                               ((!dut_mie && iss_mie) || dut_irq_take_here);
+            /* Tracer-fidelity: rvfi_intr.intr + .interrupt explicitly marks
+             * the first instruction of an async-IRQ handler - including the
+             * takes the MIE-skew detector is structurally blind to (the
+             * sync-exception+IRQ collision leaves both MIE at 0). Explicit
+             * data is primary; the legacy detector keeps running as a
+             * cross-check with loud logs on disagreement. */
+            if (g_tracer_fidelity && !g_informed_irq_enabled) {
+                bool intr_row = (g_row_intr & 0x1u) && (g_row_intr & 0x4u);
+                if (intr_row) {
+                    g_fid_intr_rows++;
+                    if (is_new_irq) {
+                        g_fid_intr_agree++;
+                    } else {
+                        g_fid_intr_only++;
+                        BRIDGE_ERR("tracer-fidelity: rvfi_intr flags an IRQ "
+                                   "handler entry the reactive detector "
+                                   "missed (PC=0x%08x cause=%u) - resyncing "
+                                   "on the explicit signal",
+                                   g_retire.pc, (g_row_intr >> 3) & 0x1fu);
+                        is_new_irq = true;
+                    }
+                } else if (is_new_irq) {
+                    g_fid_det_only++;
+                    BRIDGE_ERR("tracer-fidelity: reactive detector fired "
+                               "without rvfi_intr on the row (PC=0x%08x) - "
+                               "keeping the resync, flagging for review",
+                               g_retire.pc);
+                }
+            }
             bool is_wfi_stuck = (rc == 0 && gvsoc_engine_is_wfi());
 
             if (is_new_irq || is_wfi_stuck) {

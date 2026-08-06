@@ -29,7 +29,15 @@ module rvvi_trace2api
     // the rvvi channels: they carry "the retire" and are only meaningful
     // on a single-retire hart (asserted below).
     input logic [31:0] dut_mem_addr  = '0,
-    input logic [31:0] dut_mem_rmask = '0
+    input logic [31:0] dut_mem_rmask = '0,
+    // Tracer-fidelity sidecar (opt-in, +rvvi_tracer_fidelity): the raw
+    // rvfi_intr bundle {cause[10:0], interrupt, exception, intr} and the
+    // rvfi_dbg entry cause (dcsr.cause) of the retiring row, straight from
+    // the core tracer. Explicit per-row data the bridge can use INSTEAD of
+    // inferring handler entries from CSR side effects. Tied off when the
+    // wrap does not connect them; same single-retire contract as dut_mem_*.
+    input logic [13:0] dut_intr = '0,
+    input logic [2:0]  dut_dbg  = '0
 );
 
     int client_id;
@@ -85,6 +93,23 @@ module rvvi_trace2api
     initial begin
         informed_irq_en = $test$plusargs("rvvi_informed_irq") != 0;
         rvviRefSetInformedIrq(informed_irq_en ? 1 : 0);
+    end
+
+    // Tracer-fidelity sidecar: pushes the row's rvfi_intr/rvfi_dbg to the
+    // bridge BEFORE the trap/retire handling, so both paths see it. The
+    // bridge uses the explicit data as the primary handler-entry/debug-cause
+    // source and cross-checks it against its legacy detectors (counters +
+    // loud log on disagreement). Opt-in: without the plusarg the bridge
+    // ignores the sidecar entirely and nothing changes.
+    import "DPI-C" function void rvviRefSetTracerFidelity(input int enable);
+    import "DPI-C" function void rvviDutTracerSidecar(
+        input int unsigned hartId,
+        input int unsigned intr,
+        input int unsigned dbg);
+    bit tracer_fidelity_en = 1'b0;
+    initial begin
+        tracer_fidelity_en = $test$plusargs("rvvi_tracer_fidelity") != 0;
+        rvviRefSetTracerFidelity(tracer_fidelity_en ? 1 : 0);
     end
 `endif
 
@@ -157,6 +182,13 @@ module rvvi_trace2api
                         $display("[rvvi_trace2api] retire #%0d: PC=0x%08x insn=0x%08x trap=%0b order=%0d",
                                  retire_count, rvvi.pc_rdata[h][r], rvvi.insn[h][r],
                                  rvvi.trap[h][r], rvvi.order[h][r]);
+
+`ifdef USE_GVSOC
+                    // Tracer-fidelity sidecar: per-row, before any trap/retire
+                    // handling (both consume it). No-op unless enabled.
+                    if (tracer_fidelity_en && !is_flush_artifact)
+                        rvviDutTracerSidecar(h, {18'h0, dut_intr}, {29'h0, dut_dbg});
+`endif
 
                     // Skip GPR/FPR/CSR push for the trap-redirect flush artifact
                     // (see post_trap_flush above).  Trap retires and genuine
