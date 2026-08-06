@@ -102,14 +102,23 @@ module rvvi_trace2api
     // loud log on disagreement). Opt-in: without the plusarg the bridge
     // ignores the sidecar entirely and nothing changes.
     import "DPI-C" function void rvviRefSetTracerFidelity(input int enable);
+    import "DPI-C" function void rvviRefSetTracerInformed(input int enable);
     import "DPI-C" function void rvviDutTracerSidecar(
         input int unsigned hartId,
         input int unsigned intr,
         input int unsigned dbg);
     bit tracer_fidelity_en = 1'b0;
+    bit tracer_informed_en = 1'b0;
     initial begin
-        tracer_fidelity_en = $test$plusargs("rvvi_tracer_fidelity") != 0;
+        // +rvvi_tracer_informed: the bridge computes async-IRQ entries with
+        // a single-step inject driven by the row's rvfi_intr, instead of the
+        // reactive post-step repair. Consumes the sidecar data, so it
+        // implies +rvvi_tracer_fidelity.
+        tracer_informed_en = $test$plusargs("rvvi_tracer_informed") != 0;
+        tracer_fidelity_en = tracer_informed_en ||
+                             ($test$plusargs("rvvi_tracer_fidelity") != 0);
         rvviRefSetTracerFidelity(tracer_fidelity_en ? 1 : 0);
+        rvviRefSetTracerInformed(tracer_informed_en ? 1 : 0);
     end
 `endif
 

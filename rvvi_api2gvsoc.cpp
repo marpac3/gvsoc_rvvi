@@ -330,6 +330,16 @@ static uint64_t g_fid_dbg_rows       = 0;  /* debug entries with rvfi_dbg   */
 static uint64_t g_fid_dbg_agree      = 0;
 static uint64_t g_fid_dbg_mismatch   = 0;
 
+/* Tracer-informed take (opt-in, +rvvi_tracer_informed, implies the sidecar):
+ * on a row rvfi_intr marks as an async-IRQ handler entry, the ISS TAKES the
+ * DUT-selected cause (single-step inject) BEFORE the row's step, so the trap
+ * entry is computed by the model instead of repaired by the reactive
+ * force-resync afterwards. See rvviRefSetTracerInformed. */
+static bool     g_tracer_informed = false;
+static uint64_t g_fid_informed_takes = 0;  /* takes the ISS computed        */
+static uint64_t g_fid_informed_fails = 0;  /* fell back to reactive resync  */
+static uint64_t g_fid_informed_wfi   = 0;  /* left to reactive (ISS in WFI) */
+
 /* --------------------------------------------------------------------------
  * Phase-shift re-alignment on synchronous exceptions.
  *
@@ -888,6 +898,12 @@ bool_t rvviRefShutdown(void)
                    (unsigned long long)g_fid_dbg_rows,
                    (unsigned long long)g_fid_dbg_agree,
                    (unsigned long long)g_fid_dbg_mismatch);
+        if (g_tracer_informed)
+            BRIDGE_LOG("  tracer-informed takes : %llu (failed %llu, "
+                       "left to reactive on WFI %llu)",
+                       (unsigned long long)g_fid_informed_takes,
+                       (unsigned long long)g_fid_informed_fails,
+                       (unsigned long long)g_fid_informed_wfi);
     }
 
     if (g_bridge_profile) {
@@ -1002,6 +1018,14 @@ void rvviDutTracerSidecar(uint32_t /*hartId*/, uint32_t intr, uint32_t dbg)
 {
     g_row_intr = intr;
     g_row_dbg  = dbg;
+}
+
+void rvviRefSetTracerInformed(int enable)
+{
+    g_tracer_informed = (enable != 0);
+    BRIDGE_LOG("tracer-informed take %s",
+               g_tracer_informed ? "ENABLED (+rvvi_tracer_informed)"
+                                 : "DISABLED");
 }
 
 /* Inject interrupt `mcause` into the reference ISS for the current retire.
@@ -1408,6 +1432,14 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
      * faulting step unconditionally.  The SV batch compare is already gated
      * on !trap, so returning without a step is safe. */
     if (g_retire.is_trap && gvsoc_engine_commit_stream()) {
+        /* NOTE (tracer-informed residue): on the sync-exception+IRQ
+         * collision the DUT kills this instruction, but the materialize
+         * below still executes it in the ISS, so the informed take on the
+         * next row computes mepc one instruction ahead (+4 skew, the whole
+         * residue of the exception lane). An mcause-bit31 guard here
+         * over-fires (measured 8310 skips / 70 mm vs 51): the only exact
+         * discriminator is the NEXT row's rvfi_intr, which needs a
+         * deferred-step rework of this seam. Left as the known next step. */
         uint32_t commit_pc = 0;
         if (gvsoc_engine_materialize_commit(&commit_pc) == 0 &&
             commit_pc == (uint32_t)g_retire.pc) {
@@ -1422,6 +1454,36 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
      * armed on purpose: the seam targets THIS first post-trap step. */
     bool sync_trap_seam = g_sync_trap_seam;
     g_sync_trap_seam = false;
+
+    /* Tracer-informed take: rvfi_intr marks THIS row as the first
+     * instruction of an async-IRQ handler, and it arrives BEFORE the row's
+     * ISS step - the one point where the entry can be computed instead of
+     * repaired. Single-step inject of the DUT-selected cause: the take's
+     * vector-slot commit stays queued and the normal step below serves it
+     * against this row, so mepc/mcause/mstatus come out of the model's own
+     * trap logic (no force-resync recovery tail). A WFI-parked ISS is left
+     * to the reactive path, whose wire-wake handling is validated; a failed
+     * take falls through to the reactive repair unchanged. */
+    if (g_tracer_informed && !g_informed_irq_enabled &&
+        (g_row_intr & 0x1u) && (g_row_intr & 0x4u)) {
+        if (gvsoc_engine_is_wfi()) {
+            g_fid_informed_wfi++;
+        } else {
+            int irq_id = (int)((g_row_intr >> 3) & 0x1fu);
+            int irc = gvsoc_engine_take_irq_for_one_step(irq_id);
+            if (irc == 1) {
+                g_fid_informed_takes++;
+                BRIDGE_LOG_HOT("tracer-informed take: irq id=%d computed by "
+                               "the ISS (take #%llu)", irq_id,
+                               (unsigned long long)g_fid_informed_takes);
+            } else {
+                g_fid_informed_fails++;
+                BRIDGE_ERR("tracer-informed take: ISS did NOT take irq id=%d "
+                           "(rc=%d) - falling back to the reactive resync",
+                           irq_id, irc);
+            }
+        }
+    }
 
     int rc = gvsoc_engine_step();
 
