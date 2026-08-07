@@ -287,12 +287,17 @@ static bool     g_trap_collide_pending = false;
  * re-executed on the next row): commits left queued instead of consumed. */
 static uint64_t g_trap_replay_deferrals = 0;
 
-/* Values of the last successful trap-row collide take: the tiebreaker for
- * the ebreak-row standing re-push (an mret landing back on the ebreak this
- * very take killed, then killed again by a debug request, re-pushes exactly
- * these values once). */
-static uint32_t g_last_take_mcause = 0;
-static uint32_t g_last_take_mepc   = 0;
+/* Ambiguous ebreak-kill trap row: a SINGLE mcause push with mepc == row pc
+ * cannot be classified row-locally (genuine same-id-same-pc IRQ kill vs a
+ * standing re-push on a debug-request kill - v5/v6 lessons). The decision
+ * is deferred ONE row: the next row's pc is the oracle (debug ROM entry =>
+ * standing re-push; anything else => genuine take). No engine op happens
+ * between the two rows (settle_irq is skipped while armed), so resolving
+ * at the next row's rvviDut* entry is state-identical to the immediate
+ * path. */
+static bool     g_ebreak_take_deferred = false;
+static int      g_ebreak_take_id      = -1;
+static uint32_t g_ebreak_take_row_pc  = 0;
 
 /* Informed IRQ injection (OVPSim-style) - plusarg-gated, default OFF.
  * When OFF: behaviour is unchanged (the reactive resync above stays the only
@@ -867,8 +872,9 @@ bool_t rvviRefInit(const char *programPath)
     g_trap_collide_fails  = 0;
     g_trap_collide_pending = false;
     g_trap_replay_deferrals = 0;
-    g_last_take_mcause    = 0;
-    g_last_take_mepc      = 0;
+    g_ebreak_take_deferred = false;
+    g_ebreak_take_id      = -1;
+    g_ebreak_take_row_pc  = 0;
     g_row_dump_seq        = 0;
     g_volatile_sync_count = 0;
     g_volatile_mem_sync_count = 0;
@@ -987,6 +993,10 @@ bool_t rvviRefShutdown(void)
     if (g_trap_replay_deferrals > 0)
         BRIDGE_LOG("  kill-replay deferrals  : %llu",
                    (unsigned long long)g_trap_replay_deferrals);
+    if (g_ebreak_take_deferred)
+        BRIDGE_ERR("ebreak-kill decision still deferred at shutdown "
+                   "(row 0x%08x, id=%d): last row was an unresolved "
+                   "collision", g_ebreak_take_row_pc, g_ebreak_take_id);
     if (g_phase_realign_count > 0)
         BRIDGE_LOG("  phase realigns : %llu", (unsigned long long)g_phase_realign_count);
     if (g_volatile_sync_count > 0)
@@ -1074,7 +1084,12 @@ void rvviRefNetSet(uint64_t netIndex, uint64_t value, uint64_t /*when*/)
     if (gvsoc_engine_is_running())
     {
         gvsoc_engine_set_irq(netIndex, (int)value);
-        gvsoc_engine_settle_irq();  /* drain a few clock cycles so the ISS pre-fetch IRQ guard fires in the same cycle as the RTL */
+        /* No settle while an ebreak-kill decision is deferred: the ISS must
+         * hold the killed-insn boundary untouched for exactly one row, or
+         * the drained cycles could take the (still wired) interrupt on
+         * their own ahead of the deferred take. */
+        if (!g_ebreak_take_deferred)
+            gvsoc_engine_settle_irq();  /* drain a few clock cycles so the ISS pre-fetch IRQ guard fires in the same cycle as the RTL */
     }
 }
 
@@ -1463,11 +1478,85 @@ static void maybe_informed_debug_entry(uint64_t dutPc, bool debug_mode_flag)
     }
 }
 
+/* Resolve a one-row-deferred ambiguous ebreak-kill decision (see the
+ * detector in rvviRefEventStep). Runs at the START of the next row's
+ * processing, BEFORE maybe_informed_debug_entry: shape (b) must have the
+ * killed-ebreak commit consumed before the ROM row's entry injection, and
+ * shape (a) must take before this row's own step-and-compare (the take's
+ * vector-slot commit is then served by it, exactly like the immediate
+ * path, where the take fired one row earlier and the commit waited). */
+static void resolve_deferred_ebreak_take(uint64_t dutPc)
+{
+    if (!g_ebreak_take_deferred)
+        return;
+    g_ebreak_take_deferred = false;
+    if (!gvsoc_engine_is_running())
+        return;
+
+    if ((uint32_t)dutPc == gvsoc_engine_get_debug_handler() &&
+        !gvsoc_engine_is_debug_mode()) {
+        /* Shape (b): standing re-push on a debug-request kill. Consume the
+         * killed-ebreak commit exactly as the trap row's materialize path
+         * would have (is_ebreak consume) - the debug entry seam for THIS
+         * ROM row runs right after with a clean queue. */
+        uint32_t commit_pc = 0;
+        if (gvsoc_engine_materialize_commit(&commit_pc) == 0 &&
+            commit_pc == g_ebreak_take_row_pc) {
+            gvsoc_engine_step();
+            BRIDGE_LOG_HOT("deferred ebreak decision at 0x%08x: debug ROM "
+                           "row follows - standing re-push, no take (commit "
+                           "consumed)", g_ebreak_take_row_pc);
+        } else {
+            BRIDGE_ERR("deferred ebreak decision at 0x%08x: debug ROM row "
+                       "follows but the head commit is 0x%08x - left queued",
+                       g_ebreak_take_row_pc, commit_pc);
+        }
+        return;
+    }
+
+    /* Shape (a): genuine IRQ kill - take now, one bridge call before this
+     * row's step-and-compare. g_trap_collide_pending guards the
+     * tracer-informed take of THIS row exactly as it guarded the next row
+     * in the immediate path. */
+    int irc = gvsoc_engine_take_irq_for_one_step(g_ebreak_take_id);
+    if (irc == 1) {
+        g_trap_collide_takes++;
+        g_trap_collide_pending = true;
+        BRIDGE_LOG_HOT("deferred ebreak decision at 0x%08x: next row at "
+                       "0x%08x is not the debug ROM - genuine kill, took "
+                       "irq id=%d (take #%llu)", g_ebreak_take_row_pc,
+                       (uint32_t)dutPc, g_ebreak_take_id,
+                       (unsigned long long)g_trap_collide_takes);
+    } else {
+        g_trap_collide_fails++;
+        BRIDGE_ERR("deferred ebreak decision at 0x%08x: take of irq id=%d "
+                   "FAILED (rc=%d) - consuming the killed-ebreak commit to "
+                   "keep the streams aligned", g_ebreak_take_row_pc,
+                   g_ebreak_take_id, irc);
+        /* Same fallback as the immediate path's post-failure materialize:
+         * without it the un-consumed commit desyncs the streams by one
+         * retire for the rest of the run. The pending row is an ebreak by
+         * construction, so the is_ebreak consume decision applies. */
+        uint32_t commit_pc = 0;
+        if (gvsoc_engine_materialize_commit(&commit_pc) == 0 &&
+            commit_pc == g_ebreak_take_row_pc)
+            gvsoc_engine_step();
+        else
+            BRIDGE_ERR("deferred ebreak fallback: head commit 0x%08x does "
+                       "not match the kill row 0x%08x - left queued",
+                       commit_pc, g_ebreak_take_row_pc);
+    }
+}
+
 void rvviDutRetire(uint32_t /*hartId*/, uint64_t dutPc,
                    uint64_t dutInsBin, bool_t debugMode)
 {
     PROF_SCOPE(g_prof_ns_dut_retire, g_prof_cnt_dut_retire);
     g_metric_retires++;
+    /* Resolve BEFORE take_retire_event: the row dump emitted there must
+     * capture the post-resolution ISS state (reads only dutPc + globals,
+     * never g_retire). */
+    resolve_deferred_ebreak_take(dutPc);
     take_retire_event(dutPc, dutInsBin, /*is_trap=*/false);
     /* Do NOT clear g_pending_handler here: rvvi_trace2api calls rvviDutRetire
      * before rvviRefCsrsCompare, so the trap-CSR snapshot must stay active for
@@ -1486,6 +1575,7 @@ void rvviDutTrap(uint32_t /*hartId*/, uint64_t dutPc, uint64_t dutInsBin)
 {
     g_metric_retires++;
     g_metric_traps++;
+    resolve_deferred_ebreak_take(dutPc);
     take_retire_event(dutPc, dutInsBin, /*is_trap=*/true);
 
     /* A debug entry that collided with an interrupt take arrives as a TRAP
@@ -1625,33 +1715,6 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
                 have_mepc = true;
             }
         }
-        /* EBREAK-row disambiguation. A single mcause push on an ebreak row
-         * has two row-locally identical shapes:
-         *   (a) a genuine IRQ take killing the ebreak (21 such rows in the
-         *       exception dump - must take);
-         *   (b) an mret landing back on an ebreak a previous take already
-         *       killed, now killed again by a DEBUG request (r3/r4/r7
-         *       gate regression - must NOT take, the next row is the
-         *       debug ROM). The tracer re-pushes the standing mcause/mepc
-         *       once in both shapes.
-         * Tiebreaker: the bridge's own last collide take. In (b) that take
-         * is exactly the one whose values the row re-pushes (mret does not
-         * touch them; an interleaved LATER take would have overwritten the
-         * mepc CSR, making the re-push fail the mepc==pc test on its own).
-         * The ISS/mirror CSRs are NOT usable here: the rvviDutTrap snapshot
-         * force-syncs them to the row's values before this detector runs
-         * (v4 lesson - the compare was always equal). Duplicated pushes
-         * stay authoritative on any row. Residual blind spot: the same id
-         * killing the same pc twice back-to-back (not observed in dumps). */
-        {
-            uint32_t insn = g_retire.insn;
-            bool ebreak_row = (insn == 0x00100073u) ||
-                              ((insn & 0xFFFFu) == 0x9002u);
-            if (ebreak_row && mcause_pushes == 1 &&
-                row_mcause == g_last_take_mcause &&
-                have_mepc && row_mepc == g_last_take_mepc)
-                mcause_pushes = 0;  /* standing re-push: no take */
-        }
         int collide_id = -1;
         if (mcause_pushes >= 1 && (row_mcause & 0x80000000u) &&
             have_mepc && row_mepc == (uint32_t)g_retire.pc) {
@@ -1661,12 +1724,43 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
         }
         if (collide_id >= 0 && !gvsoc_engine_is_debug_mode() &&
             (uint32_t)g_retire.pc != gvsoc_engine_get_debug_handler()) {
+            /* EBREAK-row disambiguation. A SINGLE mcause push on an ebreak
+             * row has two row-locally IDENTICAL shapes:
+             *   (a) a genuine IRQ take killing the ebreak - must take. The
+             *       same id can kill the same pc twice in a loop; the
+             *       re-push is then value-identical, so remembering the
+             *       last take's values mis-fires (v5: exception lane broke,
+             *       1896/16396 takes);
+             *   (b) an mret landing back on an ebreak a previous take
+             *       already killed, now killed again by a DEBUG request -
+             *       must NOT take, the next row is the debug ROM. dpc/dcsr
+             *       do NOT ride this kill row (v6 lesson: they land on the
+             *       ROM row), and the ISS/mirror CSRs are force-synced to
+             *       the row's values before this detector runs (v4 lesson):
+             *       nothing row-local separates the shapes.
+             * Defer the decision ONE row: the next row's pc is the oracle
+             * (debug ROM entry => (b), anything else => (a)). Resolution in
+             * resolve_deferred_ebreak_take() at the next rvviDut* entry;
+             * settle_irq is skipped while armed so no engine op runs in
+             * between and the take stays state-identical to the immediate
+             * one. Duplicated pushes stay authoritative on any row. */
+            uint32_t insn = g_retire.insn;
+            bool ebreak_row = (insn == 0x00100073u) ||
+                              ((insn & 0xFFFFu) == 0x9002u);
+            if (ebreak_row && mcause_pushes == 1) {
+                g_ebreak_take_deferred = true;
+                g_ebreak_take_id      = collide_id;
+                g_ebreak_take_row_pc  = (uint32_t)g_retire.pc;
+                BRIDGE_LOG_HOT("trap-row IRQ collision on ebreak at 0x%08x "
+                               "(single push, id=%d): decision deferred to "
+                               "the next row", (uint32_t)g_retire.pc,
+                               collide_id);
+                return RVVI_TRUE;
+            }
             int irc = gvsoc_engine_take_irq_for_one_step(collide_id);
             if (irc == 1) {
                 g_trap_collide_takes++;
                 g_trap_collide_pending = true;
-                g_last_take_mcause = row_mcause;
-                g_last_take_mepc   = row_mepc;
                 BRIDGE_LOG("trap-row IRQ collision: killed insn at 0x%08x, "
                            "took irq id=%d ahead of the handler row "
                            "(take #%llu)", (uint32_t)g_retire.pc, collide_id,
