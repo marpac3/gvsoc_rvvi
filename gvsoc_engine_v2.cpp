@@ -90,6 +90,16 @@ static_assert(sizeof(CONFIG_GVSOC_ISS_REGFILE) == 864,
 #define ENGINE_ERR(fmt, ...) \
     do { vpi_printf((char *)"[gvsoc-engine] ERROR: " fmt "\n", ##__VA_ARGS__); } while(0)
 
+/* Hot-path logging (per-take / per-sync sites: set_csr, set_irq, take_irq,
+ * take_debug, settle, set_pc drain): every line is a vpi_printf through the
+ * simulator transcript, and an IRQ-heavy lane crosses these sites tens of
+ * thousands of times. Gated on the same env knob as the bridge's hot logs
+ * (CV_RVVI_BRIDGE_VERBOSE, cached at init); init/shutdown/error sites keep
+ * the always-on macros. */
+static bool g_engine_verbose = false;
+#define ENGINE_LOG_HOT(fmt, ...) \
+    do { if (__builtin_expect(g_engine_verbose, 0)) ENGINE_LOG(fmt, ##__VA_ARGS__); } while(0)
+
 /* --------------------------------------------------------------------------
  * GVSOC engine global state
  * ---------------------------------------------------------------------- */
@@ -484,6 +494,11 @@ int gvsoc_engine_init(const char *config_path)
         return -1;
     }
 
+    {
+        const char *v = getenv("CV_RVVI_BRIDGE_VERBOSE");
+        g_engine_verbose = (v && v[0] != '\0' && strcmp(v, "0") != 0);
+    }
+
     ENGINE_LOG("initializing (config=%s)", config_path);
 
     if (engine_create(config_path) != 0)
@@ -812,6 +827,16 @@ int gvsoc_engine_materialize_commit(uint32_t *pc)
     return 0;
 }
 
+int gvsoc_engine_head_commit_trapped(void)
+{
+    if (!g_running || !g_gvsoc || g_finished || !g_iss)
+        return 0;
+    if (g_iss->timing.commit_pop >= g_iss->timing.commit_push)
+        return 0;
+    return g_iss->timing.commit_trapped[
+        g_iss->timing.commit_pop % Cv32e40pEvents::COMMIT_RING] ? 1 : 0;
+}
+
 bool gvsoc_engine_finished(void)
 {
     return g_finished;
@@ -878,13 +903,22 @@ void gvsoc_engine_set_pc(uint32_t pc)
         {
             ENGINE_ERR("set_pc: engine step threw during pipeline drain: %s", e.what());
         }
-        ENGINE_LOG("set_pc: drained pipeline in %d steps before redirect (PC=0x%08x)",
+        ENGINE_LOG_HOT("set_pc: drained pipeline in %d steps before redirect (PC=0x%08x)",
                    steps, pc);
         if (!g_iss->exec.wfi.get() &&
             (g_iss->lsu.get_nb_pending_accesses() > 0 || g_iss->timing.inflight_pending()))
             ENGINE_ERR("set_pc: pipeline still busy after drain budget (PC=0x%08x)", pc);
     }
     g_iss->exec.current_insn = (iss_reg_t)pc;
+    /* Drop a latched-but-unconsumed exception redirect: the next slow
+     * dispatch would otherwise overwrite this redirect with exception_pc
+     * (exec_inorder consumes has_exception BEFORE fetching current_insn).
+     * Concrete case: a WFI wake lets the exec free-run one insn past the
+     * boundary - an ebreak the DUT kills with an IRQ take - whose raise()
+     * latches the redirect; without this clear the forced redirect lands
+     * on the sync-trap vector (mtvec base) instead of pc. The insn's CSR
+     * side effects are force-corrected by the resync caller either way. */
+    g_iss->exec.has_exception = false;
     g_retired_pc = pc;
     /* Drop unconsumed commits: after a force-resync they belong to the
      * pre-resync stream (including any produced by the drain above). */
@@ -1024,6 +1058,15 @@ void gvsoc_engine_set_fpr(uint32_t index, uint32_t value)
     g_iss->regfile.set_freg(g_iss->regfile.get_reg_gid((int)index), value);
 }
 
+int gvsoc_engine_fprs_aliased(void)
+{
+#ifdef CONFIG_GVSOC_ISS_ZFINX
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 /* --------------------------------------------------------------------------
  * State injection - CSR write
  * ---------------------------------------------------------------------- */
@@ -1057,7 +1100,7 @@ int gvsoc_engine_set_csr(uint32_t csr_addr, uint32_t value)
             }
             case 2: g_iss->hwloop.set_count(loop, value); break;
         }
-        ENGINE_LOG("set_csr: hwloop 0x%03x = 0x%08x", csr_addr, value);
+        ENGINE_LOG_HOT("set_csr: hwloop 0x%03x = 0x%08x", csr_addr, value);
         return 1;
     }
 
@@ -1083,7 +1126,7 @@ int gvsoc_engine_set_csr(uint32_t csr_addr, uint32_t value)
 
     iss_reg_t old_val = *(it->second);
     *(it->second) = (iss_reg_t)value;
-    ENGINE_LOG("set_csr: 0x%03x = 0x%08x (was 0x%08x) ptr=%p",
+    ENGINE_LOG_HOT("set_csr: 0x%03x = 0x%08x (was 0x%08x) ptr=%p",
                csr_addr, value, (unsigned)old_val, (void*)it->second);
     return 1;
 }
@@ -1114,12 +1157,12 @@ void gvsoc_engine_set_irq(uint64_t net_index, int value)
      * check() atomically with the entry) and wakes a WFI-parked hart. It
      * never touches mip, so the settle logic naturally no-ops. */
     if (net_index == 19 && value)
-        ENGINE_LOG("set_irq: haltreq asserted -> wire");
+        ENGINE_LOG_HOT("set_irq: haltreq asserted -> wire");
 
     /* wfi_wake (net 20): bridge-driven pulse releasing a WFI-parked hart
      * (Cv32e40pIrq::wfi_wake_sync), no architectural effect, mip untouched. */
     if (net_index == 20 && value)
-        ENGINE_LOG("set_irq: wfi_wake pulse -> wire");
+        ENGINE_LOG_HOT("set_irq: wfi_wake pulse -> wire");
 
     iss_reg_t old_mip = g_iss->csr.mip.value;
 
@@ -1193,7 +1236,7 @@ void gvsoc_engine_settle_irq(void)
                 /* IRQ taken: record the trapped instruction as the last retired
                  * PC so gvsoc_engine_get_pc() matches the DUT. */
                 g_retired_pc = settle_start_pc;
-                ENGINE_LOG("settle_irq: IRQ taken on drain cycle %d, PC 0x%08x -> 0x%08x",
+                ENGINE_LOG_HOT("settle_irq: IRQ taken on drain cycle %d, PC 0x%08x -> 0x%08x",
                            i, (unsigned)settle_start_pc, (unsigned)settle_pc);
                 return;
             }
@@ -1214,7 +1257,7 @@ void gvsoc_engine_settle_irq(void)
 
     /* No PC change: IRQ masked (mstatus.MIE=0) or pending for next fetch;
      * gvsoc_engine_step() will catch it at the pre-fetch guard. */
-    ENGINE_LOG("settle_irq: %d drain cycles, no PC change (IRQ pending or masked)",
+    ENGINE_LOG_HOT("settle_irq: %d drain cycles, no PC change (IRQ pending or masked)",
                SETTLE_DRAIN_CYCLES);
 }
 
@@ -1266,7 +1309,7 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
     g_dpi_skip_irq = false;
     g_iss->exec.skip_irq_check = false;
 
-    ENGINE_LOG("take_irq: arming irq id=%d (mip 0x%08x->0x%08x), single-step inject",
+    ENGINE_LOG_HOT("take_irq: arming irq id=%d (mip 0x%08x->0x%08x), single-step inject",
                mcause_irq_id, (unsigned)old_mip,
                (unsigned)g_iss->csr.mip.value);
 
@@ -1325,7 +1368,7 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
     g_dpi_skip_irq = saved_dpi_skip;
     g_iss->exec.skip_irq_check = saved_dpi_skip;
 
-    ENGINE_LOG("take_irq: rc=%d, vector-slot commit queued, ISS at 0x%08x "
+    ENGINE_LOG_HOT("take_irq: rc=%d, vector-slot commit queued, ISS at 0x%08x "
                "(mcause=0x%08x)",
                rc, (unsigned)g_iss->exec.current_insn,
                (unsigned)g_iss->csr.mcause.value);
@@ -1333,7 +1376,9 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
     return rc;
 }
 
-int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id)
+int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id,
+                                         uint32_t collide_mepc,
+                                         int collide_certify)
 {
     if (!g_running || !g_gvsoc || g_finished || !g_iss)
         return 0;
@@ -1357,7 +1402,7 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id)
                        "IRQ collision (id=%d) - the model entered without "
                        "the take", collide_irq_id);
         }
-        ENGINE_LOG("take_debug: ISS already in debug mode (cause=%d), "
+        ENGINE_LOG_HOT("take_debug: ISS already in debug mode (cause=%d), "
                    "spontaneous trigger entry - no injection", dcsr_cause);
         return 1;
     }
@@ -1374,8 +1419,14 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id)
     /* Informed interrupt+debug collision: the DUT's entry row carried the
      * CSR writes of an interrupt take, so check() must take exactly that
      * line before the entry (dpc = the vectored handler entry, mstatus/
-     * mepc/mcause from the take). -1 = no collision observed. */
+     * mepc/mcause from the take). -1 = no collision observed. With
+     * collide_certify set (adjacent-row candidates), the model takes the
+     * line only if its entry boundary equals collide_mepc - the
+     * timing-exact stale-candidate rejection this function cannot do
+     * up-front (the ISS may still be mid-batch, short of the boundary). */
     g_iss->irq.collide_irq_id = collide_irq_id;
+    g_iss->irq.collide_expected_mepc = (iss_reg_t)collide_mepc;
+    g_iss->irq.collide_certify = (collide_certify != 0);
 
     /* A WFI-parked ISS cannot spontaneously wake for an injected take (same
      * diagnostic as take_irq): report it, the step loop below will surface
@@ -1403,7 +1454,7 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id)
      * symbol (vsim-12005) at the first call. The success check on debug_mode
      * below still guards against an unrelated commit slipping through. */
 
-    ENGINE_LOG("take_debug: arming debug entry (cause=%d), single-step inject",
+    ENGINE_LOG_HOT("take_debug: arming debug entry (cause=%d), single-step inject",
                dcsr_cause);
 
     /* The arm above lands dpc = the insn the DUT killed only if the ISS is
@@ -1577,7 +1628,7 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id)
 
     /* depc is logged so a wrong entry point is visible here, without the
      * engine having to know the DUT's dpc (only the bridge holds it). */
-    ENGINE_LOG("take_debug: rc=%d, entered=%d, debug-ROM commit queued, "
+    ENGINE_LOG_HOT("take_debug: rc=%d, entered=%d, debug-ROM commit queued, "
                "ISS at 0x%08x (dcsr=0x%08x, depc=0x%08x)",
                rc, (int)entered, (unsigned)g_iss->exec.current_insn,
                (unsigned)g_iss->csr.dcsr, (unsigned)g_iss->csr.depc);

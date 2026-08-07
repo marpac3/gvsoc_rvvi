@@ -129,6 +129,18 @@ int gvsoc_engine_state_current(void);
  */
 int gvsoc_engine_materialize_commit(uint32_t *pc);
 
+/**
+ * 1 when the queued head commit's instruction itself TRAPPED in the model
+ * (exec.has_exception at its retire hook), 0 otherwise (or no commit
+ * queued / v1 stub). On a DUT trap row this separates the faulting-step
+ * commit of an ecall/ebreak (consume it there) from the NORMAL commit of
+ * a pipeline kill-and-replay row - rvfi_trap with no architectural trap,
+ * the DUT re-executes the pc on the next row - whose consume would shift
+ * the compare stream by one retire. The trap_seq stamp cannot make this
+ * distinction: the faulting instruction is stamped after its own raise().
+ */
+int gvsoc_engine_head_commit_trapped(void);
+
 /* ---- State query: PC and instruction ---- */
 
 uint32_t gvsoc_engine_get_pc(void);
@@ -204,6 +216,17 @@ void gvsoc_engine_set_gpr(uint32_t index, uint32_t value);
 void gvsoc_engine_set_fpr(uint32_t index, uint32_t value);
 
 /**
+ * Whether the FPRs alias the GPR file in this build (ZFINX).
+ *
+ * When 1, an FPR write lands on the matching X register: bulk FPR
+ * force/restore loops MUST be skipped (the GPR pass already covers the
+ * unified file), or a stale FPR mirror silently clobbers live GPRs.
+ *
+ * @return 1 under CONFIG_GVSOC_ISS_ZFINX, 0 otherwise.
+ */
+int gvsoc_engine_fprs_aliased(void);
+
+/**
  * Write a CSR into the ISS (direct struct write).
  *
  * Used by rvviRefCsrSet() to inject DUT CSR values (e.g. mtvec during
@@ -276,9 +299,21 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id);
  *                        -1. The model takes that line before the entry, so
  *                        dpc lands on the handler entry and mstatus/mepc/
  *                        mcause carry the take, as in the RTL.
+ * @param collide_mepc    the take's mepc (DUT-provided), consumed only when
+ *                        collide_certify is set.
+ * @param collide_certify when non-zero, the model takes the collision line
+ *                        ONLY if its entry boundary (current_insn, the
+ *                        future depc source) equals collide_mepc - the
+ *                        timing-exact rejection of a stale-mcause candidate
+ *                        (an adjacent-row candidate cannot be certified in
+ *                        the bridge: mid-batch the engine pc is not the
+ *                        boundary yet). 0 keeps the legacy unconditional
+ *                        same-row behaviour.
  * @return 1 if the debug entry landed a commit, 0 otherwise.
  */
-int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id);
+int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id,
+                                         uint32_t collide_mepc,
+                                         int collide_certify);
 
 #ifdef __cplusplus
 }
