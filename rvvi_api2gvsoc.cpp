@@ -275,6 +275,25 @@ static inline bool is_trap_csr(uint32_t addr)
 static bool g_force_trap_enabled  = false;  /* cached from env var at init */
 static uint64_t g_force_resync_count = 0;   /* diagnostic: resyncs applied */
 
+/* Sync-exception + enabled-IRQ collision served at the trap row (the DUT
+ * kills the excepting instruction and takes the interrupt): counters plus
+ * the one-row flag that stops the tracer-informed take from firing a
+ * second take on the handler-entry row. */
+static uint64_t g_trap_collide_takes = 0;
+static uint64_t g_trap_collide_fails = 0;
+static bool     g_trap_collide_pending = false;
+
+/* Kill-and-replay trap rows (rvfi_trap with no architectural trap, the pc
+ * re-executed on the next row): commits left queued instead of consumed. */
+static uint64_t g_trap_replay_deferrals = 0;
+
+/* Values of the last successful trap-row collide take: the tiebreaker for
+ * the ebreak-row standing re-push (an mret landing back on the ebreak this
+ * very take killed, then killed again by a debug request, re-pushes exactly
+ * these values once). */
+static uint32_t g_last_take_mcause = 0;
+static uint32_t g_last_take_mepc   = 0;
+
 /* Informed IRQ injection (OVPSim-style) - plusarg-gated, default OFF.
  * When OFF: behaviour is unchanged (the reactive resync above stays the only
  * IRQ path). When ON: the SV bridge calls rvviRefInjectIrq() on the first
@@ -322,6 +341,18 @@ static uint64_t g_dpc_force_count = 0;
 static bool     g_tracer_fidelity = false;
 static uint32_t g_row_intr = 0;   /* rvfi_intr bundle of the row in flight */
 static uint32_t g_row_dbg  = 0;   /* rvfi_dbg (entry cause) of the row */
+
+/* Row dump (opt-in, env CV_RVVI_ROW_DUMP=<path>): one line per DUT row as
+ * the bridge sees it (kind, PC, sidecar bundles, ISS view, CSR write-set) -
+ * the offline instrument for seam analysis. intr/dbg columns carry data
+ * only when the tracer-fidelity sidecar is enabled. NULL when disabled. */
+static FILE    *g_row_dump_fp  = NULL;
+static uint64_t g_row_dump_seq = 0;
+/* Optional ISS GPR probes appended to each dump row (env
+ * CV_RVVI_ROW_DUMP_GPRS="2,8"): catches silent ISS-side register
+ * corruption - a spurious ISS write the DUT never flags in x_wb is
+ * invisible to the compare until the register's next architectural use. */
+static std::vector<uint32_t> g_row_dump_gprs;
 static uint64_t g_fid_intr_rows      = 0;  /* rows flagged intr+interrupt   */
 static uint64_t g_fid_intr_agree     = 0;  /* ...where the detector agreed  */
 static uint64_t g_fid_intr_only      = 0;  /* tracer saw it, detector blind */
@@ -543,6 +574,28 @@ static void take_retire_event(uint64_t dutPc, uint64_t dutInsBin, bool is_trap)
     g_pending.gpr_mask = 0;
     g_pending.fpr_mask = 0;
     g_pending.csr_writes.clear();
+
+    if (g_row_dump_fp) {
+        uint32_t iss_mstatus = 0, iss_mcause = 0;
+        gvsoc_engine_get_csr(TRAP_CSR_MSTATUS, &iss_mstatus);
+        gvsoc_engine_get_csr(TRAP_CSR_MCAUSE, &iss_mcause);
+        fprintf(g_row_dump_fp,
+                "%llu %s pc=0x%08x insn=0x%08x intr=0x%05x dbg=0x%03x "
+                "iss_pc=0x%08x iss_dbg=%d iss_mstatus=0x%08x "
+                "iss_mcause=0x%08x csrw=",
+                (unsigned long long)++g_row_dump_seq,
+                is_trap ? "TRAP" : "RET",
+                g_retire.pc, g_retire.insn, g_row_intr, g_row_dbg,
+                gvsoc_engine_get_pc(),
+                gvsoc_engine_is_debug_mode() ? 1 : 0,
+                iss_mstatus, iss_mcause);
+        for (const auto &w : g_retire.csr_writes)
+            fprintf(g_row_dump_fp, "%03x:%08x,", w.first, w.second);
+        for (uint32_t r : g_row_dump_gprs)
+            fprintf(g_row_dump_fp, " issx%u=0x%08x", r,
+                    gvsoc_engine_get_gpr(r));
+        fputc('\n', g_row_dump_fp);
+    }
 }
 
 /* Emit one RVVI-TEXT v0.4 line for the current retire on the given side.
@@ -761,6 +814,48 @@ bool_t rvviRefInit(const char *programPath)
                    g_mismatch_log_max == 0 ? " (unlimited)" : "");
     }
 
+    /* Row dump (opt-in): one line per DUT row for offline seam analysis.
+     * Close any handle left open by a previous rvviRefInit (multi-run vsim
+     * session) so a re-init neither leaks the FILE* nor keeps appending to
+     * the previous run's file with a restarted seq numbering. */
+    {
+        if (g_row_dump_fp) {
+            fclose(g_row_dump_fp);
+            g_row_dump_fp = NULL;
+        }
+        const char *v = getenv("CV_RVVI_ROW_DUMP");
+        if (v && v[0] != '\0') {
+            g_row_dump_fp = fopen(v, "w");
+            if (g_row_dump_fp) {
+                fprintf(g_row_dump_fp,
+                        "# seq kind pc insn intr dbg iss_pc iss_dbg "
+                        "iss_mstatus iss_mcause csrw=<addr:val,...>\n");
+                BRIDGE_LOG("row dump ENABLED -> %s", v);
+            } else {
+                BRIDGE_ERR("row dump: cannot open '%s' - disabled", v);
+            }
+        }
+        g_row_dump_gprs.clear();
+        const char *g = getenv("CV_RVVI_ROW_DUMP_GPRS");
+        if (g_row_dump_fp && g && g[0] != '\0') {
+            for (const char *p = g; *p; ) {
+                char *end = NULL;
+                unsigned long r = strtoul(p, &end, 10);
+                if (end == p) {
+                    /* Non-numeric token: skip to the next separator instead
+                     * of silently dropping the rest of the probe list. */
+                    const char *comma = strchr(p, ',');
+                    if (!comma) break;
+                    p = comma + 1;
+                    continue;
+                }
+                if (r < 32) g_row_dump_gprs.push_back((uint32_t)r);
+                p = (*end == ',') ? end + 1 : end;
+            }
+            BRIDGE_LOG("row dump GPR probes: %zu regs", g_row_dump_gprs.size());
+        }
+    }
+
     /* Reset the retire lifecycle and diagnostic counters for this run.
      * The volatile memory windows are re-declared by the testbench's
      * ref_init right after this call, so clear them too. */
@@ -768,6 +863,13 @@ bool_t rvviRefInit(const char *programPath)
     g_retire              = {};
     g_phase_realign_count = 0;
     g_force_resync_count  = 0;
+    g_trap_collide_takes  = 0;
+    g_trap_collide_fails  = 0;
+    g_trap_collide_pending = false;
+    g_trap_replay_deferrals = 0;
+    g_last_take_mcause    = 0;
+    g_last_take_mepc      = 0;
+    g_row_dump_seq        = 0;
     g_volatile_sync_count = 0;
     g_volatile_mem_sync_count = 0;
     g_dpc_force_count     = 0;
@@ -859,6 +961,10 @@ bool_t rvviRefShutdown(void)
      * shutdown wedges (see the abnormal-termination note in
      * gvsoc_engine_shutdown), the trace tails must already be on disk. */
     close_text_files();
+    if (g_row_dump_fp) {
+        fclose(g_row_dump_fp);
+        g_row_dump_fp = NULL;
+    }
     if (!g_tmp_config_path.empty()) {
         remove(g_tmp_config_path.c_str());
         g_tmp_config_path.clear();
@@ -874,6 +980,13 @@ bool_t rvviRefShutdown(void)
     BRIDGE_LOG("  retires/sec    : %.0f", retires_per_sec);
     if (g_force_resync_count > 0)
         BRIDGE_LOG("  IRQ resyncs    : %llu", (unsigned long long)g_force_resync_count);
+    if (g_trap_collide_takes > 0 || g_trap_collide_fails > 0)
+        BRIDGE_LOG("  trap-row collide takes : %llu (fails %llu)",
+                   (unsigned long long)g_trap_collide_takes,
+                   (unsigned long long)g_trap_collide_fails);
+    if (g_trap_replay_deferrals > 0)
+        BRIDGE_LOG("  kill-replay deferrals  : %llu",
+                   (unsigned long long)g_trap_replay_deferrals);
     if (g_phase_realign_count > 0)
         BRIDGE_LOG("  phase realigns : %llu", (unsigned long long)g_phase_realign_count);
     if (g_volatile_sync_count > 0)
@@ -1294,10 +1407,52 @@ static void maybe_informed_debug_entry(uint64_t dutPc, bool debug_mode_flag)
                        collide_irq_id);
             collide_irq_id = -1;
         }
+        /* Collision recovery when the take's mcause write rode an EARLIER
+         * row (pulp/fpu int+debug lanes: the tracer lands mcause on the
+         * preceding row, only mstatus rides the entry row, and the same-row
+         * scan above stays blind - evidence fixcert_debug_entry_20260807 +
+         * triage_fpu_zfinx_20260806). The DUT's dpc is the structural
+         * discriminator: an entry that collided with a take parks dpc at
+         * the UN-EXECUTED vectored handler entry (mtvec base + 4*id) of the
+         * sticky mcause id. Whether the ISS is exactly at the interrupted
+         * boundary (== the take's mepc) cannot be read HERE - mid-batch the
+         * engine pc is not the boundary yet (measured: mepc 0x2bf4 vs
+         * engine pc 0x485c on the certifying entry) - so the candidate is
+         * handed to the model and certified at the entry itself, where
+         * current_insn IS the boundary. A stale-mcause candidate (id from
+         * a take the ISS already followed) fails that certification by
+         * construction: its boundary is past the take's mepc. */
+        uint32_t collide_mepc = 0;
+        int collide_certify = 0;
+        if (collide_irq_id < 0) {
+            auto itc = g_dut_csr.find(TRAP_CSR_MCAUSE);
+            auto itd = g_dut_csr.find(CSR_DPC);
+            auto ite = g_dut_csr.find(TRAP_CSR_MEPC);
+            if (itc != g_dut_csr.end() && itd != g_dut_csr.end() &&
+                ite != g_dut_csr.end() && (itc->second & 0x80000000u)) {
+                int id = (int)(itc->second & 0x1fu);
+                uint32_t mtvec = 0;
+                gvsoc_engine_get_csr(CSR_MTVEC, &mtvec);
+                uint32_t vec = (mtvec & 0xFFFFFF00u) + 4u * (uint32_t)id;
+                bool wired = (id == 3 || id == 7 || id == 11 ||
+                              (id >= 16 && id <= 31));
+                if (wired && itd->second == vec) {
+                    collide_irq_id = id;
+                    collide_mepc = ite->second;
+                    collide_certify = 1;
+                    BRIDGE_LOG("informed debug entry: adjacent-row collision "
+                               "candidate (mcause id %d, dpc==vector 0x%08x, "
+                               "take mepc 0x%08x) - certification at the "
+                               "entry boundary", id, vec, collide_mepc);
+                }
+            }
+        }
         BRIDGE_LOG_HOT("informed debug entry: DUT PC=0x%08x cause=%u%s",
                        (uint32_t)dutPc, cause,
                        collide_irq_id >= 0 ? " (+interrupt collision)" : "");
-        int rc = gvsoc_engine_take_debug_for_one_step((int)cause, collide_irq_id);
+        int rc = gvsoc_engine_take_debug_for_one_step((int)cause, collide_irq_id,
+                                                      collide_mepc,
+                                                      collide_certify);
         if (rc != 1)
             BRIDGE_ERR("informed debug entry not certified (cause=%u rc=%d) - "
                        "the ISS either did not enter debug or entered off the "
@@ -1432,18 +1587,130 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
      * faulting step unconditionally.  The SV batch compare is already gated
      * on !trap, so returning without a step is safe. */
     if (g_retire.is_trap && gvsoc_engine_commit_stream()) {
-        /* NOTE (tracer-informed residue): on the sync-exception+IRQ
-         * collision the DUT kills this instruction, but the materialize
-         * below still executes it in the ISS, so the informed take on the
-         * next row computes mepc one instruction ahead (+4 skew, the whole
-         * residue of the exception lane). An mcause-bit31 guard here
-         * over-fires (measured 8310 skips / 70 mm vs 51): the only exact
-         * discriminator is the NEXT row's rvfi_intr, which needs a
-         * deferred-step rework of this seam. Left as the known next step. */
+        /* Sync-exception + enabled-IRQ collision, decided by the DUT: the
+         * RTL kills the excepting instruction and takes the interrupt, and
+         * the tracer emits the kill as ONE trap row carrying the take's own
+         * write-set. The signature is row-LOCAL and exact (row-dump
+         * evidence collide_adjrow_fix_20260806, exception lane seq 47989):
+         * fresh mcause with bit 31 on a wired line AND fresh mepc == the
+         * killed instruction's pc. The sticky g_dut_csr mirror is
+         * deliberately NOT consulted - a lingering bit-31 mcause from an
+         * earlier take is what made the historical guard over-fire (8310
+         * skips). The killed instruction must NOT be materialized (it never
+         * executed in the DUT; executing it here is the +4 mepc skew that
+         * was the whole informed residue of the exception lane): take the
+         * interrupt instead - mepc/mstatus/mcause come out of the model's
+         * own trap logic - and leave the take's vector-slot commit queued
+         * for the next row's step-and-compare. A debug entry riding a trap
+         * row keeps its own seam (maybe_informed_debug_entry already ran):
+         * the ROM-entry guard keeps this path out of it. */
+        /* Freshness = DUPLICATED trap-CSR entries in the row write-set
+         * (sparse scan + explicit push, observed reliable on every genuine
+         * take species in the row dumps - F5). A single standing re-push
+         * carries the same values but is NOT a take on this row: an mret
+         * landing back on an insn a previous take killed re-pushes the
+         * stale mcause/mepc once, and matching on mere presence re-fired
+         * the take (double-take of irq 16 on back-to-back ebreak kill rows,
+         * r3/r4/r7 residue of the 2026-08-07 gate). Count, don't just
+         * remember the last match. */
+        uint32_t row_mcause = 0, row_mepc = 0;
+        int mcause_pushes = 0;
+        bool have_mepc = false;
+        for (const auto &w : g_retire.csr_writes) {
+            if (w.first == TRAP_CSR_MCAUSE) {
+                row_mcause = w.second;
+                mcause_pushes++;
+            } else if (w.first == TRAP_CSR_MEPC) {
+                row_mepc = w.second;
+                have_mepc = true;
+            }
+        }
+        /* EBREAK-row disambiguation. A single mcause push on an ebreak row
+         * has two row-locally identical shapes:
+         *   (a) a genuine IRQ take killing the ebreak (21 such rows in the
+         *       exception dump - must take);
+         *   (b) an mret landing back on an ebreak a previous take already
+         *       killed, now killed again by a DEBUG request (r3/r4/r7
+         *       gate regression - must NOT take, the next row is the
+         *       debug ROM). The tracer re-pushes the standing mcause/mepc
+         *       once in both shapes.
+         * Tiebreaker: the bridge's own last collide take. In (b) that take
+         * is exactly the one whose values the row re-pushes (mret does not
+         * touch them; an interleaved LATER take would have overwritten the
+         * mepc CSR, making the re-push fail the mepc==pc test on its own).
+         * The ISS/mirror CSRs are NOT usable here: the rvviDutTrap snapshot
+         * force-syncs them to the row's values before this detector runs
+         * (v4 lesson - the compare was always equal). Duplicated pushes
+         * stay authoritative on any row. Residual blind spot: the same id
+         * killing the same pc twice back-to-back (not observed in dumps). */
+        {
+            uint32_t insn = g_retire.insn;
+            bool ebreak_row = (insn == 0x00100073u) ||
+                              ((insn & 0xFFFFu) == 0x9002u);
+            if (ebreak_row && mcause_pushes == 1 &&
+                row_mcause == g_last_take_mcause &&
+                have_mepc && row_mepc == g_last_take_mepc)
+                mcause_pushes = 0;  /* standing re-push: no take */
+        }
+        int collide_id = -1;
+        if (mcause_pushes >= 1 && (row_mcause & 0x80000000u) &&
+            have_mepc && row_mepc == (uint32_t)g_retire.pc) {
+            int id = (int)(row_mcause & 0x1fu);
+            if (id == 3 || id == 7 || id == 11 || (id >= 16 && id <= 31))
+                collide_id = id;
+        }
+        if (collide_id >= 0 && !gvsoc_engine_is_debug_mode() &&
+            (uint32_t)g_retire.pc != gvsoc_engine_get_debug_handler()) {
+            int irc = gvsoc_engine_take_irq_for_one_step(collide_id);
+            if (irc == 1) {
+                g_trap_collide_takes++;
+                g_trap_collide_pending = true;
+                g_last_take_mcause = row_mcause;
+                g_last_take_mepc   = row_mepc;
+                BRIDGE_LOG("trap-row IRQ collision: killed insn at 0x%08x, "
+                           "took irq id=%d ahead of the handler row "
+                           "(take #%llu)", (uint32_t)g_retire.pc, collide_id,
+                           (unsigned long long)g_trap_collide_takes);
+                return RVVI_TRUE;
+            }
+            g_trap_collide_fails++;
+            BRIDGE_ERR("trap-row IRQ collision: take of irq id=%d FAILED "
+                       "(rc=%d) - falling back to the materialize path",
+                       collide_id, irc);
+        }
         uint32_t commit_pc = 0;
         if (gvsoc_engine_materialize_commit(&commit_pc) == 0 &&
             commit_pc == (uint32_t)g_retire.pc) {
-            gvsoc_engine_step();
+            /* An ebreak on a TRAP row with NO fresh trap-CSR write is a
+             * DEBUG entry (dcsr.ebreakm/u routes ebreak to debug: dpc/dcsr
+             * are written, the mcause/mepc mirrors stay standing), never a
+             * kill-and-replay: the DUT proceeds to the debug ROM, it does
+             * not re-execute the pc. An architectural ebreak TRAP instead
+             * writes a fresh mcause=3 and is served by head_commit_trapped.
+             * Deferring here starved the compare by one commit and skewed
+             * the hwloop counters (7-lane ebreak+debug regression, gate
+             * 2026-08-07). Consume the commit as before the deferral gate. */
+            uint32_t insn = g_retire.insn;
+            bool is_ebreak = (insn == 0x00100073u) ||
+                             ((insn & 0xFFFFu) == 0x9002u);
+            if (gvsoc_engine_head_commit_trapped() || is_ebreak) {
+                gvsoc_engine_step();
+            } else {
+                /* Kill-and-replay row: the DUT killed this instruction with
+                 * NO architectural trap (write-set carries only standing
+                 * values) and re-executes the same pc on the next row; the
+                 * ISS committed it as a NORMAL instruction. Consuming that
+                 * commit here would serve it against the kill row and shift
+                 * the whole compare stream by one retire (the 63-mm tail of
+                 * the exception lane). Leave it queued: the re-execution
+                 * row's step serves it - net architectural state is
+                 * identical on both sides (one execution each). */
+                g_trap_replay_deferrals++;
+                BRIDGE_LOG_HOT("trap-row kill-replay at 0x%08x: commit left "
+                               "queued for the re-execution row (#%llu)",
+                               (uint32_t)g_retire.pc,
+                               (unsigned long long)g_trap_replay_deferrals);
+            }
         }
         return RVVI_TRUE;
     }
@@ -1455,6 +1722,11 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
     bool sync_trap_seam = g_sync_trap_seam;
     g_sync_trap_seam = false;
 
+    /* A trap-row collision take already computed this row's handler entry:
+     * the tracer-informed take below must not fire a second one. */
+    bool trap_collide_served = g_trap_collide_pending;
+    g_trap_collide_pending = false;
+
     /* Tracer-informed take: rvfi_intr marks THIS row as the first
      * instruction of an async-IRQ handler, and it arrives BEFORE the row's
      * ISS step - the one point where the entry can be computed instead of
@@ -1464,7 +1736,7 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
      * trap logic (no force-resync recovery tail). A WFI-parked ISS is left
      * to the reactive path, whose wire-wake handling is validated; a failed
      * take falls through to the reactive repair unchanged. */
-    if (g_tracer_informed && !g_informed_irq_enabled &&
+    if (g_tracer_informed && !g_informed_irq_enabled && !trap_collide_served &&
         (g_row_intr & 0x1u) && (g_row_intr & 0x4u)) {
         if (gvsoc_engine_is_wfi()) {
             g_fid_informed_wfi++;
@@ -1695,11 +1967,19 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
                     }
                 }
 
-                /* Force all FPRs */
-                for (uint32_t i = 0; i < 32; i++) {
-                    uint32_t iss_fpr = gvsoc_engine_get_fpr(i);
-                    if (iss_fpr != g_dut_fpr[i]) {
-                        gvsoc_engine_set_fpr(i, g_dut_fpr[i]);
+                /* Force all FPRs.  NOT under ZFINX: there the FPRs alias
+                 * the X file (set_fpr lands on the matching GPR) while the
+                 * g_dut_fpr mirror never updates (a ZFINX DUT reports FP
+                 * results as X writebacks), so this loop would clobber the
+                 * just-forced GPRs back to the stale mirror (all zeros) -
+                 * observed as sp=0 at the first handler prologue after the
+                 * first reactive resync in the zfinx lane. */
+                if (!gvsoc_engine_fprs_aliased()) {
+                    for (uint32_t i = 0; i < 32; i++) {
+                        uint32_t iss_fpr = gvsoc_engine_get_fpr(i);
+                        if (iss_fpr != g_dut_fpr[i]) {
+                            gvsoc_engine_set_fpr(i, g_dut_fpr[i]);
+                        }
                     }
                 }
 
@@ -2126,7 +2406,9 @@ void rvviRefGprSet(uint32_t /*hartId*/, uint32_t gprIndex, uint64_t gprValue)
 
 void rvviRefFprSet(uint32_t /*hartId*/, uint32_t fprIndex, uint64_t fprValue)
 {
-    if (gvsoc_engine_is_running())
+    /* Under ZFINX an external FPR set would land on the matching X register
+     * (aliased file) - and there are no architectural FPRs to set anyway. */
+    if (gvsoc_engine_is_running() && !gvsoc_engine_fprs_aliased())
         gvsoc_engine_set_fpr(fprIndex, (uint32_t)fprValue);
 }
 
