@@ -127,8 +127,9 @@ static uint32_t      g_retired_opcode = 0; /* always 0: opcode not captured in D
 static uint64_t      g_popped_trap_seq = 0; /* trap_seq stamp of the last popped commit */
 static FILE         *g_iss_trace_fp  = nullptr;  /* opt-in, env GVSOC_RVVI_ISS_TRACE */
 
-/* When set, re-assert exec.skip_irq_check before every step(): the ISS
- * slow handler clears it after one use. */
+/* When set, re-assert exec.skip_irq_check before every step(): the flag is
+ * one-shot, consumed inside Irq::check() (the model still evaluates its
+ * synchronous execute-trigger ahead of the gate on every boundary). */
 static bool g_dpi_skip_irq = false;
 
 /* --------------------------------------------------------------------------
@@ -679,8 +680,11 @@ static bool engine_advance_to_commit(int *cycles)
         if (g_finished || i == STEP_MAX_CYCLES)
             break;
 
-        /* Re-assert skip_irq_check before every step.
-         * The ISS slow handler clears it after one use. */
+        /* Re-assert skip_irq_check before every step (one-shot, consumed
+         * inside Irq::check).  Synchronous debug conditions - the
+         * execute-address trigger - are evaluated by the model AHEAD of
+         * its internal gate, so a suppressed dispatch still enters debug
+         * at an armed tdata2 boundary; no engine carve-out is needed. */
         if (g_dpi_skip_irq)
             g_iss->exec.skip_irq_check = true;
 
@@ -1280,6 +1284,21 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
         return 0;
     }
 
+    /* Entry guard, symmetric to take_debug_for_one_step: in debug mode
+     * Irq::check() never reaches the IRQ ladder, so the injection cannot
+     * land - and a debug-ROM retire inside the window would be handed to
+     * the caller as if it were the vector-slot commit. The DUT taking an
+     * interrupt proves IT is not in debug mode (the spec masks interrupts
+     * there), so this state is a divergence: fail the injection and let
+     * the caller's fallback realign. */
+    if (g_iss->exec.debug_mode)
+    {
+        ENGINE_ERR("take_irq: ISS in debug mode at injection (irq id=%d) - "
+                   "the DUT's take proves it is not; failing the injection",
+                   mcause_irq_id);
+        return 0;
+    }
+
     /* Present ONLY the DUT-selected cause to Irq::check() for this step. The
      * generic check() arbitrates by standard RISC-V priority (MEI > MSI > MTI >
      * ...), but CV32E40P ranks the fast local interrupts (16..31) ABOVE MEI.
@@ -1304,6 +1323,20 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
 
     /* Remember the engine-level defense so we can restore it exactly. */
     bool saved_dpi_skip = g_dpi_skip_irq;
+
+    /* Suppress a latched debug request for this one window: the debug branch
+     * outranks the IRQ ladder in Irq::check(), so a haltreq armed by the
+     * level-sensitive wire would hijack this injection into a debug entry
+     * the DUT did not take at this boundary (the DUT's arbitration took the
+     * IRQ). Restored after the step: the wire is still high on the DUT too,
+     * and the genuine entry follows on the DUT's own entry row. Nets are
+     * DPI-delivered between bridge calls, so no re-arm can land inside the
+     * window. */
+    bool saved_req_debug       = g_iss->irq.req_debug;
+    int  saved_req_debug_cause = g_iss->irq.req_debug_cause;
+    bool saved_haltreq_level   = g_iss->irq.haltreq_level;
+    g_iss->irq.req_debug     = false;
+    g_iss->irq.haltreq_level = false;  /* check() re-arms from a held-high level */
 
     /* Lower the defense for ONE step (see window guarantee above). */
     g_dpi_skip_irq = false;
@@ -1367,6 +1400,31 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
      * shutdown runs on this call path. */
     g_dpi_skip_irq = saved_dpi_skip;
     g_iss->exec.skip_irq_check = saved_dpi_skip;
+
+    /* haltreq_level mirrors the wire, not a request: always restore it (the
+     * next net sync only fires on a level CHANGE). */
+    g_iss->irq.haltreq_level = saved_haltreq_level;
+
+    /* Re-arm the suppressed debug request only if the window stayed out of
+     * debug. The suppression covers req_debug and the haltreq level, but
+     * check() can still enter through its non-suppressed paths (trigger
+     * execute-match, single-step re-entry) - those entries consume
+     * req_debug as part of taking, and re-latching the saved value on top
+     * would arm a stale entry for the next dret. A dropped haltreq request
+     * is not lost: check() re-arms it from the restored level. */
+    if (!g_iss->exec.debug_mode)
+    {
+        g_iss->irq.req_debug       = saved_req_debug;
+        g_iss->irq.req_debug_cause = saved_req_debug_cause;
+    }
+    else
+    {
+        ENGINE_ERR("take_irq: debug entry during the injection window "
+                   "(irq id=%d) via a non-suppressed path (trigger or "
+                   "single-step re-entry) - suppressed request dropped, "
+                   "the commit handed to the caller is NOT the vector slot",
+                   mcause_irq_id);
+    }
 
     ENGINE_LOG_HOT("take_irq: rc=%d, vector-slot commit queued, ISS at 0x%08x "
                "(mcause=0x%08x)",
