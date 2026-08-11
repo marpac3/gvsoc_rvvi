@@ -36,14 +36,50 @@
 #     bug was fixed 2026-07-24.
 #   - corev_rand_pulp_{,hwloop_}illegal_instr_test run the base rand TEST
 #     with TEST_CFG_FILE=insert_illegal_instr (regress-yaml alias).
+#   - DEBUG-MODE SWEEP 2026-08-10/11 (nine lanes flipped expected-pass,
+#     evidence /tmp/tracer_triage_20260810 + /tmp/final_gate_20260811):
+#     (1) interrupt_debug 231mm: the take_irq injection window let a
+#     latched haltreq hijack the entry (Irq::check debug branch outranks
+#     the IRQ ladder) - the engine now saves/suppresses req_debug +
+#     haltreq_level for the one step and restores after (the level
+#     re-arms post-dret like the RTL wire).
+#     (2) debug_test tracer phantom: on a haltreq DBG_TAKEN_ID the RVFI
+#     tracer emitted a retire for the instruction killed in ID -
+#     bhv/cv32e40p_rvfi.sv now drops that trace_id row (order released,
+#     send_rvfi contiguity kept). Fix is in the tracer, not the bridge.
+#     (3) exceptions/ecall in debug mode -> dm_exception_addr with NO CSR
+#     update (debug.rst: Cv32e40pException::raise debug-mode branch; new
+#     config key debug_exception_handler=0x1A111600 in the v2 JSONs).
+#     (4) mret in debug mode -> dm_exception_addr, no side effects
+#     (debug.rst "without affecting status registers";
+#     Cv32e40pCore::mret_handle).
+#     (5) execute-trigger vs the standing irq-check suppression: check()
+#     never saw the tdata2 boundary, the ISS ran one insn past the DUT's
+#     trigger entry - engine_at_armed_trigger lowers the skip for exactly
+#     that dispatch, the spontaneous entry certifies (debug_test_trigger).
+#     Cause priority on a shared boundary follows the RTL, per entry
+#     path: TRIGGER overrides an armed haltreq (DBG_TAKEN_ID table) but
+#     YIELDS to a closing single-step window (DBG_TAKEN_IF's cause mux
+#     never looks at trigger_match - step wins, the trigger fires on the
+#     next session).
+#     (6) self-modifying code (debug_hwloop_test writes the hwloop body):
+#     a hart store into a decoded insn-cache page queues a deferred flush
+#     (LsuV2::data_req_virtual + InsnCache::covers) - CV32E40P fetches
+#     straight from memory, the model must stay coherent without fence.i.
+#     (7) hwloop count on a trapping loop-end insn (ebreak at lpend): the
+#     RTL kills the insn before the loop update - the dispatch loop skips
+#     hwloop.check when the handler raised (hwloop-ebreak lanes, cc6 skew).
+#     debug_test_boot_set stays xfail: the TEST PROGRAM itself flags
+#     failure at reset (77 retires, exit_value=1, no co-sim mismatch) -
+#     debug-req-at-reset TB config path, separate triage.
 #   - debug-mode tests (debug_hwloop_test, pulp_hardware_loop_debug_test):
 #     the reference model now follows the DUT into debug the informed way
 #     (engine take-debug on the rvvi.debug_mode edge, dpc/hwloop CSRs
 #     forced from the DUT at the entry seam, dret outside debug raises
 #     illegal, dcsr.prv WARL-pinned to M). The residual is a
 #     one-instruction retire misalignment inside the debug ROM when debug
-#     entries re-arm in rapid succession (characterized, root cause open);
-#     still xfail / KNOWN_FAIL.
+#     entries re-arm in rapid succession - RESOLVED by the 2026-08-10/11
+#     debug-mode sweep above (items 3/4/6/7); lanes now expected-pass.
 #   - debug axis (characterized 2026-08-04, evidence
 #     /data2/.../debug_axis_char_20260804; RESOLVED in bulk 2026-08-05
 #     night, gate quickval_gate_20260805_night: 139/160 PASS, 33 debug
@@ -70,7 +106,8 @@
 #     haltreq entry through DBG_TAKEN_ID the RVFI tracer emits a retire for
 #     the instruction killed in ID, register write included (proof: the
 #     debugger's save/restore reads the OLD value on the DUT; dpc-force
-#     gauge shows a systematic +4) - keep-xfail, tracer surgery needed.
+#     gauge shows a systematic +4) - FIXED 2026-08-10 in the tracer
+#     itself (sweep item 2 above), debug_test now expected-pass.
 #     B4 FIXED 2026-08-05 by three stacked fixes:
 #     entry rows whose rvfi_dbg_mode marker the tracer never asserts are
 #     recognized by PC (== the model's dm_halt_addr) in the bridge; wfi
@@ -97,12 +134,9 @@
 #     corev_rand_illegal_instr FIXED 2026-08-05 (the "mepc skew" was the
 #     ISS executing reserved RVC code-points, e.g. c.addi4spn nzuimm=0,
 #     that the RTL correctly rejects - guards in rv32c.hpp, lane now gen);
-#     debug_test_trigger stays xfail, reclassified into the async
-#     debug-entry class: tdata1/tdata2 AND the execute-trigger match are
-#     modelled (2026-08-05) and the trigger entries themselves compare
-#     clean through the informed seam; what diverges is the test's haltreq
-#     ARMING entries (dcsr.cause=3 - a batched step runs one commit past
-#     the DUT's async entry boundary); interrupt_test on Zfinx (the
+#     debug_test_trigger FIXED 2026-08-11 (sweep item 5 above: the
+#     engine opens the irq-check for the armed-trigger boundary dispatch
+#     and the trigger outranks a same-boundary haltreq like the RTL); interrupt_test on Zfinx (the
 #     default sibling); and coremark, which carries TWO independent
 #     causes: a GPR read of the TB vp_cycle_counter at 0x15001004
 #     (cycles-since-reset, unstable across seeds with random OBI stalls -
@@ -196,8 +230,8 @@ gen|corev_rand_jump_stress_test|corev_rand_jump_stress_test|
 gen|corev_rand_instr_long_stall|corev_rand_instr_long_stall|
 gen|corev_rand_interrupt|corev_rand_interrupt|
 gen|corev_rand_interrupt_wfi|corev_rand_interrupt_wfi|
-gen_xfail|corev_rand_interrupt_wfi_mem_stress|corev_rand_interrupt_wfi_mem_stress|
-gen_xfail|corev_rand_interrupt_exception|corev_rand_interrupt_exception|
+gen|corev_rand_interrupt_wfi_mem_stress|corev_rand_interrupt_wfi_mem_stress|TMO=6000
+gen|corev_rand_interrupt_exception|corev_rand_interrupt_exception|
 gen_xfail|corev_rand_interrupt_nested|corev_rand_interrupt_nested|
 run|hello-world|hello-world|
 run|branch_zero|branch_zero|
@@ -225,14 +259,14 @@ run|riscv_arithmetic_basic_test_1|riscv_arithmetic_basic_test_1|
 gen|corev_rand_debug|corev_rand_debug|
 gen|corev_rand_debug_ebreak|corev_rand_debug_ebreak|
 gen|corev_rand_debug_single_step|corev_rand_debug_single_step|
-gen_xfail|corev_rand_interrupt_debug|corev_rand_interrupt_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
-xfail|debug_test|debug_test|
+gen|corev_rand_interrupt_debug|corev_rand_interrupt_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
+run|debug_test|debug_test|
 xfail|debug_test_boot_set|debug_test_boot_set|
 run|debug_test_known_miscompares|debug_test_known_miscompares|CFG_PLUSARGS="+UVM_TIMEOUT=20000000"
 run|debug_test_reset|debug_test_reset|
 run|riscv_ebreak_test_0|riscv_ebreak_test_0|CFG_PLUSARGS="+UVM_TIMEOUT=20000000"
 gen|corev_rand_illegal_instr_test|corev_rand_illegal_instr_test|
-xfail|debug_test_trigger|debug_test_trigger|
+run|debug_test_trigger|debug_test_trigger|
 run|matmul_32b_int|matmul_32b_int|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 xfail|coremark|coremark|CFG_PLUSARGS="+UVM_TIMEOUT=20000000" TMO=3600
 '
@@ -254,7 +288,7 @@ gen|tb_hack_obi_gnt_stalls|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT
 run|pulp_hardware_loop|pulp_hardware_loop|CFG_PLUSARGS="+UVM_TIMEOUT=1000000" VSIM_USER_FLAGS="+skip_sampling_uvme_rv32x_hwloop_covg +fixed_data_gnt_stall=3"
 run|pulp_hardware_loop_interrupt_test|pulp_hardware_loop_interrupt_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|pulp_hardware_loop_debug_test|pulp_hardware_loop_debug_test|
-xfail|debug_hwloop_test|debug_hwloop_test|
+run|debug_hwloop_test|debug_hwloop_test|
 run|custom_opcode_illegal_test|custom_opcode_illegal_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|cv32e40pv2_illegal_ro_csr_access_test|cv32e40pv2_illegal_ro_csr_access_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|cv32e40p_csr_access_test|cv32e40p_csr_access_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
@@ -293,10 +327,10 @@ gen|corev_directed_pulp_hwloop_test_with_random_debug|corev_directed_pulp_hwloop
 gen|corev_rand_debug_ebreak_xpulp|corev_rand_debug_ebreak_xpulp|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
 gen|corev_rand_debug_single_step_xpulp|corev_rand_debug_single_step_xpulp|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
 gen|corev_rand_pulp_hwloop_debug|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
-gen_xfail|corev_rand_pulp_hwloop_debug_ebreak|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_ebreak
+gen|corev_rand_pulp_hwloop_debug_ebreak|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_ebreak
 gen|corev_rand_pulp_hwloop_debug_single_step|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_single_step_en
 gen|corev_rand_pulp_hwloop_debug_trigger|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic
-gen_xfail|corev_rand_pulp_hwloop_debug_trigger_with_ebreak|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic,debug_ebreak
+gen|corev_rand_pulp_hwloop_debug_trigger_with_ebreak|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic,debug_ebreak
 gen|corev_rand_pulp_hwloop_debug_trigger_with_single_step|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=debug_trigger_basic,debug_single_step_en
 gen|corev_rand_pulp_hwloop_debug_with_int_debug_ebreak|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_ebreak
 gen|corev_rand_pulp_hwloop_debug_with_int_debug_trigger|corev_rand_pulp_hwloop_debug|CFG_PLUSARGS="+UVM_TIMEOUT=30000000" TEST_CFG_FILE=gen_rand_int,debug_trigger_basic
@@ -320,7 +354,7 @@ gen|corev_rand_pulp_instr_debug_trigger_with_ebreak|corev_rand_pulp_instr_debug|
 gen|corev_rand_pulp_instr_debug_trigger_with_random_debug_req|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_trigger_basic,gen_rand_debug_req
 gen|corev_rand_pulp_instr_debug_trigger_with_single_step|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_trigger_basic,debug_single_step_en
 gen|corev_rand_pulp_instr_ebreak_debug_test|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_ebreak
-gen_xfail|corev_rand_pulp_instr_interrupt_debug_test|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,gen_rand_debug_req
+gen|corev_rand_pulp_instr_interrupt_debug_test|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_int,gen_rand_debug_req
 gen|corev_rand_pulp_instr_random_debug_test|corev_rand_pulp_instr_test|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=gen_rand_debug_req
 gen|corev_rand_pulp_instr_single_step_debug_test|corev_rand_pulp_instr_debug|CFG_PLUSARGS="+UVM_TIMEOUT=10000000" TEST_CFG_FILE=debug_single_step_en
 gen|corev_directed_for_hwloop_covg_test|corev_directed_for_hwloop_covg_test|CFG_PLUSARGS="+UVM_TIMEOUT=60000000"
