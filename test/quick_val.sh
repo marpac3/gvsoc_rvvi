@@ -76,6 +76,16 @@
 #     full fix stack): 16 fast lanes PASS + mem_stress PASS (TMO=6000,
 #     3165s); nested fails at its self-corruption point as expected (see
 #     the dedicated interrupt_nested note - unpassable by construction).
+#     CONSOLIDATION 2026-08-11 morning (review-driven): the async gate is
+#     consumed inside Irq::check() and the execute trigger is evaluated
+#     model-side ahead of it - the engine's trigger carve-out is GONE;
+#     SMC hook on physical addresses with a page-crossing short-circuit;
+#     tracer halt-kill arming guarded against re-arm (review HIGH).
+#     FULL GATE on the consolidated build (155 PASS / 0 FAIL /
+#     3 KNOWN_FAIL / 2 SKIP, 08:36-13:08, archived
+#     /data2/marco.paci/validation-evidence/quickval_gate_20260811_c2):
+#     zero regressions, the three KNOWN_FAIL are exactly the documented
+#     xfails (interrupt_nested, debug_test_boot_set, coremark).
 #   - debug-mode tests (debug_hwloop_test, pulp_hardware_loop_debug_test):
 #     the reference model now follows the DUT into debug the informed way
 #     (engine take-debug on the rvvi.debug_mode edge, dpc/hwloop CSRs
