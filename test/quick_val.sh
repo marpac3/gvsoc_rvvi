@@ -72,6 +72,10 @@
 #     debug_test_boot_set stays xfail: the TEST PROGRAM itself flags
 #     failure at reset (77 retires, exit_value=1, no co-sim mismatch) -
 #     debug-req-at-reset TB config path, separate triage.
+#     FINAL GATE 2026-08-11 (/tmp/final_gate_20260811, 18 lanes on the
+#     full fix stack): 16 fast lanes PASS + mem_stress PASS (TMO=6000,
+#     3165s); nested fails at its self-corruption point as expected (see
+#     the dedicated interrupt_nested note - unpassable by construction).
 #   - debug-mode tests (debug_hwloop_test, pulp_hardware_loop_debug_test):
 #     the reference model now follows the DUT into debug the informed way
 #     (engine take-debug on the rvvi.debug_mode edge, dpc/hwloop CSRs
@@ -171,7 +175,8 @@
 #     collide_irq_id -> the model takes that line ahead of the entry).
 #     Lanes: corev_rand_interrupt_exception,
 #     corev_rand_pulp_with_priv_instr_test, corev_rand_interrupt_nested
-#     (also exceeds the per-lane timeout); interrupt_test carries a
+#     (nested root cause is NOT this collision class - see the dedicated
+#     note below, root-caused 2026-08-11); interrupt_test carries a
 #     DIFFERENT root cause, FIXED 2026-08-05: the test reads the TB
 #     virtual-peripheral RNG at 0x15001000 (*(volatile int*)...), which no
 #     functional model can predict - the same volatile-device class as the
@@ -181,9 +186,27 @@
 #     (RVFI mem_addr/mem_rmask through the batch DPI). _wfi_mem_stress
 #     since 2026-08-05 compares CLEAN (a WFI parked mid-redirect is now
 #     woken and redirected: drain break + wake retry); its TMO=600 cap was
-#     lifted 2026-08-05 (decision E) but the ~78k reactive resyncs do NOT
-#     fit the default per-lane budget either (night gate: rc=124 at
-#     2400s) - clean-but-slow, keep-xfail until the resync cost drops.
+#     lifted 2026-08-05 (decision E) but the ~78k reactive resyncs do not
+#     fit the default per-lane budget - VALIDATED PASS 2026-08-11 with a
+#     dedicated TMO=6000 (final gate: rc=0 at 3165s), lane is gen now.
+#   - corev_rand_interrupt_nested: NOT a co-sim gap - the generated test
+#     self-destructs (root-caused 2026-08-11). The handler re-enables
+#     mstatus.MIE 10 insns into its prologue (csrsi mstatus,8 at the
+#     window 0x1ea9e..0x1eaaa) and the TB irq agent fires continuously,
+#     so entries nest without ever reaching the epilogue pop: the kernel
+#     stack descends 16B per level and after ~7884 levels (~83400
+#     retires, 459701 ns, deterministic at SEED=1) the context save
+#     overwrites the handler's own code (x2 reaches 0x1ea8x - the c.swsp
+#     at 0x1ea88 stores over itself). The DUT rides the stale prefetch a
+#     couple of insns, then storms illegal-instruction forever (103k+
+#     illegals, PC walking off-program): the historic rc=124 "timeout"
+#     was this runaway in DUT/ISS lockstep, NOT a clean-but-slow run.
+#     With the 2026-08-11 SMC insn-cache coherence fix the ISS honestly
+#     redecodes the clobbered bytes and diverges AT the corruption point
+#     (fail-fast ~74s wall instead of hours of lockstep derailment).
+#     Unpassable at ANY timeout by construction; a fix needs a TB
+#     irq-rate constraint or a generator handler change upstream. Keep
+#     gen_xfail, TMO=900 (fail-fast).
 #
 # Seed: generated lanes default to SEED=1 (deterministic snapshot, sweeps
 # directly comparable). Set QV_SEED=<n> to run the SAME lane list at a
@@ -232,7 +255,7 @@ gen|corev_rand_interrupt|corev_rand_interrupt|
 gen|corev_rand_interrupt_wfi|corev_rand_interrupt_wfi|
 gen|corev_rand_interrupt_wfi_mem_stress|corev_rand_interrupt_wfi_mem_stress|TMO=6000
 gen|corev_rand_interrupt_exception|corev_rand_interrupt_exception|
-gen_xfail|corev_rand_interrupt_nested|corev_rand_interrupt_nested|
+gen_xfail|corev_rand_interrupt_nested|corev_rand_interrupt_nested|TMO=900
 run|hello-world|hello-world|
 run|branch_zero|branch_zero|
 run|csr_instr_asm|csr_instr_asm|
