@@ -101,7 +101,7 @@ MICROMAMBA   := $(shell command -v micromamba 2>/dev/null)
 ifneq ($(MICROMAMBA),)
   GVRUN_ENV := $(MICROMAMBA) run -n $(GVSOC_PY_ENV)
 endif
-GVRUN := $(GVRUN_ENV) timeout 10s $(INSTALLDIR)/bin/gvrun
+GVRUN := $(GVRUN_ENV) timeout 120s $(INSTALLDIR)/bin/gvrun
 
 .PHONY: all gvsoc config-v2 trace clean distclean test
 
@@ -173,19 +173,32 @@ gvsoc:
 # make config-v2 — generate gvsoc_config.json (gvrun prepare, without running
 # the sim). The core configuration is baked into the target name, so there
 # are no --parameter knobs besides the binary.
+#
+# Parallel-safe: every `make test` lane regenerates its per-CFG json through
+# this target. The historical SHARED work dir + plain `cp` raced across
+# concurrent lanes — a pulp lane could publish the gvsoc_config.json a
+# pulp_fpu lane's prepare had just written into the same work/ directory,
+# and the bridge then booted the ISS with the wrong misa/fpu (CSR[0x301]
+# mismatch at retire #1, F-bit delta). A unique mktemp work dir per
+# invocation plus an atomic publish (tmp + mv on the same filesystem)
+# close both the cross-CFG corruption and torn reads.
 V2_TARGET ?= cv32e40p-v2-standalone
 config-v2:
 ifeq ($(BINARY),__BINARY_NOT_SET__)
 	$(error BINARY not set — use: make config-v2 BINARY=/path/to/test.elf [V2_TARGET=cv32e40p-v2-standalone-fpu])
 endif
-	mkdir -p $(WORK_DIR)
+	set -e; \
+	wd=$$(mktemp -d $(CURDIR)/work_cfg.XXXXXX); \
+	trap 'rm -rf "$$wd"' EXIT; \
 	$(GVRUN) \
 		--target=$(V2_TARGET) \
-		--work-dir=$(WORK_DIR) \
+		--work-dir=$$wd \
 		--parameter binary=$(BINARY) \
-		prepare
-	cp $(WORK_DIR)/gvsoc_config.json $(if $(GVSOC_CONFIG),$(GVSOC_CONFIG),gvsoc_config.json)
-	@echo "OK → $(if $(GVSOC_CONFIG),$(GVSOC_CONFIG),gvsoc_config.json) (target=$(V2_TARGET), binary=$(BINARY))"
+		prepare; \
+	out="$(if $(GVSOC_CONFIG),$(GVSOC_CONFIG),gvsoc_config.json)"; \
+	cp $$wd/gvsoc_config.json "$$out.tmp.$$$$"; \
+	mv "$$out.tmp.$$$$" "$$out"; \
+	echo "OK → $$out (target=$(V2_TARGET), binary=$(BINARY))"
 
 # make trace — standalone GVSOC with instruction trace → $(TRACE), a
 # diagnostic tool (behavioural ISS analysis without the DPI co-simulation).
