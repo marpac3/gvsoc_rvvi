@@ -444,6 +444,17 @@ static int engine_acquire_core(void)
     g_iss->csr.mnepc.value     = 0;
     g_iss->csr.mncause.value   = 0;
     g_iss->csr.mnstatus.value  = 0;
+    /* Delegation/S-mode registers: undeclared by the personality, hence
+     * outside Csr::reset() (same reset-scope hole as depc above), but read
+     * raw by Exception::raise (medeleg -> S-mode delegation, redirect via
+     * stvec) and Core::sret_handle (sepc). Allocation garbage here delegated
+     * sync traps and sent the ISS to 0x20202020. Belt-and-braces with the
+     * personality ctor fix - cheap, idempotent, engine-local. */
+    g_iss->csr.medeleg.value   = 0;
+    g_iss->csr.mideleg.value   = 0;
+    g_iss->csr.stvec.value     = 0;
+    g_iss->csr.sepc.value      = 0;
+    g_iss->csr.scause.value    = 0;
     g_iss->csr.scratch0        = 0;
     g_iss->csr.scratch1        = 0;
     ENGINE_LOG("forced trap/NMI CSRs to RTL reset values "
