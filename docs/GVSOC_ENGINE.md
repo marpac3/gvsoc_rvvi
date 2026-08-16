@@ -356,7 +356,8 @@ step-and-compare:
 
 - `gdbserver_regs_get` exposes 33 registers — 32 GPRs plus
   `reg[32] = current_insn` (the PC) — and zero CSRs, while the compare needs
-  ~19 CSRs (mstatus, mtvec, mcause, mepc, ...);
+  the full enabled CSR set (mstatus, mtvec, mcause, mepc, the FP and debug
+  CSRs, the retired-instruction counters, ...);
 - the single-register `gdbserver_reg_get` is unimplemented (prints and
   returns 0), and `reg_set` only handles the PC;
 - `gdbserver_stepi` does not execute the instruction: it raises the step

@@ -248,6 +248,12 @@ static void build_csr_map(Cv32e40pCsr &csr)
     /* Debug CSRs - dcsr/depc are raw iss_reg_t, not CsrReg */
     g_csr_value_map[0x7B0] = &csr.dcsr;             /* dcsr */
     g_csr_value_map[0x7B1] = &csr.depc;             /* dpc */
+    /* dscratch0/1: the personality 0x7B2/0x7B3 front-ends are debug-mode-only
+     * access VIEWS backed by the base scratch registers - map the backing
+     * store so the per-retire compare and the resync forces reach the real
+     * state. */
+    g_csr_value_map[0x7B2] = &csr.scratch0;         /* dscratch0 */
+    g_csr_value_map[0x7B3] = &csr.scratch1;         /* dscratch1 */
 
     /* FPU CSR - fcsr.raw maps the full register (fflags+frm) */
     g_csr_value_map[0x003] = &csr.fcsr.raw;         /* fcsr */
@@ -260,12 +266,16 @@ static void build_csr_map(Cv32e40pCsr &csr)
     g_csr_value_map[0xF14] = &csr.mhartid_csr.value;   /* mhartid */
 
     /* Counter CSRs. With counting enabled mcycle.value is the personality's
-     * frozen/offset anchor, not the live count - the co-sim compares only
-     * mcountinhibit among these, so the anchor is what a resync needs. */
+     * frozen/offset anchor, not the live count. minstret/minstreth ARE the
+     * live count: Cv32e40pCsr::hpm_commit increments them per retired
+     * instruction with the RTL semantics, so they carry the compared value
+     * directly. 0xC82 is the instreth user-mode shadow the personality
+     * aliases onto minstreth (instreth_alias_access). */
     g_csr_value_map[0xB00] = &csr.mcycle.value;     /* mcycle */
     g_csr_value_map[0xB80] = &csr.mcycleh.value;    /* mcycleh */
     g_csr_value_map[0xB02] = &csr.minstret.value;   /* minstret */
     g_csr_value_map[0xB82] = &csr.minstreth.value;  /* minstreth */
+    g_csr_value_map[0xC82] = &csr.minstreth.value;  /* instreth shadow */
     g_csr_value_map[0x320] = &csr.mcountinhibit.value; /* mcountinhibit */
 
     /* NMI CSRs */

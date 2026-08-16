@@ -140,10 +140,13 @@ module rvvi_trace2api
 
     // Exception CSRs pushed explicitly on a trap retire (step 5 below).
     // Must match is_trap_csr() / TRAP_CSR_* in rvvi_api2gvsoc.cpp.
-    localparam logic [11:0] CSR_MSTATUS = 12'h300;
-    localparam logic [11:0] CSR_MEPC    = 12'h341;
-    localparam logic [11:0] CSR_MCAUSE  = 12'h342;
-    localparam logic [11:0] CSR_MTVAL   = 12'h343;
+    localparam logic [11:0] CSR_MSTATUS   = 12'h300;
+    localparam logic [11:0] CSR_MEPC      = 12'h341;
+    localparam logic [11:0] CSR_MCAUSE    = 12'h342;
+    localparam logic [11:0] CSR_MTVAL     = 12'h343;
+    localparam logic [11:0] CSR_MINSTRET  = 12'hB02;
+    localparam logic [11:0] CSR_MINSTRETH = 12'hB82;
+    localparam logic [11:0] CSR_INSTRETH  = 12'hC82;
 
     // Debug counters: one error budget per compare category, so one noisy
     // category cannot exhaust the log and hide the others.
@@ -271,6 +274,17 @@ module rvvi_trace2api
                         // are handled in the normal-retire path below (rvfi_intr).
                         void'(rvviRefEventStep(h));
                     end else if (!is_flush_artifact) begin
+                        // Retired-instruction counters advance WITHOUT a csr_wb
+                        // flag (the wb mask covers CSR-instruction writes, not
+                        // the per-retire increment), so the sparse scan in step
+                        // 3 never refreshes them.  Push the continuously-bound
+                        // values unconditionally on every genuine retire: the
+                        // bridge compares minstret/minstreth (0xB02/0xB82) and
+                        // the instreth user alias (0xC82) against the ISS live
+                        // count.
+                        rvviDutCsrSet(h, CSR_MINSTRET,  rvvi.csr[h][r][CSR_MINSTRET]);
+                        rvviDutCsrSet(h, CSR_MINSTRETH, rvvi.csr[h][r][CSR_MINSTRETH]);
+                        rvviDutCsrSet(h, CSR_INSTRETH,  rvvi.csr[h][r][CSR_INSTRETH]);
                         rvviDutRetire(h, rvvi.pc_rdata[h][r], rvvi.insn[h][r], rvvi.debug_mode[h][r]);
 `ifdef USE_GVSOC
                         // Informed IRQ injection (gated +rvvi_informed_irq).  The first

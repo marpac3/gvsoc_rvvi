@@ -259,9 +259,10 @@ to anything but GVSOC, `RVVI_TRACE=YES` is ignored and make prints
   longer raises a spurious inexact on an infinite FMA result.
 - No single front-end target selects the mode (something like
   `make trace LEVEL=...`); use the command lines above.
-- The in-simulation GPR/FPR compare is currently neutralized (see
-  "Known fragilities" in `ARCHITECTURE.md`), so diffing the two trace files
-  is the practical way to catch register-value divergences.
+- The in-simulation GPR/FPR compare covers the *written* set only (see
+  "Known fragilities" in `ARCHITECTURE.md`): a stale value in a register
+  the DUT never rewrites stays latent, and diffing the two trace files is
+  the practical way to catch it.
 - The format allows quoted `'…'` comment annotations, ignored by the
   checker; disassembly, symbol names or ABI register names could be
   attached later without changing the machine content.

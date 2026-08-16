@@ -194,15 +194,20 @@ Categories are `PC`, `GPR`, `GPR-written`, `FPR`, `INSN` and `CSR[addr]`.
 The first mismatch line is the one that matters — everything after the first
 divergence is usually noise from the two machines drifting apart.
 
-Two things to keep in mind when a run is green. The TB's "comparison
-performed" sanity counters count calls, not effective compares: GPR/FPR
-comparison is currently neutralized by the write-masks the TB clears before
-the compare call, so PC and the enabled CSR set are the effective divergence
-detectors today (see "Known fragilities" in
-[`ARCHITECTURE.md`](ARCHITECTURE.md)). And performance-counter CSR reads are
-synchronized from the DUT by default (`CV_RVVI_VOLATILE_CSR_SYNC=1`), which
-masks genuine counter divergences by design; disable the knob to measure
-them.
+Two things to keep in mind when a run is green. GPR/FPR comparison runs on
+the *written* set only (the RVFI write-back masks): a register the DUT never
+rewrites after a divergence is not re-checked until something writes it
+again. The effective divergence detectors are PC, the written GPR/FPR set,
+the instruction binary (the ISS-side encoding travels with the commit ring;
+rows served without an ISS execution — repairs, pins — skip the compare and
+are not counted) and the enabled CSR set, which since the compare-hardening
+pass includes fflags/frm/fcsr in full, dscratch0/dscratch1 and the modeled
+retired-instruction counters (minstret/minstreth and the instreth alias).
+And performance-counter reads of the CSRs still declared volatile by the TB
+(cycle/mcycle and the hpm bank) are synchronized from the DUT by default
+(`CV_RVVI_VOLATILE_CSR_SYNC=1`), which masks divergences on those counters
+by design; disable the knob to measure them. The modeled counters above are
+NOT synchronized: a read of minstret lands in the honest compare.
 
 ## From a red test to a cause
 

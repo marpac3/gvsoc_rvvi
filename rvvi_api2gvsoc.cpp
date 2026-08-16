@@ -3356,6 +3356,13 @@ static void sync_volatile_counter_read(void)
     uint32_t csr = insn >> 20;
     if (!csr_is_perf_counter(csr))
         return;
+    /* Only counters the TB declared VOLATILE get the read sync. The modeled
+     * ones (minstret/minstreth and the instreth alias) are a live count in
+     * the ISS and stay honestly compared - syncing their read destination
+     * from the DUT would paper over the very model the CSR compare
+     * validates. */
+    if (!g_csr_volatile.count(csr))
+        return;
     uint32_t rd = (insn >> 7) & 0x1f;
     if (rd == 0 || !(g_retire.gpr_mask & (1u << rd)))
         return;                      /* no rd write reported by the DUT */
@@ -3365,9 +3372,10 @@ static void sync_volatile_counter_read(void)
     gvsoc_engine_set_gpr(rd, g_dut_gpr[rd]);
     g_volatile_sync_count++;
     BRIDGE_LOG_HOT("volatile counter CSR[0x%03x] read @ PC=0x%08x: "
-                   "x%u ISS=0x%08x -> DUT=0x%08x (sync #%llu)",
+                   "x%u ISS=0x%08x -> DUT=0x%08x (sync #%llu, iss_pc=0x%08x)",
                    csr, g_retire.pc, rd, iss_val, g_dut_gpr[rd],
-                   (unsigned long long)g_volatile_sync_count);
+                   (unsigned long long)g_volatile_sync_count,
+                   gvsoc_engine_get_pc());
 }
 
 /* Volatile-memory read sync (see g_mem_volatile above). Runs after the ISS
