@@ -147,6 +147,16 @@ uint32_t gvsoc_engine_get_pc(void);
 uint32_t gvsoc_engine_get_insn(void);
 
 /**
+ * Injectable-boundary probe: 1 with *pc = the next unexecuted instruction
+ * (exec.current_insn) when the ISS sits on a clean dispatch boundary -
+ * no queued or held commits, no pending LSU access, not in WFI or debug.
+ * On that boundary *pc is the mepc a take injected NOW would produce, so
+ * the bridge can certify a DUT-informed async entry before injecting.
+ * 0 when the ISS is mid-burst (v1 stub: always 0).
+ */
+int gvsoc_engine_take_boundary(uint32_t *pc);
+
+/**
  * Force the ISS program counter.
  *
  * Sets current_insn to the given value and flushes the instruction prefetcher
@@ -309,11 +319,27 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id);
  *                        the bridge: mid-batch the engine pc is not the
  *                        boundary yet). 0 keeps the legacy unconditional
  *                        same-row behaviour.
+ * @param expected_dpc    the DUT's dpc (mirror value): for a plain kill
+ *                        entry it IS the kill boundary, so an ISS whose
+ *                        current_insn differs entered off the DUT's
+ *                        boundary and the entry is refused loud (rc=0, no
+ *                        certification) - the "clean but wrong boundary"
+ *                        C4 net. Exempt: cause 1 (dpc = the ebreak's own
+ *                        pc while current_insn sits past it, structural
+ *                        retire-vs-capture offset) and recognized
+ *                        collisions (collide_irq_id >= 0).
+ * @param expected_dpc_valid 0 disables the expected_dpc certification
+ *                        (mirror value unavailable, or an unrecognized
+ *                        entry collision where dpc is an un-executed entry
+ *                        target the boundary legitimately precedes - the
+ *                        bridge repairs those row-locally instead).
  * @return 1 if the debug entry landed a commit, 0 otherwise.
  */
 int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id,
                                          uint32_t collide_mepc,
-                                         int collide_certify);
+                                         int collide_certify,
+                                         uint32_t expected_dpc,
+                                         int expected_dpc_valid);
 
 #ifdef __cplusplus
 }

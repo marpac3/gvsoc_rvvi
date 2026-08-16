@@ -113,6 +113,11 @@ static bool           g_finished    = false;
 /* Clock period of the cv32e40p-v2-standalone platform (50 MHz), a constant
  * of the model: it must match the platform definition, not a runtime knob. */
 static constexpr int64_t g_clock_ps = 20000;
+/* Sub-core-cycle step used while an asynchronous take is imminent (see
+ * engine_advance_to_commit): the engine regains control between core
+ * dispatches, so the commit stream can be stopped exactly at the boundary
+ * the DUT will prove. Below the core cycle (~3 ns) by construction. */
+static constexpr int64_t g_clock_ps_fine = 1000;
 
 static Iss           *g_iss         = nullptr;
 
@@ -659,7 +664,15 @@ static void retire_commit(iss_reg_t retired_pc, const char *how, int cycles)
  * including the one that finished the simulation. */
 static bool engine_advance_to_commit(int *cycles)
 {
-    for (int i = 0; i <= STEP_MAX_CYCLES; i++)
+    /* Stall budget is TIME, not iterations: with the sub-cycle quantum
+     * active (take imminent) an iteration advances 1/20 of a platform
+     * quantum, and an iteration-counted bound would shrink the budget by
+     * the same factor - measured on the +reset_debug lane, whose 620-cycle
+     * first-fetch stall overran the shrunken window and failed the initial
+     * haltreq injection. */
+    const int64_t budget_ps = (int64_t)STEP_MAX_CYCLES * (int64_t)g_clock_ps;
+    int64_t       spent_ps  = 0;
+    for (;;)
     {
         uint64_t backlog = g_iss->timing.commit_push - g_iss->timing.commit_pop;
         if (backlog > 0)
@@ -673,22 +686,56 @@ static bool engine_advance_to_commit(int *cycles)
                 return false;
             }
             if (cycles)
-                *cycles = i;
+                *cycles = (int)(spent_ps / (int64_t)g_clock_ps);
             return true;
         }
 
-        if (g_finished || i == STEP_MAX_CYCLES)
+        if (g_finished || spent_ps >= budget_ps)
             break;
 
         /* Re-assert skip_irq_check before every step (one-shot, consumed
          * inside Irq::check).  Synchronous debug conditions - the
          * execute-address trigger - are evaluated by the model AHEAD of
          * its internal gate, so a suppressed dispatch still enters debug
-         * at an armed tdata2 boundary; no engine carve-out is needed. */
+         * at an armed tdata2 boundary; no engine carve-out is needed.
+         *
+         * The one-shot alone is NOT airtight: one 20 ns platform quantum
+         * runs several core dispatches (core cycle ~3 ns) and only the
+         * first consumes the one-shot - the later dispatches used to take
+         * pending wire IRQs / re-arm haltreq on their own, racing the
+         * DUT's entry boundary (the async trap-entry seam family).  The
+         * level hold dpi_async_hold closes that window inside
+         * Cv32e40pIrq::check(); re-asserted here so the guard heals even
+         * if a caller toggled it out of band. */
         if (g_dpi_skip_irq)
+        {
             g_iss->exec.skip_irq_check = true;
+            g_iss->irq.dpi_async_hold  = true;
+        }
 
-        g_gvsoc->step(g_clock_ps);
+        /* While an asynchronous take is imminent - an enabled wired
+         * interrupt pending with mstatus.MIE set, or a debug request
+         * armed/held outside debug mode - step at sub-cycle granularity so
+         * the loop regains control at the FIRST commit, before the next
+         * dispatch runs.  With the async hold up the model cannot stop at
+         * the take boundary by itself, and a full 20 ns quantum would
+         * over-execute up to ~6 killed-path instructions (phantom
+         * writebacks and stores) that the state repair then has to paper
+         * over.  Fine stepping bounds the overrun to zero dispatches and
+         * lets the DUT-boundary injection (take_irq/take_debug) certify
+         * `current_insn == mepc` in the common case.  The window lasts
+         * from the wire rise to the DUT's entry row (a few retires), so
+         * the extra step calls are negligible. */
+        bool take_imminent =
+            ((g_iss->csr.mie.value & g_iss->csr.mip.value &
+              Cv32e40pIrq::IRQ_MASK) != 0 && g_iss->csr.mstatus.mie) ||
+            ((g_iss->irq.req_debug || g_iss->irq.haltreq_level) &&
+             !g_iss->exec.debug_mode);
+
+        int64_t quantum = take_imminent ? (int64_t)g_clock_ps_fine
+                                        : (int64_t)g_clock_ps;
+        g_gvsoc->step(quantum);
+        spent_ps += quantum;
     }
     return false;
 }
@@ -859,9 +906,36 @@ uint32_t gvsoc_engine_get_pc(void)
     return (uint32_t)g_retired_pc;
 }
 
+/* Injectable-boundary probe for the DUT-informed async-entry take: returns 1
+ * with *pc = exec.current_insn when the ISS sits exactly on a dispatch
+ * boundary with nothing in flight - no queued commits (every served retire
+ * consumed), no held commit-FIFO entries, no pending LSU access, not parked
+ * in WFI, not in debug mode. On such a boundary current_insn is the next
+ * unexecuted instruction, i.e. the mepc a take at this boundary would
+ * produce; the bridge certifies it against the DUT row's fresh mepc before
+ * injecting. Returns 0 (pc untouched) whenever any of that is pending: the
+ * ISS is mid-burst and only the repair fallback can serve the row. */
+int gvsoc_engine_take_boundary(uint32_t *pc)
+{
+    if (!g_running || !g_gvsoc || g_finished || !g_iss || !pc)
+        return 0;
+    if (g_iss->timing.commit_push != g_iss->timing.commit_pop)
+        return 0;
+    if (g_iss->timing.inflight_pending())
+        return 0;
+    if (g_iss->lsu.get_nb_pending_accesses() > 0)
+        return 0;
+    if (g_iss->exec.wfi.get() || g_iss->exec.debug_mode)
+        return 0;
+    *pc = (uint32_t)g_iss->exec.current_insn;
+    return 1;
+}
+
 uint32_t gvsoc_engine_get_insn(void)
 {
-    /* Opcode is not captured in DPI mode; always 0. */
+    /* Raw encoding of the last popped commit (16-bit for RVC rows); 0 when
+     * the last retire was served without a pop (pin, virtual consume,
+     * deferral) - the INS compare skips those rows. */
     return g_retired_opcode;
 }
 
@@ -896,9 +970,13 @@ void gvsoc_engine_set_pc(uint32_t pc)
                 /* skip_irq_check is one-shot, consumed every dispatch cycle:
                  * re-assert per step or the ISS takes the pending wire-driven
                  * IRQ on its own mid-drain (same idiom as the other step
-                 * loops in this file). */
+                 * loops in this file). The level hold covers the dispatches
+                 * the one-shot cannot reach within a quantum. */
                 if (g_dpi_skip_irq)
+                {
                     g_iss->exec.skip_irq_check = true;
+                    g_iss->irq.dpi_async_hold  = true;
+                }
                 g_gvsoc->step(g_clock_ps);
                 steps++;
             }
@@ -946,7 +1024,13 @@ void gvsoc_engine_skip_irq(bool skip)
 {
     g_dpi_skip_irq = skip;
     if (g_iss)
+    {
         g_iss->exec.skip_irq_check = skip;
+        /* Level companion of the one-shot: closes the mid-quantum window
+         * where dispatches past the first ran unguarded (see
+         * engine_advance_to_commit and Cv32e40pIrq::dpi_async_hold). */
+        g_iss->irq.dpi_async_hold = skip;
+    }
 }
 
 bool gvsoc_engine_is_wfi(void)
@@ -1338,9 +1422,12 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
     g_iss->irq.req_debug     = false;
     g_iss->irq.haltreq_level = false;  /* check() re-arms from a held-high level */
 
-    /* Lower the defense for ONE step (see window guarantee above). */
+    /* Lower the defense for ONE step (see window guarantee above): the
+     * one-shot, and the level hold that keeps the ladder parked between
+     * injection windows. */
     g_dpi_skip_irq = false;
     g_iss->exec.skip_irq_check = false;
+    g_iss->irq.dpi_async_hold  = false;
 
     ENGINE_LOG_HOT("take_irq: arming irq id=%d (mip 0x%08x->0x%08x), single-step inject",
                mcause_irq_id, (unsigned)old_mip,
@@ -1366,7 +1453,11 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
     int rc = 0;
     try
     {
-        for (int i = 0; i < STEP_MAX_CYCLES; i++)
+        /* Sub-cycle quanta: keep the TIME budget of the historical
+         * coarse-quantum loop, not its iteration count. */
+        const int inject_iters =
+            STEP_MAX_CYCLES * (int)(g_clock_ps / g_clock_ps_fine);
+        for (int i = 0; i < inject_iters; i++)
         {
             if (g_iss->timing.commit_push - g_iss->timing.commit_pop > stale)
             {
@@ -1375,7 +1466,13 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
             }
             if (g_finished)
                 break;
-            g_gvsoc->step(g_clock_ps);
+            /* Sub-cycle stepping: the loop regains control right at the
+             * vector-slot commit, before any follower dispatch runs. A
+             * full platform quantum used to execute past the entry and
+             * push follower commits, deferring the entry row's state
+             * compare to the burst tail and moving the ISS off the clean
+             * boundary the next row's injection may need. */
+            g_gvsoc->step(g_clock_ps_fine);
         }
     }
     catch (const std::exception &e)
@@ -1400,6 +1497,7 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
      * shutdown runs on this call path. */
     g_dpi_skip_irq = saved_dpi_skip;
     g_iss->exec.skip_irq_check = saved_dpi_skip;
+    g_iss->irq.dpi_async_hold  = saved_dpi_skip;
 
     /* haltreq_level mirrors the wire, not a request: always restore it (the
      * next net sync only fires on a level CHANGE). */
@@ -1436,7 +1534,9 @@ int gvsoc_engine_take_irq_for_one_step(int mcause_irq_id)
 
 int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id,
                                          uint32_t collide_mepc,
-                                         int collide_certify)
+                                         int collide_certify,
+                                         uint32_t expected_dpc,
+                                         int expected_dpc_valid)
 {
     if (!g_running || !g_gvsoc || g_finished || !g_iss)
         return 0;
@@ -1498,9 +1598,12 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id,
     /* Remember the engine-level defense so we can restore it exactly. */
     bool saved_dpi_skip = g_dpi_skip_irq;
 
-    /* Lower the defense for ONE step (same window guarantee as take_irq). */
+    /* Lower the defense for ONE step (same window guarantee as take_irq):
+     * one-shot plus the level hold, which gates the cause-3 entry between
+     * injection windows. */
     g_dpi_skip_irq = false;
     g_iss->exec.skip_irq_check = false;
+    g_iss->irq.dpi_async_hold  = false;
 
     /* The debug entry only happens inside Cv32e40pIrq::check(), which the
      * fast dispatch handler never calls. No forcing is needed here: the
@@ -1556,6 +1659,32 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id,
                    "debug-entry boundary, dpc cannot be placed before it",
                    (unsigned)g_iss->exec.current_insn);
     }
+    /* DUT-informed boundary certification (C4 by-seed): for a non-ebreak,
+     * non-collision entry the DUT's dpc IS the kill boundary, so an ISS
+     * parked elsewhere must not certify even when its own boundary is clean
+     * (no stale commits, nothing inflight) - "clean but WRONG" was exactly
+     * the un-diagnosed shape (a phantom breakpoint exception parked the ISS
+     * on mtvec, the entry certified there, and only the mepc compare at the
+     * ROM rows surfaced it 50 rows deep). cause 1 is exempt (dpc = the
+     * ebreak's own pc while current_insn sits past it - the structural
+     * retire-vs-capture offset); a collide take is exempt too (pre-take
+     * boundary == collide_mepc, certified separately); the bridge waives
+     * the check (expected_dpc_valid=0) for unrecognized entry collisions,
+     * where dpc is an un-executed entry target. A WFI-parked ISS is exempt
+     * like everywhere else in the boundary bookkeeping (take_boundary
+     * returns 0, the inflight check above skips wfi): its current_insn is
+     * not a comparable kill boundary and the WFI diagnostic above already
+     * covers the park. */
+    if (expected_dpc_valid && collide_irq_id < 0 && (dcsr_cause & 7) != 1 &&
+        !g_iss->exec.wfi.get() &&
+        (uint32_t)g_iss->exec.current_insn != expected_dpc)
+    {
+        at_boundary = false;
+        ENGINE_ERR("take_debug: ISS boundary 0x%08x != DUT dpc 0x%08x "
+                   "(cause=%d) - entry not on the DUT's kill boundary",
+                   (unsigned)g_iss->exec.current_insn, expected_dpc,
+                   dcsr_cause);
+    }
 
     /* Step until the entry lands its first debug-ROM commit, and LEAVE the
      * commit queued: the caller's step-and-compare serves it against the
@@ -1582,7 +1711,13 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id,
     uint64_t base_trap_seq  = g_iss->timing.trap_seq;
     try
     {
-        for (int i = 0; i < STEP_MAX_CYCLES; i++)
+        /* Sub-cycle quanta: keep the TIME budget of the historical
+         * coarse-quantum loop, not its iteration count (measured: the
+         * +reset_debug initial haltreq entry sits behind a 620-cycle
+         * first-fetch stall and overran the iteration-counted window). */
+        const int inject_iters =
+            STEP_MAX_CYCLES * (int)(g_clock_ps / g_clock_ps_fine);
+        for (int i = 0; i < inject_iters; i++)
         {
             /* The entry is an EVENT; exec.debug_mode is a LEVEL. Polling the
              * level alone misses entries whose flag is not up at any poll
@@ -1654,7 +1789,10 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id,
             }
             if (g_finished)
                 break;
-            g_gvsoc->step(g_clock_ps);
+            /* Sub-cycle stepping, as in take_irq: the loop observes the
+             * entry edge and the first ROM commit at dispatch granularity,
+             * with no follower dispatched past them. */
+            g_gvsoc->step(g_clock_ps_fine);
         }
     }
     catch (const std::exception &e)
@@ -1671,6 +1809,7 @@ int gvsoc_engine_take_debug_for_one_step(int dcsr_cause, int collide_irq_id,
     /* Re-assert the defense: the next normal step() must not take IRQs. */
     g_dpi_skip_irq = saved_dpi_skip;
     g_iss->exec.skip_irq_check = saved_dpi_skip;
+    g_iss->irq.dpi_async_hold  = saved_dpi_skip;
 
     /* req_debug is a LATCHED request only consumed by a successful entry in
      * Cv32e40pIrq::check(). Left armed after a failed injection, it would

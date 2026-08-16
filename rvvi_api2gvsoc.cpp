@@ -252,10 +252,27 @@ static const uint32_t CSR_DPC          = 0x7B1U;  /* debug PC: forced from DUT a
  * fires on the 0->1 transition (first debug-ROM retire). */
 static bool g_prev_dut_debug = false;
 
+/* Per-row: the repair-row redirect re-parked the ISS on the DUT's dpc for
+ * THIS row (see consume_forced_row_redirect).  The redirect writes dpc into
+ * exec.current_insn, which is the very value the entry certification uses as
+ * its oracle - certifying there compares a value against itself.  Cleared
+ * unconditionally at every take_retire_event so it can never leak onto a
+ * later row (a stale true would waive the certification on an unrelated
+ * row). */
+static bool g_redirect_dpc_this_row = false;
+
 static inline bool is_trap_csr(uint32_t addr)
 {
     return addr == TRAP_CSR_MSTATUS || addr == TRAP_CSR_MEPC ||
            addr == TRAP_CSR_MCAUSE  || addr == TRAP_CSR_MTVAL;
+}
+
+/* ebreak (0x00100073) or c.ebreak (0x9002 in the low half-word): the retire
+ * detectors below test this on three different rows, keep the encoding in one
+ * place so an RVC decode change cannot desynchronize them. */
+static inline bool is_ebreak_insn(uint32_t insn)
+{
+    return insn == 0x00100073u || (insn & 0xFFFFu) == 0x9002u;
 }
 
 /* --------------------------------------------------------------------------
@@ -375,6 +392,74 @@ static bool     g_tracer_informed = false;
 static uint64_t g_fid_informed_takes = 0;  /* takes the ISS computed        */
 static uint64_t g_fid_informed_fails = 0;  /* fell back to reactive resync  */
 static uint64_t g_fid_informed_wfi   = 0;  /* left to reactive (ISS in WFI) */
+
+/* Mainline DUT-informed async-entry take (no plusarg): the entry row's own
+ * fresh mcause/mepc write-set drives a single-step inject when the ISS sits
+ * exactly on the kill boundary; the reactive repair stays the fallback. */
+static uint64_t g_entry_informed_takes         = 0;
+static uint64_t g_entry_informed_fails         = 0;  /* inject refused by the model */
+static uint64_t g_entry_informed_boundary_miss = 0;  /* ISS mid-burst -> repair */
+static uint64_t g_entry_informed_adjacent      = 0;  /* candidate from sticky mirrors */
+
+/* Reactive repair, virtual row consume: the repaired row's architectural
+ * effects are taken from the DUT write-set (forces), the row's instruction
+ * is NOT executed by the ISS - executing it on top of the forced end-of-row
+ * state applied the row twice, permanently corrupting non-idempotent entry
+ * instructions (the csrrw rd,rs,mscratch handler prologue: the (GPR,
+ * mscratch) pair came out SWAPPED - the trap-entry seam signature). The
+ * flag redirects the ISS onto the NEXT row's pc before that row steps. */
+static bool     g_forced_row_redirect = false;
+static uint64_t g_forced_row_consumes = 0;
+/* Defined with the force-resync helpers (section 8, inside the extern "C"
+ * region, hence the matching linkage here); consumed by rvviDutRetire /
+ * rvviDutTrap right after the retire event is committed. */
+extern "C" { static void consume_forced_row_redirect(void); }
+
+/* Defined in Section 7 (mstatus force = MIE/MPIE splice only); used earlier
+ * by the informed debug entry's row-local repair. */
+extern "C" { static void force_mstatus_async_bits(uint32_t dut_val,
+                                                  const char *why); }
+
+/* mstatus.FS write-back lag tolerance window (see rvviRefCsrCompare): the
+ * RTL updates mstatus.FS at the APU write-back, 1-8 retires after a
+ * non-pipelined DIVSQRT op retires, while the model updates it atomically
+ * at the retire. Software cannot observe the window (csr_apu_stall holds
+ * every CSR access while DIVSQRT is in flight), so a bounded FS/SD-only
+ * skew with the model side already dirty is an observation artifact of the
+ * RVFI boundary, not a divergence. Opened at each fdiv/fsqrt retire,
+ * closed on convergence or after FS_LAG_WINDOW_RETIRES. */
+static uint32_t g_fs_lag_window    = 0;
+static uint64_t g_fs_lag_tolerated = 0;
+/* A convergence only ends a lag EPISODE (diverged -> re-converged). The
+ * opening row itself still compares converged - the RTL's FS dip starts on
+ * the FOLLOWING rows (measured on the interrupt_debug ROM fdiv: both sides
+ * dirty on the fdiv row, DUT dips to Initial one row later) - so a close on
+ * any converged row killed the window before the lag it was opened for. */
+static bool     g_fs_lag_seen_diverged = false;
+static constexpr uint32_t FS_LAG_WINDOW_RETIRES = 10;
+/* Latency-aware extension (fv_final_20260817 FS_SD_BEYOND_WIN, 5 lanes):
+ * with FPU_ADDMUL_LAT/FPU_OTHERS_LAT > 0 EVERY APU op - not only the
+ * non-pipelined DIVSQRT - gets a write-back that trails its retire, so the
+ * DUT's FS commit lags behind the model on ordinary FP blocks too (campaign
+ * evidence: first mismatch at retire #25 with NO window ever opened - the
+ * DIVSQRT-only trigger never fired). The config's APU latency reaches the
+ * bridge via CV_RVVI_APU_LAT (set per config by the runner, see
+ * test/full_verif.sh; 0 = base configs, behaviour unchanged). When set:
+ *   - the window opens on every APU-class FP op (OP-FP + FMADD family);
+ *   - its size is FS_LAG_WINDOW_RETIRES + FS_LAG_RETIRES_PER_LAT_CYCLE *
+ *     lat: the base 10 covers the 1-8 retire DIVSQRT drain at lat 0, and
+ *     each extra APU cycle stretches the drain of a back-to-back FP block
+ *     by up to one retire per queued op - K=5 doubles the window at lat 2
+ *     (10 -> 20, the ~2x the campaign triage measured) and gives 15 at
+ *     lat 1, monotonic and conservative. The tolerance itself is unchanged
+ *     (FS/SD-confined, model side dirty), so a wider window cannot mask a
+ *     non-FS divergence. */
+static uint32_t g_apu_lat = 0;
+static constexpr uint32_t FS_LAG_RETIRES_PER_LAT_CYCLE = 5;
+static inline uint32_t fs_lag_window_size(void)
+{
+    return FS_LAG_WINDOW_RETIRES + FS_LAG_RETIRES_PER_LAT_CYCLE * g_apu_lat;
+}
 
 /* --------------------------------------------------------------------------
  * Phase-shift re-alignment on synchronous exceptions.
@@ -576,9 +661,48 @@ static void take_retire_event(uint64_t dutPc, uint64_t dutInsBin, bool is_trap)
     g_retire.fpr_mask = g_pending.fpr_mask;
     g_retire.csr_writes.swap(g_pending.csr_writes);
 
+    /* Per-row flag: armed later by consume_forced_row_redirect (called right
+     * after this function on both the retire and the trap path).  Cleared
+     * here unconditionally - never inside a branch. */
+    g_redirect_dpc_this_row = false;
+
     g_pending.gpr_mask = 0;
     g_pending.fpr_mask = 0;
     g_pending.csr_writes.clear();
+
+    /* mstatus.FS lag window bookkeeping (see rvviRefCsrCompare): count the
+     * window down per retire; a retiring fdiv.s/fsqrt.s (OP-FP, funct7
+     * 0x0C/0x2C - the non-pipelined DIVSQRT ops whose APU write-back trails
+     * the retire by 1-8 rows) re-opens it. */
+    if (g_fs_lag_window > 0)
+        g_fs_lag_window--;
+    {
+        uint32_t opcode = g_retire.insn & 0x7Fu;
+        bool opens = false;
+        if (opcode == 0x53u) {
+            uint32_t funct7 = g_retire.insn >> 25;
+            /* Non-pipelined DIVSQRT: write-back trails at every latency. */
+            opens = (funct7 == 0x0Cu || funct7 == 0x2Cu);
+            /* Latency configs: every OP-FP write-back trails the retire. */
+            if (g_apu_lat > 0)
+                opens = true;
+        } else if (g_apu_lat > 0 &&
+                   (opcode == 0x43u || opcode == 0x47u ||
+                    opcode == 0x4Bu || opcode == 0x4Fu)) {
+            /* FMADD/FMSUB/FNMSUB/FNMADD go through the APU too. */
+            opens = true;
+        }
+        if (opens) {
+            g_fs_lag_window        = fs_lag_window_size();
+            g_fs_lag_seen_diverged = false;
+            static uint64_t open_log = 0;
+            if (++open_log <= 5)
+                BRIDGE_LOG("FS-lag window opened @ retire #%llu (insn 0x%08x, "
+                           "%u retires)",
+                           (unsigned long long)g_metric_retires, g_retire.insn,
+                           g_fs_lag_window);
+        }
+    }
 
     if (g_row_dump_fp) {
         uint32_t iss_mstatus = 0, iss_mcause = 0;
@@ -819,6 +943,30 @@ bool_t rvviRefInit(const char *programPath)
                    g_mismatch_log_max == 0 ? " (unlimited)" : "");
     }
 
+    /* APU latency of the DUT build (FPU_ADDMUL_LAT/FPU_OTHERS_LAT) for the
+     * latency-aware FS-lag window. The define is compile-time only in the
+     * TB, so the runner exports it per config (test/full_verif.sh maps
+     * *_1cyclat -> 1, *_2cyclat -> 2; single-lane runs: prefix the make
+     * command with CV_RVVI_APU_LAT=<n>). Default 0 = base configs,
+     * historical behaviour bit-identical. Malformed values keep 0. */
+    {
+        g_apu_lat = 0;
+        const char *v = getenv("CV_RVVI_APU_LAT");
+        if (v && v[0] != '\0') {
+            char *end = nullptr;
+            unsigned long parsed = strtoul(v, &end, 10);
+            if (end != nullptr && *end == '\0' && parsed <= 16)
+                g_apu_lat = (uint32_t)parsed;
+            else
+                BRIDGE_ERR("CV_RVVI_APU_LAT='%s' is not a small number - "
+                           "keeping 0 (base FS-lag window)", v);
+        }
+        if (g_apu_lat > 0)
+            BRIDGE_LOG("APU latency: %u cycles - FS-lag window %u retires, "
+                       "opened on every APU-class FP op", g_apu_lat,
+                       fs_lag_window_size());
+    }
+
     /* Row dump (opt-in): one line per DUT row for offline seam analysis.
      * Close any handle left open by a previous rvviRefInit (multi-run vsim
      * session) so a re-init neither leaks the FILE* nor keeps appending to
@@ -879,6 +1027,15 @@ bool_t rvviRefInit(const char *programPath)
     g_volatile_sync_count = 0;
     g_volatile_mem_sync_count = 0;
     g_dpc_force_count     = 0;
+    g_entry_informed_takes         = 0;
+    g_entry_informed_fails         = 0;
+    g_entry_informed_boundary_miss = 0;
+    g_entry_informed_adjacent      = 0;
+    g_forced_row_redirect = false;
+    g_forced_row_consumes = 0;
+    g_fs_lag_window        = 0;
+    g_fs_lag_tolerated     = 0;
+    g_fs_lag_seen_diverged = false;
     g_mem_volatile.clear();
 
     if (programPath && strlen(programPath) > 0) {
@@ -986,6 +1143,20 @@ bool_t rvviRefShutdown(void)
     BRIDGE_LOG("  retires/sec    : %.0f", retires_per_sec);
     if (g_force_resync_count > 0)
         BRIDGE_LOG("  IRQ resyncs    : %llu", (unsigned long long)g_force_resync_count);
+    if (g_entry_informed_takes > 0 || g_entry_informed_fails > 0 ||
+        g_entry_informed_boundary_miss > 0)
+        BRIDGE_LOG("  entry-informed takes : %llu (adjacent-row %llu, fails %llu, "
+                   "boundary miss %llu)",
+                   (unsigned long long)g_entry_informed_takes,
+                   (unsigned long long)g_entry_informed_adjacent,
+                   (unsigned long long)g_entry_informed_fails,
+                   (unsigned long long)g_entry_informed_boundary_miss);
+    if (g_forced_row_consumes > 0)
+        BRIDGE_LOG("  repair rows consumed virtually : %llu",
+                   (unsigned long long)g_forced_row_consumes);
+    if (g_fs_lag_tolerated > 0)
+        BRIDGE_LOG("  mstatus FS-lag rows tolerated : %llu",
+                   (unsigned long long)g_fs_lag_tolerated);
     if (g_trap_collide_takes > 0 || g_trap_collide_fails > 0)
         BRIDGE_LOG("  trap-row collide takes : %llu (fails %llu)",
                    (unsigned long long)g_trap_collide_takes,
@@ -1462,19 +1633,183 @@ static void maybe_informed_debug_entry(uint64_t dutPc, bool debug_mode_flag)
                 }
             }
         }
+        /* DUT-informed boundary certification (C4 by-seed family): for a
+         * plain kill entry the DUT's dpc IS the kill boundary, so an ISS
+         * parked elsewhere must not certify - take_debug refuses it loud
+         * (expected_dpc_valid=1). Two shapes are exempt BY CONSTRUCTION,
+         * their dpc being an UN-EXECUTED entry target the ISS boundary
+         * legitimately precedes:
+         *   - a recognized IRQ collision (collide_irq_id >= 0): dpc == the
+         *     vector slot, boundary == collide_mepc, certified separately;
+         *   - an UNRECOGNIZED entry collision: dpc == mtvec base (sync
+         *     exception, slot 0 - not an IRQ slot, the candidate scan above
+         *     cannot see it) or dpc == a wired vector slot with a stale
+         *     sticky mcause. The DUT took that entry in the same
+         *     arbitration; the ISS (async hold) did not. Certification is
+         *     skipped (expected_dpc_valid=0) and the entry is repaired
+         *     row-locally below. dpc == base+4 with slot 1 NOT wired stays
+         *     a plain kill boundary (a halt one insn into the handler, C4
+         *     pulp lane) and keeps the strict certification. */
+        uint32_t expected_dpc       = 0;
+        int      expected_dpc_valid = 0;
+        bool     unrecognized_entry_collision = false;
+        auto itdpc2 = g_dut_csr.find(CSR_DPC);
+        if (itdpc2 != g_dut_csr.end()) {
+            expected_dpc       = itdpc2->second;
+            expected_dpc_valid = 1;
+            uint32_t mtvec = 0;
+            if (gvsoc_engine_get_csr(CSR_MTVEC, &mtvec)) {
+                uint32_t base = mtvec & 0xFFFFFF00u;
+                if (expected_dpc == base) {
+                    unrecognized_entry_collision = true;
+                } else if (expected_dpc > base &&
+                           expected_dpc < base + 128u &&
+                           ((expected_dpc - base) & 3u) == 0) {
+                    int id = (int)((expected_dpc - base) >> 2);
+                    if (id == 3 || id == 7 || id == 11 ||
+                        (id >= 16 && id <= 31))
+                        unrecognized_entry_collision = true;
+                }
+            }
+            if (unrecognized_entry_collision && collide_irq_id < 0) {
+                expected_dpc_valid = 0;
+                BRIDGE_LOG("informed debug entry: dpc 0x%08x is an "
+                           "un-executed entry target (mtvec-relative) - "
+                           "unrecognized entry collision, certification "
+                           "waived, row-local repair after the entry",
+                           expected_dpc);
+            } else if (g_redirect_dpc_this_row) {
+                /* The repair-row redirect just wrote THIS dpc into the ISS
+                 * boundary (consume_forced_row_redirect, one statement
+                 * earlier): certifying it would compare the oracle against
+                 * itself and always succeed - a tautology dressed up as a
+                 * check.  Waive it explicitly instead, same shape as the
+                 * unrecognized-collision waiver above.  Capturing
+                 * current_insn BEFORE the redirect is NOT an alternative:
+                 * there it still holds the virtually-consumed repair row's
+                 * pc, so the comparison would refuse legitimate entries. */
+                expected_dpc_valid = 0;
+                static uint64_t redirect_waiver_log = 0;
+                if (++redirect_waiver_log <= 20)
+                    BRIDGE_LOG("informed debug entry: boundary was re-parked "
+                               "on dpc 0x%08x by the repair-row redirect - "
+                               "certification waived (no independent oracle "
+                               "on this row)%s", expected_dpc,
+                               redirect_waiver_log == 20 ?
+                               " (suppressing further waiver messages)" : "");
+            }
+        }
         BRIDGE_LOG_HOT("informed debug entry: DUT PC=0x%08x cause=%u%s",
                        (uint32_t)dutPc, cause,
                        collide_irq_id >= 0 ? " (+interrupt collision)" : "");
         int rc = gvsoc_engine_take_debug_for_one_step((int)cause, collide_irq_id,
                                                       collide_mepc,
-                                                      collide_certify);
-        if (rc != 1)
+                                                      collide_certify,
+                                                      expected_dpc,
+                                                      expected_dpc_valid);
+        if (rc != 1) {
             BRIDGE_ERR("informed debug entry not certified (cause=%u rc=%d) - "
                        "the ISS either did not enter debug or entered off the "
                        "DUT's boundary; the step-and-compare will surface the "
                        "divergence", cause, rc);
-        else
+        } else {
             force_debug_entry_csrs_from_dut(cause);
+            /* Row-local entry repair, GATED to the unrecognized entry
+             * collision shape it exists for (M2): the DUT's arbitration
+             * took an entry the model did not replicate, and the ROM entry
+             * row carries the entry's fresh post-entry CSR writes. Splice
+             * MIE|MPIE from the row-local mstatus write (design contract:
+             * the async carriers are bridge-managed; diff-gated) and force
+             * mepc/mcause from the row write-set so the handler's reads
+             * after dret do not diverge. mstatus is NEVER copied wholesale
+             * - MIE|MPIE splice only (force_mstatus_async_bits, 0x88).
+             * The gate matters: on a RECOGNIZED collision
+             * (collide_irq_id >= 0) the model computed the take
+             * itself - forcing the row values would mask a genuine model
+             * divergence; on a REJECTED non-wired candidate the row's
+             * mcause is explicitly distrusted and must not be injected.
+             * The mepc/mcause force logs UNTHROTTLED (dpc-gauge idiom):
+             * rare by construction, and never invisible in a default run. */
+            /* The mstatus splice above the mepc/mcause branch is
+             * STRUCTURALLY DEAD on the plain unrecognized-collision shape:
+             * rvvi.csr_wb[MSTATUS] is a CHANGE detector
+             * (uvmt_cv32e40p_rvfi2rvvi_macros.svh) cleared at the first
+             * rvfi_valid after the value moves. The DUT's entry transform
+             * happened on the PRECEDING row (the instruction the debug
+             * request killed at the vector), which consumed the flag, and
+             * the debug entry itself does not touch mstatus
+             * (cv32e40p_cs_registers.sv, debug_csr_save branch) - so this
+             * ROM entry row never carries a fresh mstatus write and the
+             * splice below never fires. The authoritative post-entry value
+             * IS available: the sticky mirror g_dut_csr[0x300], fed by the
+             * trap-row push and this row's own sparse scan. Splice the two
+             * async bits from it under a gate STRICTER than the write-set
+             * splice below (which is unconditional on the mstatus branch):
+             * only on the unrecognized-collision shape, only when the row
+             * carries no fresh mstatus write, and only when the skew is
+             * the +/-1 trap-entry phase error the async hold can produce
+             * (entry transform: MPIE <- MIE, MIE <- 0). Anything else is
+             * NOT a bridge artifact: refuse loudly and let the compare
+             * fail - a genuine model divergence must reach a human. NOTE:
+             * the phase classifier is a weak filter (every accepted pair
+             * has 0x80 on one side, the canonical post-entry state), so
+             * treat its REFUSED count as a diagnostic, never as a health
+             * gate; what bounds this force is the row gate, not the
+             * classifier. MSTATUS_ASYNC_BITS is defined below the callee;
+             * the literal 0x88 is used here. */
+            {
+                bool row_has_mstatus = false;
+                for (const auto &w : g_retire.csr_writes)
+                    if (w.first == TRAP_CSR_MSTATUS) row_has_mstatus = true;
+                if (!row_has_mstatus && unrecognized_entry_collision &&
+                    collide_irq_id < 0) {
+                    auto itms = g_dut_csr.find(TRAP_CSR_MSTATUS);
+                    if (itms != g_dut_csr.end()) {
+                        uint32_t iss_ms = 0;
+                        gvsoc_engine_get_csr(TRAP_CSR_MSTATUS, &iss_ms);
+                        const uint32_t A = 0x00000088u;   /* MPIE | MIE */
+                        uint32_t iss_a = iss_ms & A;
+                        uint32_t dut_a = itms->second & A;
+                        /* entry() on the async pair: MPIE <- MIE, MIE <- 0 */
+                        uint32_t iss_after = (iss_a & 0x8u) ? 0x80u : 0x00u;
+                        uint32_t dut_after = (dut_a & 0x8u) ? 0x80u : 0x00u;
+                        if (iss_a != dut_a) {
+                            if (iss_after == dut_a)
+                                force_mstatus_async_bits(itms->second,
+                                    "debug-entry mirror [ISS one entry SHORT]");
+                            else if (dut_after == iss_a)
+                                force_mstatus_async_bits(itms->second,
+                                    "debug-entry mirror [ISS one entry LONG]");
+                            else
+                                BRIDGE_ERR("debug-entry mirror splice REFUSED: "
+                                           "mstatus MIE/MPIE skew is NOT a +/-1 "
+                                           "entry phase error (ISS=0x%08x "
+                                           "DUT=0x%08x) - not a bridge artifact, "
+                                           "letting the compare fail",
+                                           iss_ms, itms->second);
+                        }
+                    }
+                }
+            }
+            for (const auto &w : g_retire.csr_writes) {
+                if (w.first == TRAP_CSR_MSTATUS) {
+                    force_mstatus_async_bits(w.second, "debug-entry row-local");
+                } else if (unrecognized_entry_collision &&
+                           collide_irq_id < 0 &&
+                           (w.first == TRAP_CSR_MEPC ||
+                            w.first == TRAP_CSR_MCAUSE)) {
+                    uint32_t iss_v = 0;
+                    gvsoc_engine_get_csr(w.first, &iss_v);
+                    if (iss_v != w.second) {
+                        BRIDGE_LOG("debug-entry row-local force CSR[0x%03x]: "
+                                   "ISS=0x%08x -> 0x%08x (unrecognized entry "
+                                   "collision repair)",
+                                   w.first, iss_v, w.second);
+                        gvsoc_engine_set_csr(w.first, w.second);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1558,6 +1893,9 @@ void rvviDutRetire(uint32_t /*hartId*/, uint64_t dutPc,
      * never g_retire). */
     resolve_deferred_ebreak_take(dutPc);
     take_retire_event(dutPc, dutInsBin, /*is_trap=*/false);
+    /* A virtually-consumed repair row leaves the ISS pointing at ITS pc:
+     * move it onto this row before any seam or step runs for it. */
+    consume_forced_row_redirect();
     /* Do NOT clear g_pending_handler here: rvvi_trace2api calls rvviDutRetire
      * before rvviRefCsrsCompare, so the trap-CSR snapshot must stay active for
      * the comparison.  It is cleared in rvviRefCsrsCompare after consumption. */
@@ -1577,6 +1915,9 @@ void rvviDutTrap(uint32_t /*hartId*/, uint64_t dutPc, uint64_t dutInsBin)
     g_metric_traps++;
     resolve_deferred_ebreak_take(dutPc);
     take_retire_event(dutPc, dutInsBin, /*is_trap=*/true);
+    /* Same epilogue as rvviDutRetire: a repaired previous row must not
+     * leave the ISS parked on its pc while this row's seams step. */
+    consume_forced_row_redirect();
 
     /* A debug entry that collided with an interrupt take arrives as a TRAP
      * row (the take's CSR writes ride the entry row, so the tracer flags
@@ -1662,6 +2003,80 @@ static bool wake_wfi_via_wire(void)
     return false;
 }
 
+/* mstatus force = MIE/MPIE splice only.  The RTL updates mstatus.FS at the
+ * APU write-back, not at retire (C5-A): at a resync row the DUT mirror's FS
+ * can lag the ISS's architecturally-correct value by 1-8 retires, and
+ * copying the whole register rewinds the ISS's FS/SD to that stale view -
+ * an invisible poke (no trace line) that later surfaces as "compared
+ * mstatus != ISS trace" (mechanism B, corev_rand_interrupt_debug lane).
+ * Only the async timeline carriers MIE and MPIE are force-managed by the
+ * bridge; everything else in mstatus stays owned by the model. */
+static const uint32_t MSTATUS_ASYNC_BITS = 0x00000088u;  /* MPIE | MIE */
+
+static void force_mstatus_async_bits(uint32_t dut_val, const char *why)
+{
+    uint32_t iss_val = 0;
+    gvsoc_engine_get_csr(TRAP_CSR_MSTATUS, &iss_val);
+    uint32_t target = (iss_val & ~MSTATUS_ASYNC_BITS) |
+                      (dut_val &  MSTATUS_ASYNC_BITS);
+    if (target != iss_val) {
+        BRIDGE_LOG_HOT("%s force CSR[0x300] MIE/MPIE: ISS=0x%08x -> 0x%08x "
+                       "(DUT=0x%08x, FS/SD preserved)", why, iss_val, target,
+                       dut_val);
+        gvsoc_engine_set_csr(TRAP_CSR_MSTATUS, target);
+    }
+}
+
+/* Reactive-repair epilogue armed on the previous row (see the force-resync
+ * path): that row was consumed VIRTUALLY - state forced from its DUT
+ * write-set, instruction not executed - so the ISS still points at the
+ * repaired row's pc. Redirect onto the row now being served before any
+ * engine op runs for it. Called from rvviDutRetire/rvviDutTrap right after
+ * take_retire_event so injection seams (debug entry, collision takes) and
+ * the step all start from the redirected boundary. */
+static void consume_forced_row_redirect(void)
+{
+    if (!g_forced_row_redirect)
+        return;
+    g_forced_row_redirect = false;
+    if (!gvsoc_engine_is_running() || gvsoc_engine_finished())
+        return;
+    uint32_t target = (uint32_t)g_retire.pc;
+    /* Repair-row parking on a debug-entry row: when the row now being
+     * served is the debug-ROM ENTRY row, g_retire.pc is the ROM address,
+     * NOT the architectural continuation of the virtually-consumed row -
+     * redirecting there parks the ISS on an M-mode-unreachable pc one
+     * call before take_debug certifies the entry boundary.  The DUT's
+     * dpc IS the kill boundary / post-dret resume point for every entry
+     * shape, so redirect there instead.
+     * NO fail-safe by layering here, and the layering must not be claimed:
+     * this redirect writes the mirror dpc INTO exec.current_insn
+     * (gvsoc_engine_set_pc), which is exactly the oracle the expected_dpc
+     * certification reads one statement later - a stale mirror dpc would be
+     * certified against itself, silently.  The flag below makes the
+     * certification DECLARE the waiver instead of passing tautologically
+     * (see maybe_informed_debug_entry): a stale dpc still degrades to a
+     * force, but a logged and attributable one. */
+    if (target == gvsoc_engine_get_debug_handler() &&
+        !gvsoc_engine_is_debug_mode()) {
+        auto itd = g_dut_csr.find(CSR_DPC);
+        if (itd != g_dut_csr.end()) {
+            /* Capped: this fires on every debug-ROM entry row served after a
+             * repair row, i.e. per-row on the debug+irq lanes, not per-run. */
+            static uint64_t redirect_dpc_log = 0;
+            if (++redirect_dpc_log <= 20)
+                BRIDGE_LOG("repair-row redirect on a debug-entry row: "
+                           "ISS -> DUT dpc 0x%08x (not the ROM 0x%08x)%s",
+                           itd->second, target,
+                           redirect_dpc_log == 20 ?
+                           " (suppressing further redirect messages)" : "");
+            target = itd->second;
+            g_redirect_dpc_this_row = true;
+        }
+    }
+    gvsoc_engine_set_pc(target);
+}
+
 bool_t rvviRefEventStep(uint32_t /*hartId*/)
 {
     PROF_SCOPE(g_prof_ns_step, g_prof_cnt_step);
@@ -1745,8 +2160,7 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
              * between and the take stays state-identical to the immediate
              * one. Duplicated pushes stay authoritative on any row. */
             uint32_t insn = g_retire.insn;
-            bool ebreak_row = (insn == 0x00100073u) ||
-                              ((insn & 0xFFFFu) == 0x9002u);
+            bool ebreak_row = is_ebreak_insn(insn);
             if (ebreak_row && mcause_pushes == 1) {
                 g_ebreak_take_deferred = true;
                 g_ebreak_take_id      = collide_id;
@@ -1761,16 +2175,82 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
             if (irc == 1) {
                 g_trap_collide_takes++;
                 g_trap_collide_pending = true;
-                BRIDGE_LOG("trap-row IRQ collision: killed insn at 0x%08x, "
-                           "took irq id=%d ahead of the handler row "
-                           "(take #%llu)", (uint32_t)g_retire.pc, collide_id,
-                           (unsigned long long)g_trap_collide_takes);
+                /* Capped: an interrupt-storm program that starves one pc
+                 * (mret lands back on it, the next take kills it again,
+                 * cyclically over the enabled ids) fires this once per
+                 * storm iteration until the phase timeout reaps the lane -
+                 * hundreds of thousands of lines at some seeds. The take
+                 * count stays in the shutdown telemetry. */
+                if (g_trap_collide_takes <= 20) {
+                    BRIDGE_LOG("trap-row IRQ collision: killed insn at 0x%08x, "
+                               "took irq id=%d ahead of the handler row "
+                               "(take #%llu)%s", (uint32_t)g_retire.pc, collide_id,
+                               (unsigned long long)g_trap_collide_takes,
+                               g_trap_collide_takes == 20 ?
+                               " (suppressing further collision-take messages)" : "");
+                }
                 return RVVI_TRUE;
             }
             g_trap_collide_fails++;
             BRIDGE_ERR("trap-row IRQ collision: take of irq id=%d FAILED "
                        "(rc=%d) - falling back to the materialize path",
                        collide_id, irc);
+        }
+        /* Debug-request kill of an UN-executed ebreak (dcsr.ebreakm=0): with
+         * ebreakm clear an ebreak can never BE the entry, so this trap row is
+         * a haltreq/trigger KILL of the ebreak - the DUT never executed it
+         * (its dpc lands on it).  Materializing would make the ISS take a
+         * phantom breakpoint EXCEPTION (mepc/mcause/mstatus clobbered +
+         * redirect to mtvec) that no repair undoes, and whose exposure is
+         * seed-dependent.  Leave the ISS parked on the kill
+         * boundary: the next row's informed debug entry then computes
+         * depc == the DUT's dpc from the true boundary, and after dret both
+         * sides re-execute the ebreak once (ebreakm set by the debug ROM in
+         * the meantime -> ebreak entry).  take_boundary() == row pc keeps
+         * this strictly on the "ebreak not yet executed, nothing in flight"
+         * shape; with ebreakm=1 (gate 2026-08-07, 7 ebreak+debug lanes) the
+         * behaviour is untouched. */
+        {
+            uint32_t kinsn = g_retire.insn;
+            bool kill_ebreak = is_ebreak_insn(kinsn);
+            /* Freshness gate: an ARCHITECTURAL breakpoint trap (ebreakm=0,
+             * the ebreak EXECUTES and traps to mtvec - the normal shape on
+             * the exception lanes) pushes a FRESH mepc == this row's pc
+             * (RVVI_SET_TRAP_CSR wmask==0 path).  A debug-request KILL row
+             * only re-pushes STANDING values: mepc stale (!= row pc, e.g.
+             * 0x386 vs kill pc 0x38a in the C4 lane) or absent.  Same
+             * freshness idiom as the trap-row collide detector above.
+             * Without this gate the guard fired on every architectural
+             * ebreak trap with a clean boundary (measured: zfinx
+             * hwloop_exception FAIL mm=15, 26-61 spurious catch-up
+             * recoveries on the fpu/zfinx exception lanes). */
+            bool fresh_mepc_this_pc = false;
+            if (kill_ebreak) {
+                for (const auto &w : g_retire.csr_writes) {
+                    if (w.first == TRAP_CSR_MEPC &&
+                        w.second == (uint32_t)g_retire.pc)
+                        fresh_mepc_this_pc = true;
+                }
+            }
+            uint32_t iss_dcsr = 0, bpc = 0;
+            if (kill_ebreak && !fresh_mepc_this_pc &&
+                gvsoc_engine_get_csr(CSR_DCSR, &iss_dcsr) &&
+                ((iss_dcsr >> 15) & 1u) == 0 &&
+                gvsoc_engine_take_boundary(&bpc) == 1 &&
+                bpc == (uint32_t)g_retire.pc) {
+                /* Capped, same reason as the collision-take log above: this
+                 * is the mret -> ebreak -> kill loop shape, which repeats
+                 * once per storm iteration until the phase timeout - hundreds
+                 * of thousands of lines at some seeds. */
+                static uint64_t kill_ebreak_log = 0;
+                if (++kill_ebreak_log <= 20)
+                    BRIDGE_LOG("trap-row ebreak kill at 0x%08x (ebreakm=0): "
+                               "left un-executed for the entry seam%s",
+                               (uint32_t)g_retire.pc,
+                               kill_ebreak_log == 20 ?
+                               " (suppressing further kill-ebreak messages)" : "");
+                return RVVI_TRUE;
+            }
         }
         uint32_t commit_pc = 0;
         if (gvsoc_engine_materialize_commit(&commit_pc) == 0 &&
@@ -1785,8 +2265,7 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
              * the hwloop counters (7-lane ebreak+debug regression, gate
              * 2026-08-07). Consume the commit as before the deferral gate. */
             uint32_t insn = g_retire.insn;
-            bool is_ebreak = (insn == 0x00100073u) ||
-                             ((insn & 0xFFFFu) == 0x9002u);
+            bool is_ebreak = is_ebreak_insn(insn);
             if (gvsoc_engine_head_commit_trapped() || is_ebreak) {
                 gvsoc_engine_step();
             } else {
@@ -1817,9 +2296,10 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
     g_sync_trap_seam = false;
 
     /* A trap-row collision take already computed this row's handler entry:
-     * the tracer-informed take below must not fire a second one. */
+     * the informed takes below must not fire a second one. */
     bool trap_collide_served = g_trap_collide_pending;
     g_trap_collide_pending = false;
+    bool row_take_served = trap_collide_served;
 
     /* Tracer-informed take: rvfi_intr marks THIS row as the first
      * instruction of an async-IRQ handler, and it arrives BEFORE the row's
@@ -1839,6 +2319,7 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
             int irc = gvsoc_engine_take_irq_for_one_step(irq_id);
             if (irc == 1) {
                 g_fid_informed_takes++;
+                row_take_served = true;
                 BRIDGE_LOG_HOT("tracer-informed take: irq id=%d computed by "
                                "the ISS (take #%llu)", irq_id,
                                (unsigned long long)g_fid_informed_takes);
@@ -1847,6 +2328,121 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
                 BRIDGE_ERR("tracer-informed take: ISS did NOT take irq id=%d "
                            "(rc=%d) - falling back to the reactive resync",
                            irq_id, irc);
+            }
+        }
+    }
+
+    /* DUT-informed async-entry take (mainline, no plusarg needed).
+     *
+     * An external-interrupt handler entry is a NORMAL retire whose
+     * write-set carries the take's own CSR writes: a row-local fresh
+     * mcause (bit 31, wired id) plus a fresh mepc - on a non-trap row the
+     * sparse csr_wb scan only pushes what THIS row wrote, so freshness is
+     * by construction (the sticky-mirror overfire of the historical
+     * detector does not apply). This is the one point where the entry can
+     * still be COMPUTED by the model instead of repaired after the fact:
+     * with the async hold the ISS never took on its own, and when it sits
+     * exactly on the DUT's kill boundary (mepc), a single-step inject
+     * makes mepc/mcause/mstatus.MIE/MPIE come out of the model's own trap
+     * logic and the vector-slot instruction execute from its true pre-row
+     * state - an honest compare, no DUT-state copy. Certification is
+     * fail-safe and over-constrained:
+     *   - id on a wired line and row pc == the mtvec-derived entry
+     *     (mirror mtvec; vector slots are never ordinary rows);
+     *   - the ISS on a clean boundary with current_insn == the row's
+     *     fresh mepc (take_boundary: no queued/held commits, no LSU
+     *     in flight, not in WFI/debug).
+     * Anything short of that falls through to the reactive repair below,
+     * exactly as before. The engine's fine-grained stepping while a take
+     * is imminent makes the boundary match the common case rather than
+     * the exception. */
+    if (g_force_trap_enabled && !g_informed_irq_enabled && !row_take_served) {
+        uint32_t entry_mcause = 0, entry_mepc = 0;
+        bool have_mcause = false, have_mepc = false;
+        for (const auto &w : g_retire.csr_writes) {
+            if (w.first == TRAP_CSR_MCAUSE) {
+                entry_mcause = w.second;
+                have_mcause = true;
+            } else if (w.first == TRAP_CSR_MEPC) {
+                entry_mepc = w.second;
+                have_mepc = true;
+            }
+        }
+        int entry_id = -1;
+        bool adjacent = false;
+        if (have_mcause && (entry_mcause & 0x80000000u) && have_mepc) {
+            int id = (int)(entry_mcause & 0x1fu);
+            if (id == 3 || id == 7 || id == 11 || (id >= 16 && id <= 31))
+                entry_id = id;
+        }
+        /* Adjacent-row candidate: the tracer often lands the take's
+         * mcause/mepc pushes on the PRECEDING (killed) row, leaving the
+         * entry row's own write-set empty - measured >99% of the entries
+         * in the interrupt_exception lanes, the row-local scan above fired
+         * 3-4 times against 1000+ takes. The sticky mirrors then carry the
+         * take's values, and the same over-constrained certification keeps
+         * this safe: the id is cross-checked against the row's OWN vector
+         * slot (vectored mtvec only - in direct mode every id maps to base
+         * and the slot cannot discriminate), and the inject still requires
+         * the ISS boundary to equal the mirrored mepc. A stale mirror pair
+         * fails one of the two by construction. Same pattern as the
+         * adjacent-row collision recovery in maybe_informed_debug_entry. */
+        if (entry_id < 0) {
+            auto mc = g_dut_csr.find(TRAP_CSR_MCAUSE);
+            auto me = g_dut_csr.find(TRAP_CSR_MEPC);
+            auto mtv = g_dut_csr.find(0x305u /*mtvec*/);
+            if (mc != g_dut_csr.end() && (mc->second & 0x80000000u) &&
+                me != g_dut_csr.end() && mtv != g_dut_csr.end() &&
+                (mtv->second & 0x3u)) {
+                int id = (int)(mc->second & 0x1fu);
+                if (id == 3 || id == 7 || id == 11 ||
+                    (id >= 16 && id <= 31)) {
+                    entry_id   = id;
+                    entry_mepc = me->second;
+                    adjacent   = true;
+                }
+            }
+        }
+        if (entry_id >= 0) {
+            auto mt = g_dut_csr.find(0x305u /*mtvec*/);
+            if (mt != g_dut_csr.end()) {
+                uint32_t base   = mt->second & ~0x3u;
+                uint32_t target = (mt->second & 0x3u)
+                                ? base + 4u * (uint32_t)entry_id : base;
+                if ((uint32_t)g_retire.pc == target) {
+                    uint32_t boundary = 0;
+                    if (gvsoc_engine_take_boundary(&boundary) &&
+                        boundary == entry_mepc) {
+                        int irc = gvsoc_engine_take_irq_for_one_step(entry_id);
+                        if (irc == 1) {
+                            g_entry_informed_takes++;
+                            if (adjacent)
+                                g_entry_informed_adjacent++;
+                            row_take_served = true;
+                            BRIDGE_LOG_HOT("entry-informed take: irq id=%d at "
+                                           "boundary 0x%08x, entry computed by "
+                                           "the ISS (take #%llu%s)", entry_id,
+                                           boundary,
+                                           (unsigned long long)g_entry_informed_takes,
+                                           adjacent ? ", adjacent-row" : "");
+                        } else {
+                            g_entry_informed_fails++;
+                            BRIDGE_ERR("entry-informed take: ISS did NOT take "
+                                       "irq id=%d at boundary 0x%08x (rc=%d) - "
+                                       "falling back to the reactive repair",
+                                       entry_id, boundary, irc);
+                        }
+                    } else {
+                        /* ISS mid-burst or past the kill boundary: only the
+                         * repair can serve this row. Counted, hot-logged. */
+                        g_entry_informed_boundary_miss++;
+                        BRIDGE_LOG_HOT("entry-informed take: boundary miss "
+                                       "(irq id=%d, row mepc=0x%08x) - reactive "
+                                       "repair will serve the row (#%llu)",
+                                       entry_id, entry_mepc,
+                                       (unsigned long long)g_entry_informed_boundary_miss);
+                    }
+                }
             }
         }
     }
@@ -2045,8 +2641,56 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
                     }
                 };
                 for (uint32_t addr : {TRAP_CSR_MEPC, TRAP_CSR_MCAUSE,
-                                       TRAP_CSR_MTVAL, TRAP_CSR_MSTATUS})
+                                       TRAP_CSR_MTVAL})
                     force_csr_from_dut(addr);
+                /* mstatus: splice MIE/MPIE only - the async skew carriers
+                 * this repair owns. A wholesale copy dragged the DUT's
+                 * APU-lagged FS/SD over the model's spec-correct value.
+                 *
+                 * SOURCE of the two bits, on an entry row (is_new_irq):
+                 * never the sticky mirror. The tracer often lands the
+                 * take's mstatus push on the preceding row - or not at
+                 * all - so the mirror here can still carry the PRE-entry
+                 * value (MIE=1): splicing it back left the ISS without
+                 * the entry's MIE clear, the wrong MPIE went through the
+                 * handler's mret, and the lane diverged permanently on a
+                 * CSR-only skew no detector can see (both PCs re-align).
+                 * Priority instead:
+                 *   1. the row's OWN fresh mstatus write when present
+                 *      (collision rows carry it - same evidence as the
+                 *      debug-entry seam);
+                 *   2. the architectural entry transform computed from the
+                 *      ISS's own pre-repair state: MPIE <- MIE, MIE <- 0.
+                 *      The ISS did not take (async hold), so its MIE still
+                 *      holds the pre-entry value the DUT's take captured.
+                 * A WFI row served by the wire wake (woke_on_row) is NOT
+                 * an entry - no transform; the mirror splice keeps the
+                 * historical behaviour there. */
+                {
+                    bool     row_has_mstatus = false;
+                    uint32_t row_mstatus     = 0;
+                    for (const auto &w : g_retire.csr_writes) {
+                        if (w.first == TRAP_CSR_MSTATUS) {
+                            row_has_mstatus = true;
+                            row_mstatus     = w.second;
+                        }
+                    }
+                    if (row_has_mstatus) {
+                        force_mstatus_async_bits(row_mstatus,
+                                                 "IRQ-resync row-local");
+                    } else if (is_new_irq && !woke_on_row) {
+                        uint32_t iss_ms = 0;
+                        gvsoc_engine_get_csr(TRAP_CSR_MSTATUS, &iss_ms);
+                        uint32_t entry_bits =
+                            ((iss_ms >> 3) & 1u) ? 0x00000080u : 0x00000000u;
+                        force_mstatus_async_bits(entry_bits,
+                                                 "IRQ-resync entry-transform");
+                    } else {
+                        auto it = g_dut_csr.find(TRAP_CSR_MSTATUS);
+                        if (it != g_dut_csr.end())
+                            force_mstatus_async_bits(it->second, "IRQ-resync");
+                    }
+                }
                 for (uint32_t addr : g_csr_compare_enabled) {
                     if (is_trap_csr(addr) || addr == CSR_MIP) continue;
                     if (g_csr_volatile.count(addr))           continue;
@@ -2077,12 +2721,36 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
                     }
                 }
 
-                /* Step the ISS from the forced PC so it actually retires the
-                 * instruction at g_retire.pc.  This keeps ISS and DUT at the
-                 * same retire count instead of leaving the ISS one step behind.
-                 * (Already done by the wire wake when the row was the WFI.) */
-                rc = woke_on_row ? 1 : gvsoc_engine_step();
-                return (rc == 1) ? RVVI_TRUE : RVVI_FALSE;
+                /* The wire wake already retired the row's own WFI: the row
+                 * is genuinely served, nothing else to do. */
+                if (woke_on_row)
+                    return RVVI_TRUE;
+
+                /* Virtual row consume. The forces above already put the ISS
+                 * in the row's END-of-row architectural state (the mirrors
+                 * carry this row's write-set: the SV pushes GPR/FPR/CSR
+                 * before the retire call), and set_pc pinned the retired PC
+                 * to the row's pc, so the PC compare is served. Stepping
+                 * the ISS through the instruction at g_retire.pc here - the
+                 * historical behaviour - applied the row's effects a SECOND
+                 * time on top of the forced state: idempotent rows hid it,
+                 * but the canonical async-entry row, csrrw rd,rs,mscratch,
+                 * is an involution - the (GPR, mscratch) pair came out
+                 * swapped and, mscratch being rewritten only at the next
+                 * handler entry, the swap stood for the rest of the lane
+                 * (the mm=50/51 trap-entry seam signature). The instruction
+                 * is deliberately NOT executed; the redirect flag points
+                 * the ISS at the NEXT row's pc before that row steps, so
+                 * the stream resumes one instruction after the repair. */
+                g_forced_row_consumes++;
+                g_forced_row_redirect = true;
+                BRIDGE_LOG_HOT("%s resync: row 0x%08x consumed virtually "
+                               "(state forced from the DUT write-set, "
+                               "consume #%llu)",
+                               is_wfi_stuck ? "WFI" : "IRQ",
+                               (uint32_t)g_retire.pc,
+                               (unsigned long long)g_forced_row_consumes);
+                return RVVI_TRUE;
             }
         }
     }
@@ -2124,7 +2792,13 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
             }
             rc = rc2;
         } else if (iss_pc != g_retire.pc && iss_pc == g_retire.pc_prev &&
-                   g_retire.pc_prev != 0) {
+                   g_retire.pc_prev != 0 &&
+                   /* D2-C hardening (d2_parking/ANALYSIS.md §4): never
+                    * catch-up-step from a pc parked on the debug-ROM entry
+                    * outside debug mode - that executes the ROM in M-mode
+                    * (illegal cascade, old C4-pulp tail signature). */
+                   !(iss_pc == gvsoc_engine_get_debug_handler() &&
+                     !gvsoc_engine_is_debug_mode())) {
             /* (b) residual +1 lag on the same path. */
             g_phase_realign_count++;
             BRIDGE_LOG_HOT("phase-shift realign: ISS=0x%08x (==DUT_prev) one retire "
@@ -2156,16 +2830,26 @@ bool_t rvviRefEventStep(uint32_t /*hartId*/)
      * realign is skipped and the divergence surfaces honestly. */
     if (sync_trap_seam && g_force_trap_enabled && rc == 1 &&
         gvsoc_engine_get_pc() == g_retire.pc) {
-        auto it = g_trap_csr_snapshot.find(TRAP_CSR_MSTATUS);
-        if (it != g_trap_csr_snapshot.end()) {
-            uint32_t iss_val = 0;
-            gvsoc_engine_get_csr(TRAP_CSR_MSTATUS, &iss_val);
-            if (iss_val != it->second) {
-                BRIDGE_LOG_HOT("sync-trap resync CSR[0x%03x]: ISS=0x%08x -> DUT=0x%08x",
-                               TRAP_CSR_MSTATUS, iss_val, it->second);
-                gvsoc_engine_set_csr(TRAP_CSR_MSTATUS, it->second);
+        /* Row-local only. The trap-row snapshot of mstatus is the PRE-entry
+         * value on FPU/Zfinx configs (tracer FS churn poisons wdata/wmask on
+         * the faulting row, RVVI_SET_TRAP_CSR falls back to rdata for
+         * MIE/MPIE): splicing it re-injected the pre-entry bits over the
+         * model's correct entry transform - the MIE/MPIE-skew family of
+         * fv_final_20260817 (31 lanes). The handler row's OWN fresh mstatus
+         * write (csr_wb lands here) is the authoritative post-entry value;
+         * when absent, force NOTHING: under dpi_async_hold the ISS entry
+         * transform is architectural, and a genuine model skew must surface
+         * in the compare, not be papered over. Splice, never wholesale. */
+        bool     row_has_ms = false;
+        uint32_t row_ms     = 0;
+        for (const auto &w : g_retire.csr_writes) {
+            if (w.first == TRAP_CSR_MSTATUS) {
+                row_has_ms = true;
+                row_ms     = w.second;
             }
         }
+        if (row_has_ms)
+            force_mstatus_async_bits(row_ms, "sync-trap seam row-local");
     }
 
     return (rc == 1) ? RVVI_TRUE : RVVI_FALSE;
@@ -2315,6 +2999,7 @@ bool_t rvviRefFprsCompare(uint32_t hartId)
             pass = RVVI_FALSE;
         }
     }
+
     return pass;
 }
 
@@ -2367,6 +3052,44 @@ bool_t rvviRefCsrCompare(uint32_t /*hartId*/, uint32_t csrIndex)
     if (g_retire.is_trap && is_trap_csr(csrIndex))
         return RVVI_TRUE;
 
+    /* A row that WRITES a trap-CSR is not comparable against the trap
+     * snapshot: the snapshot holds the PRE-trap value while the ISS has
+     * already applied this row's architectural write.  The snapshot outlives
+     * a single row (it is armed at every trap-marked row and consumed only by
+     * the next CSR-compare row), and rvfi marks killed fall-through rows as
+     * traps too, so the arming row is not always a real trap: the pair
+     * "killed fall-through of a taken branch" + "csrrw x0, mepc, xN of the
+     * hwloop-aware ecall handler" lands the write on the armed row.  The
+     * mismatch delta then measures the hwloop body length (0xC8 / 0x158 on
+     * the two lanes that showed it), not a +-4 entry skew.  Fail open on that
+     * one row: the coincidence needs the write to fall exactly on the row
+     * after an armed one (measured ~1/20 of the executions of that pc). */
+    if (g_pending_handler && is_trap_csr(csrIndex) &&
+        csrIndex != TRAP_CSR_MSTATUS) {
+        auto snap_it = g_trap_csr_snapshot.find(csrIndex);
+        if (snap_it != g_trap_csr_snapshot.end()) {
+            for (const auto &w : g_retire.csr_writes) {
+                if (w.first != csrIndex)
+                    continue;
+                auto mirror_it = g_dut_csr.find(csrIndex);
+                static uint64_t snap_write_log = 0;
+                if (++snap_write_log <= 20)
+                    BRIDGE_LOG("trap-snapshot skipped on a row that WRITES "
+                               "CSR[0x%03x] @ retire #%llu (PC=0x%08x): "
+                               "snapshot=0x%08x row-write=0x%08x "
+                               "mirror=0x%08x%s",
+                               csrIndex,
+                               (unsigned long long)g_metric_retires,
+                               g_retire.pc, snap_it->second, w.second,
+                               mirror_it != g_dut_csr.end() ?
+                               mirror_it->second : 0u,
+                               snap_write_log == 20 ?
+                               " (suppressing further messages)" : "");
+                return RVVI_TRUE;
+            }
+        }
+    }
+
     uint32_t iss_val = 0;
     if (!gvsoc_engine_get_csr(csrIndex, &iss_val))
         return RVVI_TRUE;  /* CSR not in ISS model */
@@ -2378,7 +3101,13 @@ bool_t rvviRefCsrCompare(uint32_t /*hartId*/, uint32_t csrIndex)
      * pushed explicitly by rvvi_trace2api before the CSR write-back timing could
      * corrupt them. */
     uint32_t dut_val = 0;
-    if (g_pending_handler && is_trap_csr(csrIndex)) {
+    /* mstatus is EXCLUDED from the snapshot path: the trap-row snapshot is
+     * pre-entry on FPU/Zfinx (see the sync-trap seam), and comparing the ISS
+     * against the very value the seam just spliced made the handler-row
+     * compare vacuous (fail-open). The sticky mirror is already post-entry
+     * here: the handler row's sparse scan pushed the delayed csr_wb write. */
+    if (g_pending_handler && is_trap_csr(csrIndex) &&
+        csrIndex != TRAP_CSR_MSTATUS) {
         auto snap_it = g_trap_csr_snapshot.find(csrIndex);
         if (snap_it != g_trap_csr_snapshot.end()) {
             dut_val = snap_it->second;
@@ -2400,13 +3129,53 @@ bool_t rvviRefCsrCompare(uint32_t /*hartId*/, uint32_t csrIndex)
     }
 
     if (dut_val != iss_val) {
+        /* mstatus.FS write-back lag: inside the window opened by a DIVSQRT
+         * retire, tolerate a difference confined to FS(14:13)/SD(31) with
+         * the model side already dirty - the RTL updates FS at the APU
+         * write-back, 1-8 retires later, and software cannot observe the
+         * skew (csr_apu_stall holds CSR accesses while DIVSQRT is in
+         * flight). Everything else in mstatus stays honestly compared,
+         * and an FS difference OUTSIDE the window still fails. */
+        if (csrIndex == TRAP_CSR_MSTATUS && g_fs_lag_window > 0) {
+            const uint32_t FS_SD_BITS = 0x80006000u;  /* SD | FS */
+            if (((dut_val ^ iss_val) & ~FS_SD_BITS) == 0 &&
+                ((iss_val >> 13) & 0x3u) == 0x3u) {
+                g_fs_lag_tolerated++;
+                g_fs_lag_seen_diverged = true;
+                BRIDGE_LOG_HOT("mstatus FS lag tolerated @ retire #%llu: "
+                               "DUT=0x%08x ISS=0x%08x (window %u left, #%llu)",
+                               (unsigned long long)g_metric_retires,
+                               dut_val, iss_val, g_fs_lag_window,
+                               (unsigned long long)g_fs_lag_tolerated);
+                return RVVI_TRUE;
+            }
+        }
         g_metric_mismatches++;
         if (throttle_check(g_csr_mismatch_count, "CSR")) {
-            BRIDGE_ERR("CSR[0x%03x] mismatch @ retire #%llu: DUT=0x%08x ISS=0x%08x (PC=0x%08x)%s",
-                       csrIndex, (unsigned long long)g_metric_retires, dut_val, iss_val, g_retire.pc,
-                       (g_pending_handler && is_trap_csr(csrIndex)) ? " [trap-snapshot]" : "");
+            if (csrIndex == TRAP_CSR_MSTATUS)
+                BRIDGE_ERR("CSR[0x%03x] mismatch @ retire #%llu: DUT=0x%08x ISS=0x%08x (PC=0x%08x)%s fs_win=%u",
+                           csrIndex, (unsigned long long)g_metric_retires, dut_val, iss_val, g_retire.pc,
+                           g_pending_handler ? " [handler-row sticky]" : "",
+                           g_fs_lag_window);
+            else
+                BRIDGE_ERR("CSR[0x%03x] mismatch @ retire #%llu: DUT=0x%08x ISS=0x%08x (PC=0x%08x)%s",
+                           csrIndex, (unsigned long long)g_metric_retires, dut_val, iss_val, g_retire.pc,
+                           (g_pending_handler && is_trap_csr(csrIndex)) ? " [trap-snapshot]" : "");
         }
         return RVVI_FALSE;
+    }
+    /* A re-converged mstatus closes a live FS-lag window early - but only
+     * once the window has actually seen the divergence it was opened for
+     * (the opening row itself still compares converged, see
+     * g_fs_lag_seen_diverged). */
+    if (csrIndex == TRAP_CSR_MSTATUS && g_fs_lag_window > 0 &&
+        g_fs_lag_seen_diverged) {
+        static uint64_t close_log = 0;
+        if (++close_log <= 5)
+            BRIDGE_LOG("FS-lag window early-close @ retire #%llu (both 0x%08x)",
+                       (unsigned long long)g_metric_retires, dut_val);
+        g_fs_lag_window        = 0;
+        g_fs_lag_seen_diverged = false;
     }
     return RVVI_TRUE;
 }
