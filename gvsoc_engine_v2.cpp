@@ -128,7 +128,10 @@ static std::unordered_map<uint32_t, iss_reg_t *> g_csr_value_map;
 /* Stepping state */
 static uint64_t      g_retire_count  = 0;
 static iss_reg_t     g_retired_pc    = 0;  /* PC of last retired instruction */
-static uint32_t      g_retired_opcode = 0; /* always 0: opcode not captured in DPI mode */
+static uint32_t      g_retired_opcode = 0; /* raw encoding of the retired insn
+                                            * (from the commit ring); 0 on
+                                            * pinned/virtual retires -> the
+                                            * INS compare skips those rows */
 static uint64_t      g_popped_trap_seq = 0; /* trap_seq stamp of the last popped commit */
 static FILE         *g_iss_trace_fp  = nullptr;  /* opt-in, env GVSOC_RVVI_ISS_TRACE */
 
@@ -628,13 +631,18 @@ bool gvsoc_engine_is_running(void)
 
 static constexpr int STEP_MAX_CYCLES         = 2000; /* max stall cycles before timeout */
 
-/* Commit one retire: record the retired PC, bump the counter, log the first
- * retires, feed the opt-in trace, reset the runaway detector. Shared by the
- * two retire paths of the step loop (PC-changed and branch-to-self). */
-static void retire_commit(iss_reg_t retired_pc, const char *how, int cycles)
+/* Commit one retire: record the retired PC and raw encoding, bump the
+ * counter, log the first retires, feed the opt-in trace, reset the runaway
+ * detector. Shared by the two retire paths of the step loop (PC-changed and
+ * branch-to-self). The opcode comes from the commit ring (stamped at
+ * execution in Cv32e40pEvents::event_retire_account), which makes the
+ * INS-binary compare live; rows served without an ISS execution (set_pc
+ * pinning, virtual consume) carry 0 and the compare skips them. */
+static void retire_commit(iss_reg_t retired_pc, iss_reg_t retired_opcode,
+                          const char *how, int cycles)
 {
     g_retired_pc     = retired_pc;
-    g_retired_opcode = 0;  /* no opcode captured in DPI mode */
+    g_retired_opcode = retired_opcode;
     g_retire_count++;
 
     if (g_retire_count <= 25)
@@ -747,14 +755,21 @@ int gvsoc_engine_step(void)
 
     try
     {
+        /* Invalidate the previous row's encoding up front: if this step does
+         * NOT pop a commit (stall timeout -> the bridge defers the row), the
+         * INS compare must skip rather than match the DUT row against the
+         * stale opcode of the last served retire. */
+        g_retired_opcode = 0;
+
         int cycles = 0;
         if (engine_advance_to_commit(&cycles))
         {
             uint64_t idx = g_iss->timing.commit_pop % Cv32e40pEvents::COMMIT_RING;
             iss_reg_t pc = g_iss->timing.commit_pc[idx];
+            iss_reg_t op = g_iss->timing.commit_insn[idx];
             g_popped_trap_seq = g_iss->timing.commit_trap_seq[idx];
             g_iss->timing.commit_pop++;
-            retire_commit(pc, "committed", cycles);
+            retire_commit(pc, op, "committed", cycles);
             return 1;
         }
         if (g_finished)
@@ -1002,6 +1017,13 @@ void gvsoc_engine_set_pc(uint32_t pc)
      * side effects are force-corrected by the resync caller either way. */
     g_iss->exec.has_exception = false;
     g_retired_pc = pc;
+    /* Pinned row: no ISS execution backs this retire, so the last popped
+     * encoding (a killed-path insn under the async hold) must not survive
+     * into the INS compare - the PC compare passes on the pin and the
+     * stale opcode would false-fire against the row's real insn (observed:
+     * 11 INSN mismatches on the repaired IRQ-entry rows of the
+     * interrupt_exception residual lane). Zero = compare skips. */
+    g_retired_opcode = 0;
     /* Drop unconsumed commits: after a force-resync they belong to the
      * pre-resync stream (including any produced by the drain above). */
     g_iss->timing.commit_stream_flush();
@@ -1322,8 +1344,12 @@ void gvsoc_engine_settle_irq(void)
             if (settle_pc != settle_start_pc)
             {
                 /* IRQ taken: record the trapped instruction as the last retired
-                 * PC so gvsoc_engine_get_pc() matches the DUT. */
+                 * PC so gvsoc_engine_get_pc() matches the DUT. The paired
+                 * encoding is unknown here (no pop backs this record):
+                 * invalidate it so the INS compare skips rather than match
+                 * the previous row's opcode against this one. */
                 g_retired_pc = settle_start_pc;
+                g_retired_opcode = 0;
                 ENGINE_LOG_HOT("settle_irq: IRQ taken on drain cycle %d, PC 0x%08x -> 0x%08x",
                            i, (unsigned)settle_start_pc, (unsigned)settle_pc);
                 return;

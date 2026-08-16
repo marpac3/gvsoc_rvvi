@@ -1170,6 +1170,9 @@ bool_t rvviRefShutdown(void)
                    "collision", g_ebreak_take_row_pc, g_ebreak_take_id);
     if (g_phase_realign_count > 0)
         BRIDGE_LOG("  phase realigns : %llu", (unsigned long long)g_phase_realign_count);
+    if (g_metric_comparisons_insbin > 0)
+        BRIDGE_LOG("  INSN compares  : %llu (live encodings, skip rows uncounted)",
+                   (unsigned long long)g_metric_comparisons_insbin);
     if (g_volatile_sync_count > 0)
         BRIDGE_LOG("  volatile syncs : %llu", (unsigned long long)g_volatile_sync_count);
     if (g_volatile_mem_sync_count > 0)
@@ -3010,20 +3013,27 @@ bool_t rvviRefInsBinCompare(uint32_t /*hartId*/)
     if (!gvsoc_engine_is_running() || gvsoc_engine_finished())
         return RVVI_TRUE;
 
+    /* Deferred rows are not ISS-aligned: the engine either did not serve
+     * this retire (pending backlog) or its state was forced by a repair.
+     * Same skip policy as the value compares. */
+    if (state_compare_deferred())
+        return RVVI_TRUE;
+
     uint32_t iss_insn = gvsoc_engine_get_insn();
 
-    g_metric_comparisons_insbin++;
-
-    /* If the ISS cannot provide an opcode (0 = not decoded, or DPI mode
-     * where insn_cache is not accessible), skip comparison gracefully.
-     * Still count as a comparison to satisfy the testbench final check. */
+    /* Rows served without an ISS execution carry opcode 0 (set_pc pinning,
+     * virtual consume, or a step that popped no commit): skip WITHOUT
+     * counting - the anti-vacuity counter below reflects only compares
+     * that actually ran against a real ISS-side encoding. */
     if (iss_insn == 0)
         return RVVI_TRUE;
 
     /* Mask comparison to instruction size: RVC (compressed) instructions
      * are 16-bit, standard instructions are 32-bit.  RVC is identified
-     * by bits [1:0] != 0b11. */
+     * by bits [1:0] != 0b11.  The ISS-side opcode is already truncated to
+     * 16 bits for RVC rows at the commit-ring push. */
     uint32_t mask = ((g_retire.insn & 0x3) != 0x3) ? 0x0000FFFF : 0xFFFFFFFF;
+    g_metric_comparisons_insbin++;
     if ((g_retire.insn & mask) != (iss_insn & mask)) {
         g_metric_mismatches++;
         if (throttle_check(g_insn_mismatch_count, "INSN")) {

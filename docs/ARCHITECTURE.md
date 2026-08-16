@@ -516,9 +516,12 @@ P1 — behavioral (false mismatches / stalls):
   only (`g_retire.gpr_mask`/`fpr_mask` from the RVFI write-back flags): a
   register the DUT never rewrites after a divergence is not re-checked, so
   a stale value can sit latent until something reads or rewrites it. The
-  instruction-binary compare has no SV call-site at all; its "comparisons
-  performed" counter is incremented as a proxy, so the end-of-test sanity
-  checks pass either way;
+  instruction-binary compare is live (the encoding travels with the commit
+  ring and is masked to 16 bits on RVC rows), but rows served without an
+  ISS execution — pins, virtual consumes, deferrals — carry no encoding
+  and skip it, uncounted: the "comparisons performed" counter reflects
+  effective compares only, and a lane where every row were skipped would
+  fail the end-of-test sanity check honestly;
 - hand re-implemented CSR read fixups and write masks: every CSR semantics
   change in the ISS must be mirrored manually in the bridge, so drift over
   time is guaranteed;
