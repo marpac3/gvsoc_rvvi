@@ -253,8 +253,10 @@ to anything but GVSOC, `RVVI_TRACE=YES` is ignored and make prints
   `pulp_fpu_zfinx` and the FPU-trap path have not. When diffing
   `dut.rvvi`/`ref.rvvi` on the PULP CFGs, expect a few ref-side deltas that
   sit outside the compare set: the custom hwloop CSR echoes
-  (`0xCC0-0xCC2`) read 0 on the ref side, an occasional `fflags` NX delta
-  on `fmadd.s`, and a 2-byte PC offset on the final WFI line at exit.
+  (`0xCC0-0xCC2`) read 0 on the ref side, and a 2-byte PC offset on the
+  final WFI line at exit. The occasional `fflags` NX delta on `fmadd.s`
+  listed here before is gone with the flexfloat flag fixes: the ISS no
+  longer raises a spurious inexact on an infinite FMA result.
 - No single front-end target selects the mode (something like
   `make trace LEVEL=...`); use the command lines above.
 - The in-simulation GPR/FPR compare is currently neutralized (see
