@@ -53,6 +53,7 @@ All commands from `cv32e40p/sim/uvmt/` in the core-v-verif tree.
 | Conformance-check a produced trace | `make check-rvvi RVVI_TRACE_DIR=<dir>` |
 | Formatter unit tests (no license needed) | `micromamba run -n gvsoc_env_3_12 make -C vendor_lib/gvsoc_rvvi test` |
 | Standard validation gate (quick sweep, 4 configs, SEED=1) | `vendor_lib/gvsoc_rvvi/test/quick_val.sh [out-dir] [cfg ...]` |
+| Full regression with code coverage (374 lanes, 3 configs) | `vendor_lib/gvsoc_rvvi/test/full_verif.sh [out-dir]` — see below |
 
 A few things that save time:
 
@@ -83,6 +84,82 @@ A few things that save time:
 - Run artifacts land in `vsim_results/<CFG>/<TEST>/0/vsim-<TEST>.log`
   (the `0` is `RUN_INDEX`, not the seed; it only changes for multi-run
   invocations).
+
+## Full regression with coverage
+
+`quick_val.sh` is the fast gate — one run per test type. The full v2
+regression perimeter is 374 lanes over three configs, and running it
+sequentially the way `bin/cv_regress` emits it takes about ten core-hours.
+`test/full_verif.sh` runs the same perimeter as a parallel pool and collects
+Questa code coverage on the way:
+
+```bash
+vendor_lib/gvsoc_rvvi/test/full_verif.sh [output-dir]
+```
+
+It needs no shell setup — it loads Questa 2025.3 and the CoreV toolchain
+itself, and refuses to start on any other simulator version (UCDBs from
+different releases cannot be merged). The only prerequisite is that the GVSOC
+bridge libraries are already built. The default output directory is
+`/data2/$USER/fullverif_<timestamp>`; always keep it on `/data2`, a campaign
+writes tens of gigabytes and the run tree must not land in the repo or on NFS.
+
+| Knob | Default | Effect |
+|------|---------|--------|
+| `FV_JOBS` | 16 | Parallel lanes. 24 is the sane ceiling on the shared box; beyond ~16 the wall clock is set by the slowest single lane, not by the pool. |
+| `FV_CFGS` | `pulp pulp_fpu pulp_fpu_zfinx` | Configs to run. |
+| `FV_COV` | `YES` | Coverage build and collection. `NO` gives a reference run for measuring overhead — use a separate output directory, the work library differs. |
+| `FV_SEED_MODE` | `random` | `random` is what `cv_regress` emits; a fixed number makes two campaigns directly comparable. |
+| `FV_TIMEOUT` | 2400 | Per-lane wall-clock cap, seconds. Overridable per lane with `FV_TMO_FILE`. |
+| `FV_XFAIL_FILE` | *(empty)* | Known-open lanes, `cfg/label` or bare `TEST` per line. Reported `KNOWN_FAIL`, excluded from the merge, ignored by the exit code. |
+| `FV_FILTER` | *(empty)* | Extended regex on `cfg/label`; run a subset without changing anyone's run index. |
+| `FV_DRY` | 0 | Generate manifests, print the plan, run nothing. |
+
+The script first asks `cv_regress` for the lane list of each config, parses it
+into `manifest/<cfg>.lanes`, and renumbers `RUN_INDEX`/`GEN_START_INDEX` per
+`(config, test)` — two regression-list entries can otherwise ask for the same
+run directory and silently overwrite each other's results and UCDB. It then
+compiles each config once, serially (every lane runs with `COMP=0`, so nothing
+recompiles into the shared work library while the pool is live), and only then
+opens the pool.
+
+Output layout under the run directory:
+
+```text
+manifest/<cfg>.lanes    parsed lane table, one line per lane
+logs/<cfg>/<label>.log  per-lane make output
+results/                CV_RESULTS tree (vsim_results/<cfg>/<TEST>/<idx>/)
+cov/<cfg>/merged.ucdb   per-config merge of the passing lanes
+cov/merged_all.ucdb     cross-config merge
+reports/html/           browsable coverage report (open index.html)
+reports/by_module.txt   per-module code coverage
+reports/by_covergroup.txt   functional coverage, covergroup by covergroup
+SUMMARY.txt             verdict and wall clock per lane
+```
+
+Verdicts are the same vocabulary as the quick gate — `PASS`, `FAIL`,
+`TIMEOUT`, `NO_SIM`, `KNOWN_FAIL` — plus `NO_UCDB` for a lane that passed but
+produced no coverage database, which means the run did not go through
+`cov.tcl` and its coverage is silently missing from the merge. Only `PASS`
+lanes feed the merge. The exit code is 0 only when every lane was `PASS` or
+`KNOWN_FAIL`, so the first campaign on a new baseline is expected to exit
+non-zero: read `SUMMARY.txt`, triage, and put the genuinely-open lanes in an
+`FV_XFAIL_FILE` for the next run.
+
+Reading the coverage output: `reports/by_module.txt` is the code-coverage view
+(statement / branch / condition / expression / FSM, toggle deliberately off —
+the build passes `+cover=bcsef` on the DUT only, so testbench and interface
+code do not dilute the numbers). `reports/by_covergroup.txt` is the functional
+view, and it is the one to look at first — a config-level hole shows up there
+as a covergroup at low percentage, while code coverage tends to saturate
+early. The HTML report under `reports/html/` cross-links the two and is the
+practical way to walk from an uncovered bin to the source line.
+
+Two caveats when comparing campaigns. Coverage is only merged from lanes that
+passed, so a campaign with failures reports coverage of a smaller test set —
+compare the lane counts before comparing percentages. And with
+`FV_SEED_MODE=random` the generated tests differ between campaigns; pin a seed
+if the point is to measure the effect of a change rather than to hunt bugs.
 
 ## Reading the results
 
