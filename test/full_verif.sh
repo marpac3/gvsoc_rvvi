@@ -1,15 +1,23 @@
 #!/bin/bash
 # Full CV32E40Pv2 regression with Questa code coverage and GVSOC co-simulation.
 #
-# Runs the v2 regression perimeter (374 lanes over three TB configs) as a
-# parallel pool instead of the sequential script cv_regress emits, collects one
-# UCDB per lane, and merges the passing ones into per-config and cross-config
-# coverage databases plus HTML / module / covergroup reports.
+# Runs the v2 regression perimeter (374 lanes over the three base TB configs,
+# plus ~36 FPU-instruction lanes over the four raised-latency configs when
+# those are selected) as a parallel pool instead of the sequential script
+# cv_regress emits, collects one UCDB per lane, and merges the passing ones
+# into per-config and cross-config coverage databases plus HTML / module /
+# covergroup reports.
 #
 # Perimeter (cv32e40p/regress/README.md):
-#   pulp            xpulp_instr + interrupt_debug                           116
-#   pulp_fpu        xpulp_instr + interrupt_debug + fpu_instr               129
-#   pulp_fpu_zfinx  xpulp_instr + interrupt_debug + fpu_instr_zfinx         129
+#   pulp                    xpulp_instr + interrupt_debug                   116
+#   pulp_fpu                xpulp_instr + interrupt_debug + fpu_instr       129
+#   pulp_fpu_zfinx          xpulp_instr + interrupt_debug + fpu_instr_zfinx 129
+#   pulp_fpu_1cyclat        fpu_instr (FPU_*_LAT=1 APU write-back timing)     9
+#   pulp_fpu_2cyclat        fpu_instr (FPU_*_LAT=2)                           9
+#   pulp_fpu_zfinx_1cyclat  fpu_instr_zfinx (LAT=1)                           9
+#   pulp_fpu_zfinx_2cyclat  fpu_instr_zfinx (LAT=2)                           9
+# The latency configs are opt-in via FV_CFGS: the default config list stays
+# the three base ones.
 #
 # Usage:   test/full_verif.sh [output-dir]
 #
@@ -29,6 +37,14 @@
 #   FV_TMO_FILE=<file>      per-lane timeout overrides, one "key seconds" per
 #                           line, key being either "cfg/label" or a bare TEST
 #                           name. Takes precedence over the built-in table.
+#   FV_UVMTMO_FILE=<file>   per-lane UVM phase-timeout overrides (SIM time,
+#                           ns), one "key ns" per line, same key format as
+#                           FV_TMO_FILE. Appends CFG_PLUSARGS="+UVM_TIMEOUT=<ns>"
+#                           to the lane's make command (make: last assignment
+#                           wins, replacing the regress-yaml value, which for
+#                           these tests carries only +UVM_TIMEOUT). Keep the
+#                           value BELOW the TB watchdog (100e6 ns) or the
+#                           uvm_fatal TIMEOUT fires first.
 #   FV_XFAIL_FILE=<file>    known-open lanes, one "cfg/label" or bare TEST name
 #                           per line (# comments allowed). They are reported as
 #                           KNOWN_FAIL, kept out of the coverage merge, and do
@@ -137,6 +153,7 @@ COV=${FV_COV:-YES}
 SEED_MODE=${FV_SEED_MODE:-random}
 TIMEOUT_DEF=${FV_TIMEOUT:-2400}
 TMO_FILE=${FV_TMO_FILE:-}
+UVMTMO_FILE=${FV_UVMTMO_FILE:-}
 XFAIL_FILE=${FV_XFAIL_FILE:-}
 TRACE=${FV_TRACE:-YES}
 FILTER=${FV_FILTER:-}
@@ -153,6 +170,11 @@ yamls_for_cfg() {
         pulp)           echo "cv32e40pv2_xpulp_instr.yaml cv32e40pv2_interrupt_debug.yaml" ;;
         pulp_fpu)       echo "cv32e40pv2_xpulp_instr.yaml cv32e40pv2_interrupt_debug.yaml cv32e40pv2_fpu_instr.yaml" ;;
         pulp_fpu_zfinx) echo "cv32e40pv2_xpulp_instr.yaml cv32e40pv2_interrupt_debug.yaml cv32e40pv2_fpu_instr_zfinx.yaml" ;;
+        # Raised-latency FPU configs (FPU_ADDMUL_LAT / FPU_OTHERS_LAT = 1, 2):
+        # FPU instruction lanes only - the xpulp/interrupt yamls do not
+        # exercise the APU write-back timing these configs exist to stress.
+        pulp_fpu_1cyclat|pulp_fpu_2cyclat)             echo "cv32e40pv2_fpu_instr.yaml" ;;
+        pulp_fpu_zfinx_1cyclat|pulp_fpu_zfinx_2cyclat) echo "cv32e40pv2_fpu_instr_zfinx.yaml" ;;
         *)              return 1 ;;
     esac
 }
@@ -161,6 +183,8 @@ add_test_cfg_for_cfg() {
     case $1 in
         pulp_fpu)       echo "floating_pt_instr_en" ;;
         pulp_fpu_zfinx) echo "floating_pt_zfinx_instr_en" ;;
+        pulp_fpu_1cyclat|pulp_fpu_2cyclat)             echo "floating_pt_instr_en" ;;
+        pulp_fpu_zfinx_1cyclat|pulp_fpu_zfinx_2cyclat) echo "floating_pt_zfinx_instr_en" ;;
         *)              echo "" ;;
     esac
 }
@@ -331,6 +355,13 @@ lane_timeout() {
     echo "${v:-$TIMEOUT_DEF}"
 }
 
+# Per-lane +UVM_TIMEOUT override (ns of sim time). Empty when no override.
+lane_uvm_timeout() {
+    local key=$1 test=$2
+    [ -n "$UVMTMO_FILE" ] && [ -r "$UVMTMO_FILE" ] || { echo ""; return; }
+    awk -v k="$key" -v t="$test" '$1==k || $1==t {print $2; exit}' "$UVMTMO_FILE"
+}
+
 is_known_fail() {
     local key=$1 test=$2
     [ -n "$XFAIL_FILE" ] && [ -r "$XFAIL_FILE" ] || return 1
@@ -363,19 +394,48 @@ lane_ucdb() {
 run_lane() {
     local cfg=$1 label=$2 test=$3 tcfg=$4 ridx=$5 cmd=$6 slot=$7
     local logf="$OUT/logs/$cfg/$label.log"
-    local rundir tmo t0 t1 rc verdict mm ucdb
+    local rundir tmo uvmtmo t0 t1 rc verdict mm ucdb
     rundir=$(lane_rundir "$cfg" "$test" "$tcfg" "$ridx")
     tmo=$(lane_timeout "$cfg/$label" "$test")
+    uvmtmo=$(lane_uvm_timeout "$cfg/$label" "$test")
+    # make command-line variables: the LAST assignment wins, so appending a
+    # CFG_PLUSARGS replaces the one embedded in the regress-yaml lane command
+    # (verified: every CFG_PLUSARGS in cv32e40p/regress/*.yaml carries only
+    # +UVM_TIMEOUT). UVM itself honours the FIRST +UVM_TIMEOUT plusarg, so
+    # replacement - not addition - is the only safe override.
+    [ -n "$uvmtmo" ] && cmd="$cmd CFG_PLUSARGS=\"+UVM_TIMEOUT=$uvmtmo\""
     mkdir -p "$(dirname "$logf")"
 
     # A leftover run dir is the one way this harness can report a false pass:
     # if make dies before vsim starts, the previous log still says PASSED.
     rm -rf "$rundir"
 
+    # Latency-aware FS-lag window: FPU_ADDMUL_LAT/FPU_OTHERS_LAT is a
+    # compile-time define the DPI bridge cannot see, so the APU latency is
+    # exported per config as CV_RVVI_APU_LAT (bridge: window = 10 + 5*lat,
+    # opened on every APU-class FP op; 0/unset = historical behaviour).
+    # Read from the AUTHORITATIVE source - the cfg yaml the TB is compiled
+    # with - never string-matched on the cfg NAME: a renamed cfg, a new cfg
+    # with another naming scheme, or a define changed without a rename would
+    # hand the bridge the wrong window and produce phantom FS-lag FAILs on a
+    # conformant DUT, with no error anywhere.
+    local apulat=0 cfgyaml othlat
+    cfgyaml="$CVV/cv32e40p/tests/cfg/$cfg.yaml"
+    if [ -r "$cfgyaml" ]; then
+        apulat=$(grep -oE 'FPU_ADDMUL_LAT=[0-9]+' "$cfgyaml" | head -1 | cut -d= -f2)
+        othlat=$(grep -oE 'FPU_OTHERS_LAT=[0-9]+' "$cfgyaml" | head -1 | cut -d= -f2)
+        apulat=${apulat:-0}
+        if [ -n "$othlat" ] && [ "$othlat" != "$apulat" ]; then
+            echo "full_verif: WARN $cfg FPU_ADDMUL_LAT=$apulat != FPU_OTHERS_LAT=$othlat - the bridge window follows ADDMUL" >&2
+        fi
+    else
+        echo "full_verif: WARN cfg yaml unreadable ($cfgyaml) - CV_RVVI_APU_LAT=0" >&2
+    fi
+
     t0=$(date +%s)
     # No --foreground: GNU timeout then runs the child in its own process group
     # and signals the whole group, so vsim does not survive holding a license.
-    ( cd "$UVMT" && timeout -k 20 "$tmo" bash -c "$cmd" ) > "$logf" 2>&1
+    ( cd "$UVMT" && CV_RVVI_APU_LAT=$apulat timeout -k 20 "$tmo" bash -c "$cmd" ) > "$logf" 2>&1
     rc=$?
     t1=$(date +%s)
 
@@ -613,7 +673,7 @@ setup_env || exit 1
     echo "coverage: $COV"
     echo "seed:     $SEED_MODE"
     echo "trace:    $TRACE"
-    echo "timeout:  ${TIMEOUT_DEF}s default${TMO_FILE:+, overrides from $TMO_FILE}"
+    echo "timeout:  ${TIMEOUT_DEF}s default${TMO_FILE:+, overrides from $TMO_FILE}${UVMTMO_FILE:+; uvm-timeout overrides from $UVMTMO_FILE}"
     echo "questa:   $(vsim -version 2>/dev/null | head -1)"
 } >> "$SUMMARY"
 
