@@ -1113,6 +1113,20 @@ int gvsoc_engine_get_csr(uint32_t csr_addr, uint32_t *value)
         return 1;
     }
 
+    /* fflags (0x001) / frm (0x002): architectural views into fcsr
+     * (fcsr.raw = {frm[7:5], fflags[4:0]}), not separate registers in the
+     * v2 model - the map carries only 0x003. */
+    if (csr_addr == 0x001)
+    {
+        *value = (uint32_t)(g_iss->csr.fcsr.raw & 0x1F);
+        return 1;
+    }
+    if (csr_addr == 0x002)
+    {
+        *value = (uint32_t)((g_iss->csr.fcsr.raw >> 5) & 0x7);
+        return 1;
+    }
+
     auto it = g_csr_value_map.find(csr_addr);
     if (it == g_csr_value_map.end())
     {
@@ -1214,10 +1228,33 @@ int gvsoc_engine_set_csr(uint32_t csr_addr, uint32_t value)
         return 1;
     }
 
+    /* fflags/frm: views into fcsr.raw, mirroring get_csr. A resync forcing
+     * the compared-CSR set lands here for 0x001/0x002; without the view
+     * mapping each hit logged an unthrottled "not in map" line - 310k of
+     * them on frm-heavy seeds - and the force silently no-oped. */
+    if (csr_addr == 0x001)
+    {
+        g_iss->csr.fcsr.raw = (g_iss->csr.fcsr.raw & ~(iss_reg_t)0x1F) |
+                              (value & 0x1F);
+        return 1;
+    }
+    if (csr_addr == 0x002)
+    {
+        g_iss->csr.fcsr.raw = (g_iss->csr.fcsr.raw & ~(iss_reg_t)0xE0) |
+                              ((value & 0x7) << 5);
+        return 1;
+    }
+
     auto it = g_csr_value_map.find(csr_addr);
     if (it == g_csr_value_map.end())
     {
-        ENGINE_LOG("set_csr: addr 0x%03x not in map, ignored", csr_addr);
+        static uint64_t unmapped_log_count = 0;
+        if (++unmapped_log_count <= 10)
+        {
+            ENGINE_LOG("set_csr: addr 0x%03x not in map, ignored%s", csr_addr,
+                       unmapped_log_count == 10 ?
+                       " (suppressing further unmapped-CSR messages)" : "");
+        }
         return 0;
     }
 
