@@ -55,8 +55,9 @@
 #     Cv32e40pCore::mret_handle).
 #     (5) execute-trigger vs the standing irq-check suppression: check()
 #     never saw the tdata2 boundary, the ISS ran one insn past the DUT's
-#     trigger entry - engine_at_armed_trigger lowers the skip for exactly
-#     that dispatch, the spontaneous entry certifies (debug_test_trigger).
+#     trigger entry - the async gate is consumed inside check() and the
+#     personality evaluates the trigger ahead of it on every dispatch
+#     boundary, so the entry certifies model-side (debug_test_trigger).
 #     Cause priority on a shared boundary follows the RTL, per entry
 #     path: TRIGGER overrides an armed haltreq (DBG_TAKEN_ID table) but
 #     YIELDS to a closing single-step window (DBG_TAKEN_IF's cause mux
@@ -86,6 +87,17 @@
 #     /data2/marco.paci/validation-evidence/quickval_gate_20260811_c2):
 #     zero regressions, the three KNOWN_FAIL are exactly the documented
 #     xfails (interrupt_nested, debug_test_boot_set, coremark).
+#   - PARITY AUDIT 2026-08-12: all_csr_por and load_store_rs1_zero added
+#     (CFG=pulp) - the only two tests of the official CV32E40Pv2 sign-off
+#     matrix (CV32E40Pv2_test_list.xlsx) that had no quick_val lane. See
+#     cv32e40p/docs/GVSOC_vplan_parity_report.md for the full audit.
+#     load_store_rs1_zero PASS (28s). all_csr_por diverged at pmpcfg0
+#     (retire #1158407: the RTL has no PMP and raises illegal, the model
+#     declared the bank even with the PmpEmpty variant) - FIXED by
+#     undeclaring pmpcfg0..15/pmpaddr0..63 in Cv32e40pCsr; the full CSR
+#     sweep now PASSES (2212s, hence TMO=3600) with csr_access/modeled/
+#     readonly non-regression PASS. Evidence
+#     /data2/.../{parity_lanes,pmp_fix_val}_20260812.
 #   - debug-mode tests (debug_hwloop_test, pulp_hardware_loop_debug_test):
 #     the reference model now follows the DUT into debug the informed way
 #     (engine take-debug on the rvvi.debug_mode edge, dpc/hwloop CSRs
@@ -325,6 +337,8 @@ run|debug_hwloop_test|debug_hwloop_test|
 run|custom_opcode_illegal_test|custom_opcode_illegal_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|cv32e40pv2_illegal_ro_csr_access_test|cv32e40pv2_illegal_ro_csr_access_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|cv32e40p_csr_access_test|cv32e40p_csr_access_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
+run|all_csr_por|all_csr_por|CFG_PLUSARGS="+UVM_TIMEOUT=300000000" TMO=3600
+run|load_store_rs1_zero|load_store_rs1_zero|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
 run|jalr_test|jalr_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|pulp_bit_manipulation|pulp_bit_manipulation|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|pulp_general_alu|pulp_general_alu|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
