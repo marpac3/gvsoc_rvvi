@@ -420,7 +420,35 @@ The engine certifies an injected entry only on positive proof: the entry
 observed on its own dispatch (a `trap_seq` bump), exactly one new commit
 above the pre-injection count, and that commit stamped with the
 post-entry `trap_seq` — a program instruction draining after the entry is
-rejected loudly instead of silently certified. The remaining KNOWN_FAIL
+rejected loudly instead of silently certified. The certification also
+checks the boundary itself against the DUT: for a plain kill entry the
+DUT's `dpc` IS the kill boundary, so an ISS whose `current_insn` differs
+entered off the DUT's boundary and the entry is refused even when its own
+boundary is clean — "clean but wrong" was exactly the undiagnosed by-seed
+shape (a phantom breakpoint exception parked the ISS on `mtvec`, the
+entry certified there, and only the `mepc` compare surfaced it fifty rows
+later). ebreak entries are exempt (dpc holds the ebreak's own pc while
+the boundary sits one instruction past it — the structural
+retire-vs-capture offset), recognized collisions are exempt (the pre-take
+boundary is certified separately against the collide mepc), a WFI-parked
+ISS is exempt as everywhere else in the boundary bookkeeping, and the
+bridge waives the check for unrecognized entry collisions, where dpc is
+an un-executed entry target the boundary legitimately precedes.
+
+Unrecognized entry collisions carry one more repair. When the collision
+is not recognized (no interrupt-flagged `mcause` write on the entry row)
+the model misses that one take outright, and `{MIE, MPIE}` never
+reconverges on its own: the pair is a fixed point of the entry/mret
+dynamics — an entry maps `(m,p)` to `(0,m)`, `mret` maps it back — so a
+missed entry is a permanent phase error, not a transient. If the entry
+row carries no `mstatus` write to compare against, the bridge splices MIE
+and MPIE from the DUT mirror into the model — the same two bits the
+entry-row force already imposes without any gate — but only when the two
+sides disagree by exactly one entry of phase; any other shape is refused
+loudly (`splice REFUSED`) and left to diverge visibly. The phase
+classifier is deliberately weak — post-entry states cluster on the same
+MPIE side — so the refusal count is a diagnostic, never a health gate.
+The remaining KNOWN_FAIL
 residual of the debug axis (`debug_test`) is a DUT-side tracer artifact,
 not a model or seam defect: on a haltreq entry through DBG_TAKEN_ID the
 RVFI tracer emits a retire for the instruction *killed in ID* — complete
@@ -525,6 +553,17 @@ P1 — behavioral (false mismatches / stalls):
 - hand re-implemented CSR read fixups and write masks: every CSR semantics
   change in the ISS must be mirrored manually in the bridge, so drift over
   time is guaranteed;
+- `mstatus.FS` observability skews by one row around the FPU: the RTL
+  marks FS dirty at write-back while the model marks it on the
+  instruction itself, so a compare armed on the very next row can catch
+  the gap. APU-class ops are covered by the latency-aware compare window
+  (`CV_RVVI_APU_LAT`, exported per config by `full_verif.sh` from the cfg
+  yaml; iterative fdiv/fsqrt open it at any latency) — FP *loads* are
+  not: a generated `csrw mstatus` immediately followed by `flw` can
+  surface a single self-healing mstatus mismatch at zero latency (seen
+  once, corev_fp_mstatus_fs_test, 2026-08-18 confirmation campaign).
+  Opening the window on the LOAD-FP opcodes is the one-line fix
+  candidate;
 - `skip_irq_check` re-asserted at every step, and the post-acquire reset
   forcing: both depend on ISS side effects that might change.
 

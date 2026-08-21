@@ -207,7 +207,13 @@ And performance-counter reads of the CSRs still declared volatile by the TB
 (cycle/mcycle and the hpm bank) are synchronized from the DUT by default
 (`CV_RVVI_VOLATILE_CSR_SYNC=1`), which masks divergences on those counters
 by design; disable the knob to measure them. The modeled counters above are
-NOT synchronized: a read of minstret lands in the honest compare.
+NOT synchronized: a read of minstret lands in the honest compare. The
+`mstatus.FS` compare around the FPU is latency-aware: `full_verif.sh`
+exports `CV_RVVI_APU_LAT` per config (parsed from the cfg yaml's
+`FPU_ADDMUL_LAT`, never from the cfg name) and the bridge holds a short
+compare window after APU-class ops — at zero latency only the iterative
+fdiv/fsqrt open it, so FP loads sit outside the window (see the FS entry
+under Known fragilities in `ARCHITECTURE.md`).
 
 ## From a red test to a cause
 
