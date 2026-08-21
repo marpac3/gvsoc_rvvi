@@ -211,6 +211,24 @@
 #     lifted 2026-08-05 (decision E) but the ~78k reactive resyncs do not
 #     fit the default per-lane budget - VALIDATED PASS 2026-08-11 with a
 #     dedicated TMO=6000 (final gate: rc=0 at 3165s), lane is gen now.
+#   - corev_rand_interrupt_exception moved to gen_xfail 2026-08-18: the
+#     residual is the documented stale-injection seam (the driver nominates
+#     an async take when the ISS already ran past the DUT's boundary - "no
+#     clean recovery from here", ~1 event per million retires, by-seed).
+#     SEED=1 replica: ONE event at retire #312634 after a clean run, all 10
+#     logged mismatches are the downstream one-row mstatus.MIE phase shift,
+#     zero GPR/PC divergence; the same test PASSES on pulp/pulp_fpu/
+#     pulp_fpu_zfinx in the 413-lane campaign. Bridge seam, not a model
+#     defect; tracked in the campaign xfail list with the decision record.
+#   - FINAL RUN 2026-08-18 (12:07-18:43, definitive build, 4 configs):
+#     157 PASS / 2 KNOWN_FAIL (nested, coremark) / 2 SKIP + the
+#     interrupt_exception xfail above. all_csr_por hit the TMO=3600 cap as
+#     a pure wall-clock artifact (host load ~275: 5.07M clean retires, zero
+#     compare mismatches, sweep still progressing when killed; passed in
+#     2212s on a quiet host) - infra, not a regression. CONFIRMED by a
+#     single-lane rerun on the same loaded host: SIMULATION PASSED in
+#     3671s, 0 errors, 0 compare mismatches over 5.09M instruction
+#     compares. Lane TMO raised 3600 -> 7200 to absorb host load.
 #   - corev_rand_interrupt_nested: NOT a co-sim gap - the generated test
 #     self-destructs (root-caused 2026-08-11). The handler re-enables
 #     mstatus.MIE 10 insns into its prologue (csrsi mstatus,8 at the
@@ -276,7 +294,7 @@ gen|corev_rand_instr_long_stall|corev_rand_instr_long_stall|
 gen|corev_rand_interrupt|corev_rand_interrupt|
 gen|corev_rand_interrupt_wfi|corev_rand_interrupt_wfi|
 gen|corev_rand_interrupt_wfi_mem_stress|corev_rand_interrupt_wfi_mem_stress|TMO=6000
-gen|corev_rand_interrupt_exception|corev_rand_interrupt_exception|
+gen_xfail|corev_rand_interrupt_exception|corev_rand_interrupt_exception|
 gen_xfail|corev_rand_interrupt_nested|corev_rand_interrupt_nested|TMO=900
 run|hello-world|hello-world|
 run|branch_zero|branch_zero|
@@ -337,7 +355,7 @@ run|debug_hwloop_test|debug_hwloop_test|
 run|custom_opcode_illegal_test|custom_opcode_illegal_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|cv32e40pv2_illegal_ro_csr_access_test|cv32e40pv2_illegal_ro_csr_access_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|cv32e40p_csr_access_test|cv32e40p_csr_access_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
-run|all_csr_por|all_csr_por|CFG_PLUSARGS="+UVM_TIMEOUT=300000000" TMO=3600
+run|all_csr_por|all_csr_por|CFG_PLUSARGS="+UVM_TIMEOUT=300000000" TMO=7200
 run|load_store_rs1_zero|load_store_rs1_zero|CFG_PLUSARGS="+UVM_TIMEOUT=30000000"
 run|jalr_test|jalr_test|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
 run|pulp_bit_manipulation|pulp_bit_manipulation|CFG_PLUSARGS="+UVM_TIMEOUT=1000000"
