@@ -691,10 +691,29 @@ static void take_retire_event(uint64_t dutPc, uint64_t dutInsBin, bool is_trap)
                     opcode == 0x4Bu || opcode == 0x4Fu)) {
             /* FMADD/FMSUB/FNMSUB/FNMADD go through the APU too. */
             opens = true;
+        } else if (opcode == 0x07u ||
+                   ((g_retire.insn & 0x3u) != 0x3u &&
+                    (g_retire.insn & 0x3u) != 0x1u &&
+                    ((g_retire.insn >> 13) & 0x7u) == 0x3u)) {
+            /* FP loads dirty mstatus.FS as well, and the DUT commits that
+             * at the load write-back - one row after the retire even at
+             * lat 0 (fv_confirm fp_mstatus_fs_test: csrrw mstatus ->
+             * c.flw -> single CSR mismatch on the following row with
+             * fs_win=0).  32-bit LOAD-FP (opcode 0x07) plus the RVC
+             * quadrant-0 c.flw / quadrant-2 c.flwsp (funct3 011; quadrant
+             * 1 excluded - that encoding is c.lui/c.addi16sp).  RV32-only
+             * decode: on RV64 these RVC slots are c.ld/c.ldsp. */
+            opens = true;
         }
         if (opens) {
+            /* Reset the early-close flag only on a FRESH open: FP loads are
+             * frequent, and wiping it on every back-to-back re-arm would let
+             * an FP-dense block keep the window open indefinitely, defeating
+             * the bounded-tolerance invariant.  Re-arms still extend the
+             * countdown (back-to-back FP ops legitimately drain later). */
+            if (g_fs_lag_window == 0)
+                g_fs_lag_seen_diverged = false;
             g_fs_lag_window        = fs_lag_window_size();
-            g_fs_lag_seen_diverged = false;
             static uint64_t open_log = 0;
             if (++open_log <= 5)
                 BRIDGE_LOG("FS-lag window opened @ retire #%llu (insn 0x%08x, "
@@ -3139,13 +3158,15 @@ bool_t rvviRefCsrCompare(uint32_t /*hartId*/, uint32_t csrIndex)
     }
 
     if (dut_val != iss_val) {
-        /* mstatus.FS write-back lag: inside the window opened by a DIVSQRT
-         * retire, tolerate a difference confined to FS(14:13)/SD(31) with
-         * the model side already dirty - the RTL updates FS at the APU
-         * write-back, 1-8 retires later, and software cannot observe the
-         * skew (csr_apu_stall holds CSR accesses while DIVSQRT is in
-         * flight). Everything else in mstatus stays honestly compared,
-         * and an FS difference OUTSIDE the window still fails. */
+        /* mstatus.FS write-back lag: inside the window opened by an
+         * FS-dirtying retire (DIVSQRT always; every OP-FP/FMADD when the
+         * APU latency is non-zero; FP loads), tolerate a difference
+         * confined to FS(14:13)/SD(31) with the model side already dirty -
+         * the RTL updates FS at the write-back, 1-8 retires later, and
+         * software cannot observe the skew (csr_apu_stall holds CSR
+         * accesses while the APU is in flight). Everything else in mstatus
+         * stays honestly compared, and an FS difference OUTSIDE the window
+         * still fails. */
         if (csrIndex == TRAP_CSR_MSTATUS && g_fs_lag_window > 0) {
             const uint32_t FS_SD_BITS = 0x80006000u;  /* SD | FS */
             if (((dut_val ^ iss_val) & ~FS_SD_BITS) == 0 &&
