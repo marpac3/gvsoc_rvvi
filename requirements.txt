@@ -1,0 +1,6 @@
+# Python dependencies for GVSOC and the core-v-verif test scripts.
+-r gvsoc/requirements.txt
+six
+typing_extensions
+PyYAML
+Jinja2

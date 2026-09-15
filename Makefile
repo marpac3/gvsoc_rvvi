@@ -4,6 +4,7 @@
 # Layout:  build/ (cmake GVSOC) · install/ (lib,bin,python,models) · work/ (config gvrun)
 #
 # Target:
+#   make setup                 build GVSOC, then the bridge libraries
 #   make gvsoc                  build GVSOC + the CV32E40P iss_v2 platforms
 #   make            (= all)     build libgvsoc_rvvi_v2.so / _v2_zfinx.so / librvvi_text.so
 #   make config-v2 BINARY=...   generate gvsoc_config.json (gvrun prepare)
@@ -11,11 +12,12 @@
 #   make clean / distclean
 # Knobs: DEBUG=1 (-g -O0 for gdb/VS Code) · V2_TARGET (core config, baked per target)
 #
-# Requires the Python env (gvrun/config-gen): micromamba -n gvsoc_env_3_12 (see README).
+# Requires an active Python environment with requirements.txt installed (see README).
 # The Python generators (cv32e40p-v2-standalone*.py, cv32e40p_exit/) live in the
 # gvsoc/pulp/ submodule and are installed by 'make gvsoc'.
 
-QUESTA_HOME ?= /tools/siemens/questa_2025.3/questasim
+# Set QUESTA_HOME or DPI_INCLUDE for the local simulator installation.
+DPI_INCLUDE ?= $(if $(QUESTA_HOME),$(QUESTA_HOME)/include,$(if $(VCS_HOME),$(VCS_HOME)/include))
 GVSOC_HOME  := $(abspath gvsoc)
 RVVI_DIR    := $(abspath RVVI)
 
@@ -76,14 +78,10 @@ CXXFLAGS_ENGINE_V2_ZFINX := $(CXXFLAGS_BASE) $(ISS_DEFINES_V2_ZFINX) -include $(
 # Library options only: at link time the objects MUST precede -lpulpvp.
 LDFLAGS := -L$(GVSOC_LIB) -lpulpvp -Wl,-rpath,$(GVSOC_LIB)
 
-ifdef QUESTA_HOME
-    CXXFLAGS                 += -I$(QUESTA_HOME)/include
-    CXXFLAGS_ENGINE_V2       += -I$(QUESTA_HOME)/include
-    CXXFLAGS_ENGINE_V2_ZFINX += -I$(QUESTA_HOME)/include
-else ifdef VCS_HOME
-    CXXFLAGS                 += -I$(VCS_HOME)/include
-    CXXFLAGS_ENGINE_V2       += -I$(VCS_HOME)/include
-    CXXFLAGS_ENGINE_V2_ZFINX += -I$(VCS_HOME)/include
+ifneq ($(strip $(DPI_INCLUDE)),)
+    CXXFLAGS                 += -I$(DPI_INCLUDE)
+    CXXFLAGS_ENGINE_V2       += -I$(DPI_INCLUDE)
+    CXXFLAGS_ENGINE_V2_ZFINX += -I$(DPI_INCLUDE)
 endif
 
 TARGET_V2       := libgvsoc_rvvi_v2.so
@@ -94,21 +92,27 @@ OBJS_V2_ZFINX   := rvvi_api2gvsoc.o gvsoc_engine_v2_zfinx.o rvvi_text_writer.o
 OBJS_TEXT       := rvvi_text_dpi.o rvvi_text_writer.o
 
 # Installed gvrun: it sets LD_LIBRARY_PATH/PATH/PYTHONPATH/USE_GVRUN/--platform by itself.
-# gvrun needs the Python env (see README): wrap it in 'micromamba run' when
-# micromamba is available, so the caller's shell does not have to activate it.
-GVSOC_PY_ENV ?= gvsoc_env_3_12
-MICROMAMBA   := $(shell command -v micromamba 2>/dev/null)
-ifneq ($(MICROMAMBA),)
-  GVRUN_ENV := $(MICROMAMBA) run -n $(GVSOC_PY_ENV)
-endif
+# Use the caller's Python environment, regardless of whether micromamba is on PATH.
+# Optional explicit wrapper: GVRUN_ENV="micromamba run -n my-env".
+GVRUN_ENV ?=
 GVRUN := $(GVRUN_ENV) timeout 120s $(INSTALLDIR)/bin/gvrun
 
-.PHONY: all gvsoc config-v2 trace clean distclean test
+.PHONY: all setup check-dpi-headers gvsoc config-v2 trace clean distclean test
 
 all: $(TARGET_V2) $(TARGET_V2_ZFINX) $(TARGET_TEXT)
 
+# Separate make invocations discover the ISA headers after GVSOC generates them,
+# including on the first build and with make -j.
+setup: check-dpi-headers
+	$(MAKE) gvsoc
+	$(MAKE) all
+
+check-dpi-headers:
+	@test -r "$(DPI_INCLUDE)/vpi_user.h" || { \
+		echo "vpi_user.h not found: set QUESTA_HOME or DPI_INCLUDE to the simulator headers" >&2; exit 1; }
+
 # Separate compilation: rvvi_api2gvsoc.cpp with the base flags, gvsoc_engine_v2.cpp with the ISS flags.
-rvvi_api2gvsoc.o: rvvi_api2gvsoc.cpp gvsoc_engine.hpp rvvi_text_writer.hpp
+rvvi_api2gvsoc.o: rvvi_api2gvsoc.cpp gvsoc_engine.hpp rvvi_text_writer.hpp | check-dpi-headers
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # rvvi_text_writer.cpp — standalone RVVI-TEXT formatter: pure C++, no ISS

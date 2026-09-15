@@ -12,19 +12,21 @@ build (submodules, GVSOC, bridge libraries) is covered in the top-level
 Every shell that runs simulations needs the simulator license and the
 cross-toolchain variables. Interactive shells usually get these from the
 user profile; non-interactive shells (scripts, CI, editors' terminals) do
-not read `~/.bashrc`, so set them explicitly:
+not read `~/.bashrc`, so set them explicitly. This example is specific to the
+Chips-it server; use your local simulator and toolchain paths elsewhere:
 
 ```bash
 source /etc/profile.d/modules.sh
 module load questa/2025.3
+export QUESTA_HOME=/tools/siemens/questa_2025.3/questasim
 export CV_SIMULATOR=vsim
 export CV_SW_TOOLCHAIN=/opt/riscv/corev-openhw-gcc-modded-v0.1
 export CV_SW_PREFIX=riscv64-unknown-elf-
 ```
 
-Rebuilds of GVSOC or the bridge also need the Python environment
-(`micromamba activate gvsoc_env_3_12`, or the one-shot
-`micromamba run -n gvsoc_env_3_12 ...` form) — see the README.
+Builds and simulations also need the Python environment from the README
+(`venv` or micromamba) active. Install the bridge's `requirements.txt`, which
+includes the Python dependencies of both GVSOC and the testbench scripts.
 
 When every test dies within seconds, check the license first. `lmutil`
 ships with Questa but is not on `PATH`; reach it relative to `vsim`:
@@ -78,7 +80,7 @@ A few things that save time:
 - A TB compiled with `RVVI_TRACE=YES` also needs `RVVI_TRACE=YES` on the run
   line: the flag gates plusargs at runtime, not only defines at compile time.
 - After editing ISS or bridge sources, rebuild the libraries in the submodule
-  (`micromamba run -n gvsoc_env_3_12 make gvsoc && make` from
+  (`make setup` in the active Python environment, from
   `vendor_lib/gvsoc_rvvi/`) before rerunning. The `.so` files are loaded at
   vsim startup; a stale build silently runs the old code.
 - Run artifacts land in `vsim_results/<CFG>/<TEST>/0/vsim-<TEST>.log`
@@ -97,10 +99,11 @@ Questa code coverage on the way:
 vendor_lib/gvsoc_rvvi/test/full_verif.sh [output-dir]
 ```
 
-It needs no shell setup — it loads Questa 2025.3 and the CoreV toolchain
-itself, and refuses to start on any other simulator version (UCDBs from
-different releases cannot be merged). The only prerequisite is that the GVSOC
-bridge libraries are already built. The default output directory is
+Activate the Python environment first; with a venv, also set `FV_PY=python`
+to override the script's micromamba command for `cv_regress`. The script loads
+Questa 2025.3 and the CoreV toolchain itself, and refuses to start on any other
+simulator version (UCDBs from different releases cannot be merged). The GVSOC
+bridge libraries must already be built. The default output directory is
 `/data2/$USER/fullverif_<timestamp>`; always keep it on `/data2`, a campaign
 writes tens of gigabytes and the run tree must not land in the repo or on NFS.
 
