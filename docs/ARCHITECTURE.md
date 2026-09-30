@@ -103,8 +103,11 @@ and depends on nothing of the core layout.
   reported first: the model treats an instruction without a decision point as an error. The client advances the
   engine one clock period at a time, and fails the step after 1,000,000 core cycles without a record, so that a
   model that spins or sleeps fails instead of hanging the caller.
-- `read_gpr()` and `read_csr()` read the state of the model: the reset state before the first step, then the
-  current state.
+- `volatile_csr()` declares a CSR whose value depends on timing that the model does not reproduce, and
+  `volatile_read()` gives the model the value that the RTL read from it, before the instruction that reads it
+  executes.
+- `read_gpr()`, `read_fpr()` and `read_csr()` read the state of the model: the reset state before the first step,
+  then the current state.
 
 ## cosim_run (`test/`)
 
@@ -242,9 +245,10 @@ the architectural state: the DUT shadow, which the testbench writes with `rvviDu
 instruction, and the reference shadow, written only by the commit records of the model.
 
 **Start.** `rvviRefInit()` reads `GVSOC_CONFIG`, the path of `gvsoc_config.json` (required), and opens the
-client. Then it reads the reset state of the model: the GPRs and the CSRs. This is the only direct read of the
-model state: from here on the reference shadow follows the commit records. It also sends the pin levels set
-before the model existed.
+client. Then it reads the reset state of the model: the GPRs, the FPRs when the core has F registers (no FPU, or
+Zfinx, means none), and the CSRs. This is the only direct read of the model state: from here on the reference
+shadow follows the commit records. It declares to the model the volatile CSRs set before, and sends the pin levels
+set before the model existed.
 
 **Every retire.** For each instruction that the DUT retires, the testbench passes the registers and CSRs that the
 instruction wrote (`rvviDutGprSet`, `rvviDutFprSet`, `rvviDutCsrSet`), then calls `rvviDutRetire`, or `rvviDutTrap`
@@ -268,12 +272,15 @@ the CSR list of the record: the bridge takes them from its `minstret` field.
 
 Each compare category prints its first 10 mismatches in detail.
 
-**Reset state.** Both shadows start from the reset state of the model.
+**Reset state.** The DUT shadow starts from the RTL reset state, with all registers zero, and the reference
+shadow from the reset state of the model, so the first compare checks the reset state of the model.
 
 **State setters.** The reference is never written from the DUT: `rvviRefCsrSet`, `rvviRefGprSet`, ... are
 rejected, except a CSR set to the value the model already holds at reset.
 
-**Volatile CSRs.** `rvviRefCsrSetVolatile` takes the CSR out of the CSR compare.
+**Volatile CSRs.** `rvviRefCsrSetVolatile` declares the CSR to the model and takes it out of the CSR compare. When
+the DUT retires a CSR instruction that reads a volatile CSR into rd != x0, the value it wrote to rd goes to the
+model before the step.
 
 **Shutdown.** `rvviRefShutdown()` runs at the end of the test, before the testbench reads the metrics. It logs the
 metrics and the compare-enabled CSRs that were never checked, because the model does not implement them or the

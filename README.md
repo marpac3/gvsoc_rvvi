@@ -45,13 +45,15 @@ cd <this repository> && make GVSOC_HOME=<gvsoc> GVSOC_INSTALL=<install>
 
 After every retire, the bridge compares the DUT state, which the testbench writes with `rvviDut*Set`, with the
 reference state, written only by the commit records of the model: PC, instruction, trap and debug mode, all
-GPRs, all FPRs, and every compare-enabled, non-volatile CSR that the model implements and the DUT reports. Both
-states start from the reset state of the model.
+GPRs, all FPRs, and every compare-enabled, non-volatile CSR that the model implements and the DUT reports. The
+DUT state starts from the RTL reset state (all registers zero) and the reference state from the model reset
+state, so the first compare checks the reset state of the model.
 
 The reference is never written from the DUT. The DUT only gives the model its inputs:
 - the interrupt lines and the debug request, with the instants the RTL samples them and the decision points
   where its controller evaluates them (`bridge/rvviDecisionApi.h`, an additive RVVI-API extension). The model
   takes interrupts and debug entries by itself.
+- the value read from a volatile CSR (`rvviRefCsrSetVolatile`, such as the performance counters).
 
 State setters (`rvviRefCsrSet`, `rvviRefGprSet`, ...) are rejected, except a CSR set to the value the model
 already holds at reset.
