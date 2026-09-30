@@ -16,8 +16,8 @@ This repository compares a CV32E40P RTL simulation in lock step with the CV32E40
 
 ```
 git submodule update --init
-cd <gvsoc> && make build TARGETS="cv32e40p_cosim;cv32e40p_cosim_mhpm29;cv32e40p_cosim_pulp;cv32e40p_cosim_pulp_fpu;cv32e40p_cosim_pulp_fpu_zfinx" \
-    MODULES=<this repository>/gvsoc INSTALLDIR=<install>
+cd <gvsoc> && make build MODULES=<this repository>/gvsoc INSTALLDIR=<install> \
+    TARGETS="cv32e40p_cosim;cv32e40p_cosim_mhpm29;cv32e40p_cosim_pulp;cv32e40p_cosim_pulp_fpu;cv32e40p_cosim_pulp_fpu_zfinx;cv32e40p_cosim_pulp_cluster;cv32e40p_cosim_pulp_cluster_fpu;cv32e40p_cosim_pulp_cluster_fpu_zfinx"
 make GVSOC_HOME=<gvsoc> GVSOC_INSTALL=<install>
 ```
 
@@ -25,7 +25,8 @@ make GVSOC_HOME=<gvsoc> GVSOC_INSTALL=<install>
 
 1. For each test program, write the platform configuration:
    `gvrun --target-dir=<this repository>/gvsoc --target=<target> --parameter binary=<elf> --work-dir=<dir> prepare`,
-   with `<target>` one of `cv32e40p_cosim[_pulp[_fpu[_zfinx]]]` or `cv32e40p_cosim_mhpm29` (NUM_MHPMCOUNTERS=29)
+   with `<target>` one of `cv32e40p_cosim[_pulp[_cluster][_fpu[_zfinx]]]` or `cv32e40p_cosim_mhpm29`
+   (NUM_MHPMCOUNTERS=29)
 2. Run the simulator with `GVSOC_CONFIG=<dir>/gvsoc_config.json`, `-sv_lib <build>/libcv32e40p_rvvi`,
    the files of `sv/gvsoc_rvvi.f` and `rvvi_trace2api` bound to the `rvviTrace` interface of the testbench.
 
