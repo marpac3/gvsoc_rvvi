@@ -24,7 +24,8 @@ from interco.router_v2 import Router, RouterConfig, RouterMapping
 from utils.loader.loader_v2 import ElfLoader
 from pulp.cpu.iss.cv32e40p import Cv32e40p
 from pulp.cpu.iss.cv32e40p_config import Cv32e40pConfig
-from cv32e40p_platform.devices import (Cv32e40pExitDevice, Cv32e40pSparseMem,
+from cv32e40p_platform.devices import (Cv32e40pExitDevice, Cv32e40pExitDeviceConfig,
+                                    Cv32e40pSparseMem,
                                     Cv32e40pIrqInjector, IRQ_LINES, IRQ_NUMBERS)
 
 
@@ -68,6 +69,10 @@ class Cv32e40pCosimConfig(Config):
 
     debug_rom: MemoryV3Config = cfg_field(init=False, desc=(
         "Debug ROM configuration"
+    ))
+
+    exit: Cv32e40pExitDeviceConfig = cfg_field(init=False, desc=(
+        "Virtual EXIT device configuration"
     ))
 
     router: RouterConfig = cfg_field(init=False, desc=(
@@ -116,6 +121,7 @@ class Cv32e40pCosimConfig(Config):
                                         init=False)
         self.debug_rom = MemoryV3Config('debug_rom', size=0x1000, atomics=False, latency=0,
                                         init=False)
+        self.exit = Cv32e40pExitDeviceConfig('exit')
         self.router = RouterConfig(kind='bandwidth')
         self.mem_mapping       = RouterMapping(name='mem_mapping',
                                                base=0x0000_0000, size=0x0040_0000)
@@ -143,7 +149,7 @@ class Cv32e40pCosimSoc(gvsoc.systree.Component):
         stdout = Memory             ( self, 'stdout'        , config=config.stdout    )
         timer  = Memory             ( self, 'timer'         , config=config.timer     )
         dbgrom = Memory             ( self, 'debug_rom'     , config=config.debug_rom )
-        exit_d = Cv32e40pExitDevice ( self, 'exit'                                    )
+        exit_d = Cv32e40pExitDevice ( self, 'exit'          , config=config.exit      )
         bg_mem = Cv32e40pSparseMem  ( self, 'background_mem'                          )
         ico    = Router             ( self, 'ico'           , config=config.router    )
         core   = Cv32e40p           ( self, 'core'          , config=config.core      )
@@ -187,8 +193,14 @@ class Cv32e40pCosim(gvsoc.systree.Component):
             description='Main RAM response latency in cycles'
         ).get_value()
 
+        stop_on_exit = TargetParameter(
+            self, name='stop_on_exit', value=True, cast=bool,
+            description='Stop when the software reports its end (False for co-simulation)'
+        ).get_value()
+
         config = Cv32e40pCosimConfig('soc', fpu=fpu, zfinx=zfinx, corev_pulp=corev_pulp,
                                      ram_latency=ram_latency)
+        config.exit.stop_on_exit = stop_on_exit
 
         clock = vp.clock_domain.Clock_domain(self, 'clock', frequency=50000000)
         soc = Cv32e40pCosimSoc(self, 'soc', config, binary)

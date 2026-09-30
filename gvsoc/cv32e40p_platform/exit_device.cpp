@@ -8,13 +8,15 @@
  * CV32E40P virtual exit device: mirrors the UVM virtual peripheral at
  * 0x20000000 — status flags (+0x00, magic 123456789 = PASSED, 1 = FAILED),
  * exit_valid (+0x04), signature registers (+0x08..+0x10). Writes persist in
- * a 256B backing store and read back like testbench memory.
+ * a 256B backing store and read back like testbench memory. A reported end
+ * stops the simulation unless stop_on_exit is false (co-simulation).
  */
 
 #include <cstring>
 
 #include <vp/vp.hpp>
 #include <vp/itf/io_v2.hpp>
+#include <cv32e40p_platform/devices/cv32e40p_exit_device_config.hpp>
 
 #define VP_STATUS_FLAGS_OFFSET  0x00
 #define VP_EXIT_VALID_OFFSET    0x04
@@ -29,6 +31,9 @@ public:
 
 private:
     static vp::IoReqStatus req(vp::Block *__this, vp::IoReq *req);
+    void end(int status);
+
+    Cv32e40pExitDeviceConfig cfg;
 
     vp::Trace   trace;
     vp::IoSlave in{&Cv32e40pExitDevice::req};
@@ -39,7 +44,7 @@ private:
 };
 
 Cv32e40pExitDevice::Cv32e40pExitDevice(vp::ComponentConf &config)
-    : vp::Component(config)
+    : vp::Component(config, this->cfg)
 {
     this->traces.new_trace("trace", &this->trace, vp::DEBUG);
     this->new_slave_port("input", &this->in);
@@ -79,18 +84,18 @@ vp::IoReqStatus Cv32e40pExitDevice::req(vp::Block *__this, vp::IoReq *req)
         if (wdata == 123456789U)  /* 0x075BCD15 — TEST PASSED (same magic as UVM VP) */
         {
             _this->trace.msg(vp::Trace::LEVEL_DEBUG,
-                "vp_status write: wdata=0x%08x — TEST PASSED, stopping simulation\n", wdata);
+                "vp_status write: wdata=0x%08x — TEST PASSED\n", wdata);
             fprintf(stdout, "[cv32e40p_exit] tests_passed=1 exit_value=0x00000000\n");
             fflush(stdout);
-            _this->time.get_engine()->quit(0);
+            _this->end(0);
         }
         else if (wdata == 1U)  /* TEST FAILED */
         {
             _this->trace.msg(vp::Trace::LEVEL_DEBUG,
-                "vp_status write: wdata=0x%08x — TEST FAILED, stopping simulation\n", wdata);
+                "vp_status write: wdata=0x%08x — TEST FAILED\n", wdata);
             fprintf(stdout, "[cv32e40p_exit] tests_failed=1 exit_value=0x00000001\n");
             fflush(stdout);
-            _this->time.get_engine()->quit(1);
+            _this->end(1);
         }
         else
         {
@@ -101,10 +106,10 @@ vp::IoReqStatus Cv32e40pExitDevice::req(vp::Block *__this, vp::IoReq *req)
 
     case VP_EXIT_VALID_OFFSET:
         _this->trace.msg(vp::Trace::LEVEL_DEBUG,
-            "exit_valid asserted: exit_value=0x%08x — stopping simulation\n", wdata);
+            "exit_valid asserted: exit_value=0x%08x\n", wdata);
         fprintf(stdout, "[cv32e40p_exit] exit_valid=1 exit_value=0x%08x\n", wdata);
         fflush(stdout);
-        _this->time.get_engine()->quit((int32_t)wdata);
+        _this->end((int32_t)wdata);
         break;
 
     case VP_SIG_START_OFFSET:
@@ -119,10 +124,10 @@ vp::IoReqStatus Cv32e40pExitDevice::req(vp::Block *__this, vp::IoReq *req)
 
     case VP_SIG_WRITE_OFFSET:
         _this->trace.msg(vp::Trace::LEVEL_DEBUG,
-            "signature write triggered — stopping simulation (exit_value=0)\n");
+            "signature write triggered (exit_value=0)\n");
         fprintf(stdout, "[cv32e40p_exit] signature write → exit_valid=1 exit_value=0x00000000\n");
         fflush(stdout);
-        _this->time.get_engine()->quit(0);
+        _this->end(0);
         break;
 
     default:
@@ -132,6 +137,16 @@ vp::IoReqStatus Cv32e40pExitDevice::req(vp::Block *__this, vp::IoReq *req)
     }
 
     return vp::IO_REQ_DONE;
+}
+
+void Cv32e40pExitDevice::end(int status)
+{
+    // In co-simulation the testbench core keeps running after the report:
+    // so does the model.
+    if (this->cfg.stop_on_exit)
+    {
+        this->time.get_engine()->quit(status);
+    }
 }
 
 extern "C" vp::Component *gv_new(vp::ComponentConf &config)

@@ -4,8 +4,12 @@
 #
 # Authors: Marco Paci (marco.paci@chips.it)
 
+from typing import Annotated
+
 import gvsoc.systree
 import gvsoc.signature
+from config_tree import Config, cfg_field
+from gvrun.runtime import Runtime
 
 # Line names and their interrupt numbers, index-aligned, in RVVI net order
 # (MSWInterrupt, MTimerInterrupt, MExternalInterrupt, LocalInterrupt0..15).
@@ -14,11 +18,24 @@ IRQ_LINES: tuple = ('msi', 'mti', 'mei',
 IRQ_NUMBERS: tuple = (3, 7, 11, *range(16, 32))
 
 
+class Cv32e40pExitDeviceConfig(Config):
+
+    # Runtime: set per run (gvrun --parameter stop_on_exit=...) without
+    # rebuilding the platform.
+    stop_on_exit: Annotated[bool, Runtime] = cfg_field(default=True, dump=True, desc=(
+        "Stop the simulation when the software reports its end. False keeps the "
+        "core running after the report, like the testbench (co-simulation)"
+    ))
+
+    def __post_init__(self):
+        super().__post_init__()
+
+
 class Cv32e40pExitDevice(gvsoc.systree.Component):
     """UVM virtual peripheral at 0x20000000: test status and exit value."""
 
-    def __init__(self, parent, name):
-        super().__init__(parent, name)
+    def __init__(self, parent, name, config: Cv32e40pExitDeviceConfig):
+        super().__init__(parent, name, config=config)
         self.add_sources(['cv32e40p_platform/exit_device.cpp'])
 
     def i_INPUT(self) -> gvsoc.systree.SlaveItf:
