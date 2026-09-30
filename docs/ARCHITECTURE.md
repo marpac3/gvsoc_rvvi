@@ -9,6 +9,8 @@ every instruction retired by the RTL, it steps the model and compares the state 
 
 ```
 RTL testbench
+  RVFI -> RVVI-TRACE -> rvvi_trace2api.sv
+  decision monitor (interrupts, debug)
       |
       |  RVVI-API (DPI) + decision-point extension
       v
@@ -285,6 +287,39 @@ functional compare.
 
 `rvviDutBusWrite` fails too, so stores are not compared, and so does `rvviRefMemorySetVolatile`: every load of the
 model reads its own memory.
+
+## rvvi_trace2api (`sv/rvvi_trace2api.sv`)
+
+`rvvi_trace2api` is the SystemVerilog module that connects the testbench to the bridge. The testbench instantiates it
+and connects it to its RVVI-TRACE interface (`rvviTrace`).
+
+At every clock edge the interface holds the instructions that the core retired in the cycle. For each one it has:
+
+- `valid`, `pc_rdata` and `insn`: the instruction retired, its PC and its encoding;
+- `trap`: the instruction trapped;
+- `debug_mode`: the core is in debug mode;
+- `x_wdata` and `f_wdata`: the values written to the GPRs and to the FPRs; `csr`: the values of the CSRs;
+- `x_wb`, `f_wb` and `csr_wb`: a flag for each register and CSR, set when the instruction wrote it. The core-v-verif
+  testbench sets the flag of a CSR when its value changes, also when a trap or a counter changes it.
+
+At every clock edge, for each retired instruction, `rvvi_trace2api` calls the bridge through DPI:
+
+1. it passes the registers and the CSRs whose flag is set (`rvviDutGprSet`, `rvviDutFprSet`, `rvviDutCsrSet`);
+2. with `NETS` = 1, it passes the interrupt and debug nets that changed (`rvviRefNetSet`);
+3. it closes the instruction with `rvviDutRetire`, or with `rvviDutTrap` if it trapped;
+4. it makes the model execute its next instruction (`rvviRefEventStep`), and compares the PC, the instruction, the GPRs,
+   the FPRs and the CSRs of the DUT with those of the model.
+
+If 50 consecutive instructions fail a compare, `rvvi_trace2api` stops the simulation.
+`+rvvi_max_consecutive_mismatch=<n>` sets a different number.
+
+The parameter `NETS` says who passes the interrupt and debug nets to the model:
+
+- `NETS` = 1: `rvvi_trace2api` passes the nets that changed, taken from the interface. It does not pass samples or
+  decision points, but the model needs a decision point before every instruction: with `rvvi_trace2api` alone the
+  co-simulation stops at the first instruction. This comes from reading the code; it has not been tried.
+- `NETS` = 0, the default: the testbench passes the nets, their samples and the decision points itself
+  (`rvviDecisionApiPkg`). core-v-verif does this, with `uvmt_cv32e40p_gvsoc_decision_monitor`.
 
 ## Debugging
 
