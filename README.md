@@ -34,6 +34,13 @@ make GVSOC_HOME=<gvsoc> GVSOC_INSTALL=<install>
 The DUT state (written by `rvviDut*Set` from the RVFI rows) and the reference state (written only by the
 commit records of the model) start from the model reset state and are compared after every retire:
 PC, instruction, trap and debug mode, all GPRs, all FPRs, and every compare-enabled, non-volatile CSR
-implemented by the model and reported by the DUT. The reference is never written from the DUT; the only DUT-to-model inputs are the
-interrupt lines and the debug request. State setters (`rvviRefCsrSet`, `rvviRefGprSet`, ...) are
-rejected, except a CSR set to the value the model already holds at reset.
+implemented by the model and reported by the DUT. The reference is never written from the DUT. The DUT gives
+the model inputs only:
+- the interrupt lines and the debug request, with the instants the RTL samples them and the decision points
+  where its controller evaluates them (`bridge/rvviDecisionApi.h`, an additive RVVI-API extension); the model
+  takes interrupts and debug entries by itself;
+- the value read from a volatile CSR (`rvviRefCsrSetVolatile`, e.g. the performance counters);
+- the data loaded from a volatile memory range (`rvviRefMemorySetVolatile`), an external region of the model.
+
+State setters (`rvviRefCsrSet`, `rvviRefGprSet`, ...) are rejected, except a CSR set to the value the model
+already holds at reset.
