@@ -76,6 +76,7 @@ public:
 
     // Reference side
     bool event_step();
+    void trace(const std::vector<Cv32e40pCosimBoundary> &boundaries);
     void net_set(uint64_t index, uint64_t value);
     bool csr_set(uint32_t address, uint64_t value);
 
@@ -106,6 +107,8 @@ public:
     std::array<uint64_t, RVVI_METRIC_FATALS + 1> metrics{};
     unsigned pc_reports = 0, insn_reports = 0, gpr_reports = 0, fpr_reports = 0, csr_reports = 0;
     std::vector<std::string> unsupported_calls;
+    // GVSOC_RVVI_TRACE=first:last prints the records of these retires.
+    uint64_t trace_first = 1, trace_last = 0;
 };
 
 Bridge bridge;
@@ -172,6 +175,11 @@ bool Bridge::init(const char *program)
         return this->fail("GVSOC_CONFIG is not set (gvsoc_config.json from gvrun prepare)");
     }
     log("reference: %s, program: %s", config, program);
+    const char *trace = getenv("GVSOC_RVVI_TRACE");
+    if (trace != nullptr && sscanf(trace, "%lu:%lu", &this->trace_first, &this->trace_last) != 2)
+    {
+        return this->fail("GVSOC_RVVI_TRACE=%s: expected first:last", trace);
+    }
     if (!this->client.open(config))
     {
         return this->fail("%s", this->client.error().c_str());
@@ -371,11 +379,37 @@ bool Bridge::event_step()
         if (this->ref.csr_valid[address]) this->ref.set_csr(address, high);
     }
     this->metrics[RVVI_METRIC_RETIRES]++;
+    if (this->metrics[RVVI_METRIC_RETIRES] >= this->trace_first &&
+        this->metrics[RVVI_METRIC_RETIRES] <= this->trace_last)
+    {
+        this->trace(boundaries);
+    }
     if (this->commit.flags & CV32E40P_COSIM_REC_TRAPPED)
     {
         this->metrics[RVVI_METRIC_TRAPS]++;
     }
     return true;
+}
+
+void Bridge::trace(const std::vector<Cv32e40pCosimBoundary> &boundaries)
+{
+    for (const Cv32e40pCosimBoundary &boundary : boundaries)
+    {
+        log("trace: boundary kind %u cause %u irq %u pc 0x%08x next 0x%08x after %llu",
+            boundary.kind, boundary.cause, boundary.irq_id, boundary.pc, boundary.next_pc,
+            (unsigned long long)boundary.after_sequence);
+    }
+    const Cv32e40pCosimCommit &c = this->commit;
+    log("trace: retire %llu seq %llu pc 0x%08x insn 0x%08x flags 0x%x next 0x%08x cycle %lld",
+        (unsigned long long)this->metrics[RVVI_METRIC_RETIRES], (unsigned long long)c.sequence,
+        c.pc, c.insn, c.flags, c.next_pc, (long long)c.cycle);
+    for (uint32_t i = 0; i < c.n_gpr; i++)
+        log("trace:   x%u = 0x%08x", c.gpr[i].index, c.gpr[i].value);
+    for (uint32_t i = 0; i < c.n_fpr; i++)
+        log("trace:   f%u = 0x%08x", c.fpr[i].index, c.fpr[i].value);
+    for (uint32_t i = 0; i < c.n_mem; i++)
+        log("trace:   %s 0x%08x size %u data 0x%08x", c.mem[i].is_store ? "store" : "load",
+            c.mem[i].address, c.mem[i].size, c.mem[i].data);
 }
 
 void Bridge::net_set(uint64_t index, uint64_t value)
@@ -695,6 +729,13 @@ void rvviDutCsrSet(uint32_t hartId, uint32_t csrIndex, uint64_t value)
 {
     bridge.dut_row_start();
     if (csrIndex >= NUM_CSRS) return;
+    uint64_t retire = bridge.metrics[RVVI_METRIC_RETIRES] + 1;
+    if (retire >= bridge.trace_first && retire <= bridge.trace_last &&
+        (!bridge.dut.csr_valid[csrIndex] || bridge.dut.csr[csrIndex] != (uint32_t)value))
+    {
+        log("trace: DUT retire %llu csr 0x%03x = 0x%08x", (unsigned long long)retire, csrIndex,
+            (uint32_t)value);
+    }
     bridge.dut.set_csr(csrIndex, (uint32_t)value);
 }
 
