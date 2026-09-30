@@ -143,6 +143,30 @@ bool Cv32e40pCosimClient::step(Cv32e40pCosimCommit &commit,
     }
 }
 
+bool Cv32e40pCosimClient::volatile_csr(uint32_t address)
+{
+    if (this->cosim == nullptr)
+    {
+        return this->fail("volatile CSR before a successful open");
+    }
+    return this->check(this->cosim->volatile_csr(address), "a volatile CSR");
+}
+
+bool Cv32e40pCosimClient::volatile_read(uint64_t sequence, uint32_t address, uint32_t value)
+{
+    if (this->cosim == nullptr)
+    {
+        return this->fail("volatile read before a successful open");
+    }
+    Cv32e40pCosimVolatileRead read;
+    memset(&read, 0, sizeof(read));
+    read.struct_size = sizeof(read);
+    read.address = address;
+    read.sequence = sequence;
+    read.value = value;
+    return this->check(this->cosim->volatile_read(&read), "a volatile read");
+}
+
 bool Cv32e40pCosimClient::input(uint32_t irq_level, bool debug_req)
 {
     if (this->cosim == nullptr)
@@ -215,6 +239,11 @@ std::string Cv32e40pCosimClient::model_error() const
 bool Cv32e40pCosimClient::read_gpr(uint32_t index, uint32_t &value) const
 {
     return this->cosim != nullptr && this->cosim->read_gpr(index, &value) == CV32E40P_COSIM_OK;
+}
+
+bool Cv32e40pCosimClient::read_fpr(uint32_t index, uint32_t &value) const
+{
+    return this->cosim != nullptr && this->cosim->read_fpr(index, &value) == CV32E40P_COSIM_OK;
 }
 
 bool Cv32e40pCosimClient::read_csr(uint32_t address, uint32_t &value) const

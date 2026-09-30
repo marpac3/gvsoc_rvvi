@@ -34,6 +34,8 @@ public:
     bool input(uint32_t irq_level, bool debug_req);
     // Reports that the RTL sampled the pins of one domain (Cv32e40pCosimDomain).
     bool sample(uint32_t domain);
+    bool volatile_csr(uint32_t address);
+    bool volatile_read(uint64_t sequence, uint32_t address, uint32_t value);
     // Reports that the RTL decided on interrupts and debug before the instruction
     // with sequence number ordinal. kind is a Cv32e40pCosimOpportunityKind.
     bool opportunity(uint32_t kind, uint64_t ordinal);
@@ -41,6 +43,7 @@ public:
     // Architectural state reads, for checks and diagnostics. They return the
     // reset state before the first step, then the current state.
     bool read_gpr(uint32_t index, uint32_t &value) const;
+    bool read_fpr(uint32_t index, uint32_t &value) const;
     bool read_csr(uint32_t address, uint32_t &value) const;
 
     const Cv32e40pCosimInfo &info() const { return *this->cosim->info(); }

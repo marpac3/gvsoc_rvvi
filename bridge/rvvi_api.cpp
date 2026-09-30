@@ -95,7 +95,7 @@ public:
     bool started = false;
     bool stepped = false;             // set after a step, so that the next DUT call opens a row
     Shadow dut, ref;
-    std::bitset<NUM_CSRS> csr_compare, csr_ignored;
+    std::bitset<NUM_CSRS> csr_compare, csr_volatile;
     std::array<uint32_t, NUM_CSRS> csr_mask;
     uint64_t dut_pc = 0, dut_insn = 0;
     bool dut_debug = false, dut_trap = false;
@@ -185,6 +185,14 @@ bool Bridge::init(const char *program)
             return this->fail("cannot read x%u at reset", i);
         }
     }
+    // read_fpr fails when the core has no F registers (no FPU, or Zfinx).
+    for (uint32_t i = 0; i < 32; i++)
+    {
+        if (!this->client.read_fpr(i, this->ref.fpr[i]))
+        {
+            break;
+        }
+    }
     for (uint32_t address = 0; address < NUM_CSRS; address++)
     {
         uint32_t value;
@@ -193,10 +201,17 @@ bool Bridge::init(const char *program)
             this->ref.set_csr(address, value);
         }
     }
-    // The DUT starts from the same reset state: registers are zero.
-    this->dut.gpr = this->ref.gpr;
+    // The DUT shadow starts from the RTL reset state, with all registers zero,
+    // so the first compare checks the reset state of the model.
     this->csr_mask.fill(0xFFFFFFFF);
     this->started = true;
+    for (uint32_t address = 0; address < NUM_CSRS; address++)
+    {
+        if (this->csr_volatile[address] && !this->client.volatile_csr(address))
+        {
+            return this->fail("%s", this->client.error().c_str());
+        }
+    }
     // Send the pin levels set before the model existed.
     if ((this->irq_level != 0 || this->haltreq) &&
         !this->client.input(this->irq_level, this->haltreq))
@@ -215,7 +230,7 @@ void Bridge::shutdown()
     std::string never, absent;
     for (uint32_t address = 0; address < NUM_CSRS; address++)
     {
-        if (!this->csr_compare[address] || this->csr_ignored[address])
+        if (!this->csr_compare[address] || this->csr_volatile[address])
         {
             continue;
         }
@@ -305,6 +320,16 @@ bool Bridge::event_step()
     if (!this->started)
     {
         return this->fail("rvviRefEventStep before rvviRefInit");
+    }
+    // A read of a volatile CSR takes the value the DUT read, which it wrote to rd.
+    uint32_t insn = (uint32_t)this->dut_insn, funct3 = (insn >> 12) & 7;
+    uint32_t rd = (insn >> 7) & 31, address = insn >> 20;
+    if (!this->dut_trap && (insn & 0x7F) == 0x73 && funct3 != 0 && funct3 != 4 && rd != 0 &&
+        this->csr_volatile[address] && ((this->dut.gpr_written >> rd) & 1) &&
+        !this->client.volatile_read(this->metrics[RVVI_METRIC_RETIRES] + 1, address,
+            this->dut.gpr[rd]))
+    {
+        return this->fail("%s", this->client.error().c_str());
     }
     std::vector<Cv32e40pCosimBoundary> boundaries;
     if (!this->client.step(this->commit, boundaries))
@@ -475,7 +500,7 @@ bool Bridge::compare_fprs()
 
 bool Bridge::compare_csr(uint32_t address, bool report)
 {
-    if (address >= NUM_CSRS || this->csr_ignored[address] || !this->dut.csr_valid[address])
+    if (address >= NUM_CSRS || this->csr_volatile[address] || !this->dut.csr_valid[address])
     {
         return true;
     }
@@ -546,7 +571,12 @@ bool_t rvviRefShutdown(void)
 bool_t rvviRefCsrSetVolatile(uint32_t hartId, uint32_t csrIndex)
 {
     if (csrIndex >= NUM_CSRS) return RVVI_FALSE;
-    bridge.csr_ignored[csrIndex] = true;
+    bridge.csr_volatile[csrIndex] = true;
+    // rvviRefInit declares it when the model does not exist yet.
+    if (bridge.started && !bridge.client.volatile_csr(csrIndex))
+    {
+        return bridge.fail("%s", bridge.client.error().c_str());
+    }
     return RVVI_TRUE;
 }
 
