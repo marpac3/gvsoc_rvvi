@@ -42,6 +42,29 @@ class Cv32e40pExitDevice(gvsoc.systree.Component):
         return gvsoc.systree.SlaveItf(self, 'input', signature=gvsoc.signature.IoV2Sync())
 
 
+class Cv32e40pStrapsConfig(Config):
+
+    # Runtime: set per test (gvrun --parameter mtvec_addr=...) without
+    # rebuilding the platform.
+    mtvec_addr: Annotated[int, Runtime] = cfg_field(default=0, fmt="hex", dump=True, desc=(
+        "mtvec base at boot (RTL mtvec_addr_i)"
+    ))
+
+    def __post_init__(self):
+        super().__post_init__()
+
+
+class Cv32e40pStraps(gvsoc.systree.Component):
+    """Static configuration inputs of the core, driven at reset."""
+
+    def __init__(self, parent, name, config: Cv32e40pStrapsConfig):
+        super().__init__(parent, name, config=config)
+        self.add_sources(['cv32e40p_platform/straps.cpp'])
+
+    def o_MTVEC_ADDR(self, itf: gvsoc.systree.SlaveItf):
+        self.itf_bind('mtvec_addr', itf, signature='wire<uint32_t>')
+
+
 class Cv32e40pSparseMem(gvsoc.systree.Component):
     """Catch-all memory: never-written bytes read 0, like the UVM testbench."""
 

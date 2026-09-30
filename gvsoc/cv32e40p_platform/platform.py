@@ -25,7 +25,7 @@ from utils.loader.loader_v2 import ElfLoader
 from pulp.cpu.iss.cv32e40p import Cv32e40p
 from pulp.cpu.iss.cv32e40p_config import Cv32e40pConfig
 from cv32e40p_platform.devices import (Cv32e40pExitDevice, Cv32e40pExitDeviceConfig,
-                                    Cv32e40pSparseMem,
+                                    Cv32e40pStraps, Cv32e40pStrapsConfig, Cv32e40pSparseMem,
                                     Cv32e40pIrqInjector, IRQ_LINES, IRQ_NUMBERS)
 
 
@@ -75,6 +75,10 @@ class Cv32e40pCosimConfig(Config):
         "Virtual EXIT device configuration"
     ))
 
+    straps: Cv32e40pStrapsConfig = cfg_field(init=False, desc=(
+        "Static configuration inputs of the core"
+    ))
+
     router: RouterConfig = cfg_field(init=False, desc=(
         "Router configuration"
     ))
@@ -122,6 +126,7 @@ class Cv32e40pCosimConfig(Config):
         self.debug_rom = MemoryV3Config('debug_rom', size=0x1000, atomics=False, latency=0,
                                         init=False)
         self.exit = Cv32e40pExitDeviceConfig('exit')
+        self.straps = Cv32e40pStrapsConfig('straps')
         self.router = RouterConfig(kind='bandwidth')
         self.mem_mapping       = RouterMapping(name='mem_mapping',
                                                base=0x0000_0000, size=0x0040_0000)
@@ -177,6 +182,10 @@ class Cv32e40pCosimSoc(gvsoc.systree.Component):
         irq_inj.o_LINE('haltreq', gvsoc.systree.SlaveItf(
             core, itf_name='haltreq', signature='wire<bool>'))
 
+        straps = Cv32e40pStraps(self, 'straps', config=config.straps)
+        straps.o_MTVEC_ADDR(gvsoc.systree.SlaveItf(
+            core, itf_name='mtvec_addr', signature='wire<uint32_t>'))
+
 
 class Cv32e40pCosim(gvsoc.systree.Component):
 
@@ -198,9 +207,15 @@ class Cv32e40pCosim(gvsoc.systree.Component):
             description='Stop when the software reports its end (False for co-simulation)'
         ).get_value()
 
+        mtvec_addr = TargetParameter(
+            self, name='mtvec_addr', value=0, cast=int,
+            description='mtvec base at boot (RTL mtvec_addr_i)'
+        ).get_value()
+
         config = Cv32e40pCosimConfig('soc', fpu=fpu, zfinx=zfinx, corev_pulp=corev_pulp,
                                      ram_latency=ram_latency)
         config.exit.stop_on_exit = stop_on_exit
+        config.straps.mtvec_addr = mtvec_addr
 
         clock = vp.clock_domain.Clock_domain(self, 'clock', frequency=50000000)
         soc = Cv32e40pCosimSoc(self, 'soc', config, binary)
