@@ -4,13 +4,14 @@
 //
 // Authors: Marco Paci (marco.paci@chips.it)
 
-// RVVI-API (riscv-verification/RVVI, rvviApi.h) on the CV32E40P model of GVSOC.
+// The RVVI-API (riscv-verification/RVVI, rvviApi.h) and its decision-point
+// extension (rvviDecisionApi.h), implemented on the CV32E40P model of GVSOC.
 //
-// Two shadows of the architectural state are compared after every retire:
-// the DUT shadow is written by rvviDut*Set (the RVFI rows), the reference
-// shadow by the commit records of the model. Both start from the model reset
-// state, so an effect present on one side only makes them diverge. Nothing
-// flows from the DUT into the model except the interrupt and debug pins.
+// After every retire, the DUT shadow written by rvviDut*Set from the RVFI rows
+// is compared with the reference shadow written by the commit records of the
+// model. The model only takes its inputs from the DUT: the interrupt and debug
+// pins with the points where the DUT sampled and decided on them, the values
+// read from volatile CSRs and the data loaded from volatile memory.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +21,7 @@
 #include <string>
 #include <vector>
 #include "rvviApi.h"
+#include "rvviDecisionApi.h"
 #include "cosim_client.hpp"
 
 namespace {
@@ -33,6 +35,17 @@ constexpr unsigned MAX_REPORTS = 10;   // detailed messages per compare category
 // rvviRefNetIndexGet returns the irq_i bit for an interrupt net, and this index
 // for the debug request.
 constexpr uint64_t NET_HALTREQ = 32;
+
+// The net groups follow the RTL. The interrupt lines are sampled by the irq_q
+// flop on the gated clock, and haltreq by the sticky debug_req_q flop on the
+// free-running clock.
+constexpr uint32_t GROUP_IRQ = 1, GROUP_DEBUG = 2;
+
+// The decision kinds of the extension are the opportunity kinds of the model.
+static_assert((int)RVVI_DECISION_DISPATCH == (int)CV32E40P_COSIM_OPP_DISPATCH &&
+    (int)RVVI_DECISION_FIRST_FETCH == (int)CV32E40P_COSIM_OPP_FIRST_FETCH &&
+    (int)RVVI_DECISION_SLEEP == (int)CV32E40P_COSIM_OPP_SLEEP &&
+    (int)RVVI_DECISION_BOOT == (int)CV32E40P_COSIM_OPP_BOOT, "decision kinds");
 
 struct Shadow
 {
@@ -184,6 +197,12 @@ bool Bridge::init(const char *program)
     this->dut.gpr = this->ref.gpr;
     this->csr_mask.fill(0xFFFFFFFF);
     this->started = true;
+    // Send the pin levels set before the model existed.
+    if ((this->irq_level != 0 || this->haltreq) &&
+        !this->client.input(this->irq_level, this->haltreq))
+    {
+        return this->fail("%s", this->client.error().c_str());
+    }
     return true;
 }
 
@@ -570,7 +589,48 @@ uint64_t rvviRefNetIndexGet(const char *name)
 
 void rvviRefNetGroupSet(uint64_t netIndex, uint32_t group)
 {
-    // Every input reaches the model as one batch of levels: groups need no handling.
+    // The groups are fixed by the RTL, so only the same placement is accepted.
+    uint32_t expected = netIndex == NET_HALTREQ ? GROUP_DEBUG : GROUP_IRQ;
+    if (group != expected)
+    {
+        bridge.fail("rvviRefNetGroupSet: net %llu is in group %u", (unsigned long long)netIndex,
+            expected);
+    }
+}
+
+bool_t rvviRefNetGroupSample(uint32_t group)
+{
+    if (group != GROUP_IRQ && group != GROUP_DEBUG)
+    {
+        return bridge.fail("rvviRefNetGroupSample: unknown group %u", group);
+    }
+    if (!bridge.started)
+    {
+        return bridge.fail("rvviRefNetGroupSample before rvviRefInit");
+    }
+    uint32_t domain = group == GROUP_IRQ ? CV32E40P_COSIM_DOMAIN_IRQ : CV32E40P_COSIM_DOMAIN_DEBUG;
+    if (!bridge.client.sample(domain))
+    {
+        return bridge.fail("%s", bridge.client.error().c_str());
+    }
+    return RVVI_TRUE;
+}
+
+bool_t rvviRefDecisionPoint(uint32_t hartId, uint32_t kind, uint64_t order)
+{
+    if (kind > RVVI_DECISION_BOOT)
+    {
+        return bridge.fail("rvviRefDecisionPoint: unknown kind %u", kind);
+    }
+    if (!bridge.started)
+    {
+        return bridge.fail("rvviRefDecisionPoint before rvviRefInit");
+    }
+    if (!bridge.client.opportunity(kind, order))
+    {
+        return bridge.fail("%s", bridge.client.error().c_str());
+    }
+    return RVVI_TRUE;
 }
 
 void rvviRefNetSet(uint64_t netIndex, uint64_t value, uint64_t when)

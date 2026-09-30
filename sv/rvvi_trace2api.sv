@@ -4,15 +4,14 @@
 //
 // Authors: Marco Paci (marco.paci@chips.it)
 
-// rvvi_trace2api: drives the RVVI-API from an RVVI-TRACE interface, one
-// step-and-compare per retired instruction.
-//
-// For every valid retire slot:
-//   1. the DUT effects of the row (GPR, FPR, CSR) go to the DUT state with
-//      rvviDut*Set;
-//   2. the input nets changed since the previous row go to the reference;
-//   3. the row is closed with rvviDutRetire, or rvviDutTrap on an exception;
-//   4. the reference retires its next instruction (rvviRefEventStep) and the
+// rvvi_trace2api drives the RVVI-API from an RVVI-TRACE interface, with one
+// step and compare per retired instruction. For every valid retire slot:
+//   1. the GPR, FPR and CSR writes of the row go to the DUT (rvviDut*Set);
+//   2. the input nets changed since the previous row go to the reference,
+//      unless NETS is 0 and the testbench reports the nets, their samples and
+//      the decision points itself (rvviDecisionApiPkg);
+//   3. rvviDutRetire, or rvviDutTrap on an exception, closes the row;
+//   4. the reference retires its next instruction (rvviRefEventStep), and the
 //      PC, instruction, GPR, FPR and CSR states are compared.
 //
 // The reference is never corrected from the DUT. The simulation stops after
@@ -22,7 +21,8 @@ module rvvi_trace2api
   import rvviApiPkg::*;
 #(
     parameter int NHART  = 1,
-    parameter int RETIRE = 1
+    parameter int RETIRE = 1,
+    parameter bit NETS   = 1
 )
 (
     rvviTrace rvvi
@@ -48,7 +48,7 @@ module rvvi_trace2api
     initial begin
         void'($value$plusargs("rvvi_max_consecutive_mismatch=%d", max_consecutive_mismatch));
         // Receive the net changes (interrupts and halt request), without memory events.
-        client_id = rvvi.client_register(1'b1, 1'b0);
+        client_id = rvvi.client_register(NETS, 1'b0);
     end
 
     function automatic void push_row(int h, int r);

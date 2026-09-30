@@ -126,11 +126,9 @@ bool Cv32e40pCosimClient::step(Cv32e40pCosimCommit &commit,
         }
         if (status == CV32E40P_COSIM_ERROR)
         {
-            Cv32e40pCosimSnapshot snapshot;
-            snapshot.struct_size = sizeof(snapshot);
-            this->cosim->snapshot(&snapshot);
-            return this->fail(std::string("core model error: ") + snapshot.error);
+            return this->fail(std::string("core model error: ") + this->model_error());
         }
+
         if (this->has_ended_)
         {
             return this->fail("the reference software exited before its next instruction");
@@ -158,12 +156,60 @@ bool Cv32e40pCosimClient::input(uint32_t irq_level, bool debug_req)
     input.irq_level = irq_level;
     input.debug_req = debug_req;
     input.fetch_enable = 1;
-    Cv32e40pCosimStatus status = this->cosim->input(&input);
-    if (status == CV32E40P_COSIM_REJECTED || status == CV32E40P_COSIM_ERROR)
+    return this->check(this->cosim->input(&input), "an input");
+}
+
+bool Cv32e40pCosimClient::sample(uint32_t domain)
+{
+    if (this->cosim == nullptr)
     {
-        return this->fail("the core model rejected an input");
+        return this->fail("sample before a successful open");
+    }
+    Cv32e40pCosimSample sample;
+    memset(&sample, 0, sizeof(sample));
+    sample.struct_size = sizeof(sample);
+    sample.domain = domain;
+    sample.sample_sequence = ++this->sample_sequence;
+    return this->check(this->cosim->sample(&sample), "an input sample");
+}
+
+bool Cv32e40pCosimClient::opportunity(uint32_t kind, uint64_t ordinal)
+{
+    if (this->cosim == nullptr)
+    {
+        return this->fail("decision point before a successful open");
+    }
+    Cv32e40pCosimOpportunity opportunity;
+    memset(&opportunity, 0, sizeof(opportunity));
+    opportunity.struct_size = sizeof(opportunity);
+    opportunity.kind = kind;
+    opportunity.opportunity_id = ++this->opportunity_id;
+    opportunity.ordinal = ordinal;
+    return this->check(this->cosim->opportunity(&opportunity), "a decision point");
+}
+
+bool Cv32e40pCosimClient::check(Cv32e40pCosimStatus status, const char *what)
+{
+    if (status == CV32E40P_COSIM_ERROR)
+    {
+        return this->fail(std::string("core model error: ") + this->model_error());
+    }
+    if (status == CV32E40P_COSIM_REJECTED)
+    {
+        std::string error = this->model_error();
+        return this->fail(std::string("the core model rejected ") + what +
+            (error.empty() ? "" : ": " + error));
     }
     return true;
+}
+
+std::string Cv32e40pCosimClient::model_error() const
+{
+    Cv32e40pCosimSnapshot snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.struct_size = sizeof(snapshot);
+    this->cosim->snapshot(&snapshot);
+    return snapshot.error;
 }
 
 bool Cv32e40pCosimClient::read_gpr(uint32_t index, uint32_t &value) const

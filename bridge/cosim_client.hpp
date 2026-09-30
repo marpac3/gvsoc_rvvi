@@ -26,11 +26,17 @@ public:
 
     // Runs the model until it publishes its next commit record. Boundary
     // events (interrupt take, debug entry, wake-up) published before the
-    // commit are appended to boundaries, in model order.
+    // commit are appended to boundaries, in model order. The decision points
+    // of that instruction must have been reported before.
     bool step(Cv32e40pCosimCommit &commit, std::vector<Cv32e40pCosimBoundary> &boundaries);
 
     // Sets new levels on the irq_i[31:0] and debug_req_i pins.
     bool input(uint32_t irq_level, bool debug_req);
+    // Reports that the RTL sampled the pins of one domain (Cv32e40pCosimDomain).
+    bool sample(uint32_t domain);
+    // Reports that the RTL decided on interrupts and debug before the instruction
+    // with sequence number ordinal. kind is a Cv32e40pCosimOpportunityKind.
+    bool opportunity(uint32_t kind, uint64_t ordinal);
 
     // Architectural state reads, for checks and diagnostics. They return the
     // reset state before the first step, then the current state.
@@ -47,6 +53,9 @@ public:
 
 private:
     bool fail(const std::string &message);
+    // Fails on REJECTED and ERROR, with the error text of the model.
+    bool check(Cv32e40pCosimStatus status, const char *what);
+    std::string model_error() const;
 
     // Upper bound on the core cycles spent waiting for one record, so that a
     // divergent model that spins or sleeps fails the step instead of hanging
@@ -58,6 +67,8 @@ private:
     Cv32e40pCosim *cosim = nullptr;
     uint64_t sequence = 0;
     uint64_t input_sequence = 0;
+    uint64_t sample_sequence = 0;
+    uint64_t opportunity_id = 0;
     bool has_ended_ = false;
     int exit_status_ = 0;
     std::string error_;

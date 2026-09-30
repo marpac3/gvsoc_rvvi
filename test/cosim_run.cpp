@@ -7,7 +7,9 @@
 // Runs a cv32e40p_cosim* platform through the co-simulation interface
 // alone, without a DUT, and prints one line per commit record in the
 // instruction trace format of GVSOC (pc, opcode). Used to check that the
-// record stream matches the standalone instruction trace.
+// record stream matches the standalone instruction trace. Without an RTL,
+// every instruction gets one DISPATCH decision point, and the interrupt
+// lines are the wires of the platform.
 //
 //   cosim_run [-v] <gvsoc_config.json> [max_records]   (-v adds the register and CSR writes)
 
@@ -41,7 +43,8 @@ int main(int argc, char **argv)
     {
         Cv32e40pCosimCommit commit;
         std::vector<Cv32e40pCosimBoundary> boundaries;
-        if (!client.step(commit, boundaries))
+        if (!client.opportunity(CV32E40P_COSIM_OPP_DISPATCH, records + 1) ||
+            !client.step(commit, boundaries))
         {
             if (client.ended())
             {
