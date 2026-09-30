@@ -54,6 +54,7 @@ The reference is never written from the DUT. The DUT only gives the model its in
   where its controller evaluates them (`bridge/rvviDecisionApi.h`, an additive RVVI-API extension). The model
   takes interrupts and debug entries by itself.
 - the value read from a volatile CSR (`rvviRefCsrSetVolatile`, such as the performance counters).
+- the data loaded from a volatile memory range (`rvviRefMemorySetVolatile`), an external region of the model.
 
 State setters (`rvviRefCsrSet`, `rvviRefGprSet`, ...) are rejected, except a CSR set to the value the model
 already holds at reset.

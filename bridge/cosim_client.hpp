@@ -7,6 +7,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <functional>
 #include <string>
 #include <vector>
 #include <gv/gvsoc.hpp>
@@ -23,14 +24,19 @@ public:
 
     // Runs the model until it publishes its next commit record. Boundary
     // events (interrupt taken, debug entry, wake-up) published before the
-    // commit are appended to boundaries, in model order.
-    bool step(Cv32e40pCosimCommit &commit, std::vector<Cv32e40pCosimBoundary> &boundaries);
+    // commit are appended to boundaries, in model order. A load from an
+    // external region takes its data from external_data.
+    using ExternalData = std::function<uint32_t(const Cv32e40pCosimExternalLoad &)>;
+    bool step(Cv32e40pCosimCommit &commit, std::vector<Cv32e40pCosimBoundary> &boundaries,
+        const ExternalData &external_data);
 
     // Sets new levels on the irq_i[31:0] and debug_req_i pins.
     bool input(uint32_t irq_level, bool debug_req);
     // Reports that the RTL sampled the pins of one domain (Cv32e40pCosimDomain).
     bool sample(uint32_t domain);
     bool volatile_csr(uint32_t address);
+    // Loads from [base, base + length) take their data from the testbench.
+    bool external_region(uint32_t base, uint32_t length);
     bool volatile_read(uint64_t sequence, uint32_t address, uint32_t value);
     // Reports that the RTL decided on interrupts and debug before the instruction
     // with sequence number ordinal. kind is a Cv32e40pCosimOpportunityKind.

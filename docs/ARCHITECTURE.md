@@ -106,6 +106,8 @@ and depends on nothing of the core layout.
 - `volatile_csr()` declares a CSR whose value depends on timing that the model does not reproduce, and
   `volatile_read()` gives the model the value that the RTL read from it, before the instruction that reads it
   executes.
+- `external_region()` declares a memory range whose loads take their data from the testbench, through the
+  `external_data` callback of `step()`.
 - `read_gpr()`, `read_fpr()` and `read_csr()` read the state of the model: the reset state before the first step,
   then the current state.
 
@@ -248,7 +250,7 @@ instruction, and the reference shadow, written only by the commit records of the
 `GVSOC_RVVI_TRACE` (optional), and opens the client. Then it reads the reset state of the model: the GPRs, the
 FPRs when the core has F registers (no FPU, or Zfinx, means none), and the CSRs. This is the only direct read of
 the model state: from here on the reference shadow follows the commit records. It declares to the model the
-volatile CSRs set before, and sends the pin levels set before the model existed.
+volatile CSRs and the volatile memory ranges set before, and sends the pin levels set before the model existed.
 
 **Every retire.** For each instruction that the DUT retires, the testbench passes the registers and CSRs that the
 instruction wrote (`rvviDutGprSet`, `rvviDutFprSet`, `rvviDutCsrSet`), then calls `rvviDutRetire`, or `rvviDutTrap`
@@ -282,6 +284,11 @@ rejected, except a CSR set to the value the model already holds at reset.
 the DUT retires a CSR instruction that reads a volatile CSR into rd != x0, the value it wrote to rd goes to the
 model before the step.
 
+**Volatile memory.** A range set with `rvviRefMemorySetVolatile` becomes an external region of the model. A load
+from it takes the value of its destination register in the DUT, and the model applies the access width and the
+extension. This is what volatile memory means in RVVI-API: a test that reads the random-number generator of the
+testbench, for example, needs it.
+
 **Shutdown.** `rvviRefShutdown()` runs at the end of the test, before the testbench reads the metrics. It logs the
 metrics and the compare-enabled CSRs that were never checked, because the model does not implement them or the
 DUT never reported them.
@@ -292,8 +299,7 @@ fail with "... is not supported by the GVSOC reference": the reference state is 
 execution. `rvviDutCycleCountSet` is accepted and ignored, since cycle-accurate comparison is not part of the
 functional compare.
 
-`rvviDutBusWrite` fails too, so stores are not compared, and so does `rvviRefMemorySetVolatile`: every load of the
-model reads its own memory.
+`rvviDutBusWrite` fails too, so stores are not compared.
 
 ## rvvi_trace2api (`sv/rvvi_trace2api.sv`)
 
