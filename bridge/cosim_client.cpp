@@ -91,7 +91,7 @@ void Cv32e40pCosimClient::close()
 }
 
 bool Cv32e40pCosimClient::step(Cv32e40pCosimCommit &commit,
-    std::vector<Cv32e40pCosimBoundary> &boundaries)
+    std::vector<Cv32e40pCosimBoundary> &boundaries, const ExternalData &external_data)
 {
     if (this->cosim == nullptr)
     {
@@ -128,6 +128,19 @@ bool Cv32e40pCosimClient::step(Cv32e40pCosimCommit &commit,
         {
             return this->fail(std::string("core model error: ") + this->model_error());
         }
+        if (status == CV32E40P_COSIM_EXTERNAL_LOAD)
+        {
+            Cv32e40pCosimExternalLoad load;
+            memset(&load, 0, sizeof(load));
+            load.struct_size = sizeof(load);
+            if (!this->check(this->cosim->external_load_query(&load), "an external load query") ||
+                !this->check(this->cosim->external_load_response(load.sequence,
+                    external_data(load)), "an external load"))
+            {
+                return false;
+            }
+            continue;
+        }
 
         if (this->has_ended_)
         {
@@ -141,6 +154,16 @@ bool Cv32e40pCosimClient::step(Cv32e40pCosimCommit &commit,
         }
         this->gvsoc->step(period);
     }
+}
+
+bool Cv32e40pCosimClient::external_region(uint32_t base, uint32_t length)
+{
+    if (this->cosim == nullptr)
+    {
+        return this->fail("external region before a successful open");
+    }
+    Cv32e40pCosimRegion region = { base, length, CV32E40P_COSIM_REGION_EXTERNAL };
+    return this->check(this->cosim->region(&region), "an external region");
 }
 
 bool Cv32e40pCosimClient::volatile_csr(uint32_t address)

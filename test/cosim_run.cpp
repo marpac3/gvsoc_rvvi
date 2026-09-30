@@ -43,8 +43,9 @@ int main(int argc, char **argv)
     {
         Cv32e40pCosimCommit commit;
         std::vector<Cv32e40pCosimBoundary> boundaries;
+        // No external region is declared, so the model owns all the memory.
         if (!client.opportunity(CV32E40P_COSIM_OPP_DISPATCH, records + 1) ||
-            !client.step(commit, boundaries))
+            !client.step(commit, boundaries, [](const Cv32e40pCosimExternalLoad &) { return 0u; }))
         {
             if (client.ended())
             {

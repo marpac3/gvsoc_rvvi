@@ -97,6 +97,9 @@ public:
     bool stepped = false;             // set after a step, so that the next DUT call opens a row
     Shadow dut, ref;
     std::bitset<NUM_CSRS> csr_compare, csr_volatile;
+    // Volatile memory ranges [base, base + length), whose loads take the data the
+    // DUT loaded.
+    std::vector<std::pair<uint32_t, uint32_t>> volatile_memory;
     std::array<uint32_t, NUM_CSRS> csr_mask;
     uint64_t dut_pc = 0, dut_insn = 0;
     bool dut_debug = false, dut_trap = false;
@@ -216,6 +219,13 @@ bool Bridge::init(const char *program)
     for (uint32_t address = 0; address < NUM_CSRS; address++)
     {
         if (this->csr_volatile[address] && !this->client.volatile_csr(address))
+        {
+            return this->fail("%s", this->client.error().c_str());
+        }
+    }
+    for (const auto &range : this->volatile_memory)
+    {
+        if (!this->client.external_region(range.first, range.second))
         {
             return this->fail("%s", this->client.error().c_str());
         }
@@ -340,7 +350,13 @@ bool Bridge::event_step()
         return this->fail("%s", this->client.error().c_str());
     }
     std::vector<Cv32e40pCosimBoundary> boundaries;
-    if (!this->client.step(this->commit, boundaries))
+    // A load from volatile memory takes the value of its destination register in
+    // the DUT, and the model applies the access width and the extension.
+    auto external_data = [this](const Cv32e40pCosimExternalLoad &load) -> uint32_t {
+        return load.reg == 0 ? 0 : load.reg < 32 ? this->dut.gpr[load.reg]
+                                                 : this->dut.fpr[load.reg - 32];
+    };
+    if (!this->client.step(this->commit, boundaries, external_data))
     {
         this->stepped = true;
         return this->fail("%s", this->client.error().c_str());
@@ -623,11 +639,19 @@ bool_t rvviRefCsrSetVolatileMask(uint32_t hartId, uint32_t csrIndex, uint64_t cs
 
 bool_t rvviRefMemorySetVolatile(uint64_t addressLow, uint64_t addressHigh)
 {
-    // Needs the external-load protocol of the model (loads served by the
-    // testbench), not provided by version 1.0 of the interface.
-    return bridge.fail("rvviRefMemorySetVolatile(0x%llx, 0x%llx): external memory is not "
-        "supported yet, loads from the range are compared as RAM",
-        (unsigned long long)addressLow, (unsigned long long)addressHigh);
+    if (addressLow > addressHigh || addressHigh > 0xFFFFFFFFull)
+    {
+        return bridge.fail("rvviRefMemorySetVolatile(0x%llx, 0x%llx): not a 32-bit range",
+            (unsigned long long)addressLow, (unsigned long long)addressHigh);
+    }
+    uint32_t base = (uint32_t)addressLow, length = (uint32_t)(addressHigh - addressLow + 1);
+    bridge.volatile_memory.emplace_back(base, length);
+    // rvviRefInit declares it when the model does not exist yet.
+    if (bridge.started && !bridge.client.external_region(base, length))
+    {
+        return bridge.fail("%s", bridge.client.error().c_str());
+    }
+    return RVVI_TRUE;
 }
 
 uint64_t rvviRefNetIndexGet(const char *name)
