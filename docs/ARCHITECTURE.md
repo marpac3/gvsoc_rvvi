@@ -4,14 +4,26 @@ gvsoc_rvvi makes the CV32E40P model of GVSOC the reference model of a CV32E40P R
 targets of the model, a client (cosim_client.cpp) that runs a target inside another program and steps the model one
 instruction at a time, the RVVI API and an extension of it to bring the interrupt and debug decision points from the TB
 to the GVSOC model.
+The bridge (rvvi_api.cpp, built as libcv32e40p_rvvi.so) implements the RVVI API and its extension on the client: after
+every instruction retired by the RTL, it steps the model and compares the state of the DUT with the state of the model.
 
 ```
-test/cosim_run --> Cv32e40pCosimClient --> cv32e40p_cosim* platform
-                   (cosim_client.cpp)      CV32E40P model, cosim.hpp
+RTL testbench
+      |
+      |  RVVI-API (DPI) + decision-point extension
+      v
+libcv32e40p_rvvi.so (rvvi_api.cpp)
+      |
+      v
+Cv32e40pCosimClient (cosim_client.cpp)
+      |
+      v
+cv32e40p_cosim* platform (CV32E40P model, cosim.hpp)
 ```
 
 The model decides to take interrupts and debug requests by itself, and the DUT testbench only gives it the signals as
 input.
+The reference state is never written from the DUT.
 
 ## GVSOC targets (`gvsoc/`)
 
@@ -220,3 +232,61 @@ A testbench finds these moments inside the RTL: the pins `irq_i` and `debug_req_
 for the samples of `irq_q`; the condition that loads `debug_req_q`; the state of the controller (`ctrl_fsm_cs`),
 for the decision points. It computes `order` by counting the instructions issued from ID. In core-v-verif this is
 `uvmt_cv32e40p_gvsoc_decision_monitor`.
+
+## Bridge (`bridge/rvvi_api.cpp`, `libcv32e40p_rvvi.so`)
+
+The bridge implements the RVVI-API of the RVVI submodule and the extension on the client. It keeps two shadows of
+the architectural state: the DUT shadow, which the testbench writes with `rvviDut*Set` after every retired
+instruction, and the reference shadow, written only by the commit records of the model.
+
+**Start.** `rvviRefInit()` reads `GVSOC_CONFIG`, the path of `gvsoc_config.json` (required), and opens the
+client. Then it reads the reset state of the model: the GPRs and the CSRs. This is the only direct read of the
+model state: from here on the reference shadow follows the commit records. It also sends the pin levels set
+before the model existed.
+
+**Every retire.** For each instruction that the DUT retires, the testbench passes the registers and CSRs that the
+instruction wrote (`rvviDutGprSet`, `rvviDutFprSet`, `rvviDutCsrSet`), then calls `rvviDutRetire`, or `rvviDutTrap`
+if the instruction trapped. `rvviRefEventStep()` steps the model by one
+commit record. The CSR writes of the boundary events before the record (interrupt taken, debug entry) go to the
+reference shadow first, then the register and CSR writes of the record. A write to `fcsr`, `frm` or `fflags`
+changes the other two, since `fcsr` is {frm, fflags}. The instret counters change on every retire and are not in
+the CSR list of the record: the bridge takes them from its `minstret` field.
+
+**Compares.** After the step the testbench calls the compares:
+
+- PC and instruction. For a compressed instruction the RVFI of the core reports the fetched word, whose upper
+  half is the next parcel, so only the lower half is compared;
+- trap and debug mode. `rvviDutTrap` carries no debug mode, and the bridge cannot take it from the instruction
+  before, which can be a `dret`: for an instruction that trapped the debug mode is not compared, and the next
+  instruction shows where the trap went;
+- all GPRs and all FPRs;
+- every compare-enabled, non-volatile CSR that the model implements and the DUT reports, with the masks of
+  `rvviRefCsrCompareMask`. A CSR the model does not implement has no reference state: an access to it traps in
+  the model, and the PC and trap compares catch that.
+
+Each compare category prints its first 10 mismatches in detail.
+
+**Reset state.** Both shadows start from the reset state of the model.
+
+**State setters.** The reference is never written from the DUT: `rvviRefCsrSet`, `rvviRefGprSet`, ... are
+rejected, except a CSR set to the value the model already holds at reset.
+
+**Volatile CSRs.** `rvviRefCsrSetVolatile` takes the CSR out of the CSR compare.
+
+**Shutdown.** `rvviRefShutdown()` runs at the end of the test, before the testbench reads the metrics. It logs the
+metrics and the compare-enabled CSRs that were never checked, because the model does not implement them or the
+DUT never reported them.
+
+**Not provided.** The functions that would write the reference state (`rvviRefPcSet`, `rvviRefGprSet`,
+`rvviRefMemoryWrite`, ...), load a program (it comes from the platform configuration) or handle vector registers
+fail with "... is not supported by the GVSOC reference": the reference state is only written by its own
+execution. `rvviDutCycleCountSet` is accepted and ignored, since cycle-accurate comparison is not part of the
+functional compare.
+
+`rvviDutBusWrite` fails too, so stores are not compared, and so does `rvviRefMemorySetVolatile`: every load of the
+model reads its own memory.
+
+## Debugging
+
+- `rvviErrorGet()` returns the last error, with the message of the model when the model failed.
+- `cosim_run` runs the model of a target alone, to check it without the RTL.

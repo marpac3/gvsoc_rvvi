@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# Co-simulation client of the CV32E40P model of GVSOC, with its test cosim_run.
+# RVVI bridge for the CV32E40P model of GVSOC.
 #
 #   make GVSOC_HOME=<gvsoc source tree> GVSOC_INSTALL=<gvsoc install dir>
 #
@@ -16,11 +16,18 @@ BUILDDIR      ?= build
 CXX      ?= g++
 CXXFLAGS ?= -O2 -g
 CXXFLAGS += -std=c++17 -fPIC -Wall -Werror -MMD -MP \
+            -IRVVI/include/host/rvvi \
             -I$(GVSOC_HOME)/engine/engine/include \
             -I$(GVSOC_HOME)/pulp
 LDLIBS   := -L$(GVSOC_INSTALL)/lib -lpulpvp -Wl,-rpath,$(GVSOC_INSTALL)/lib -ldl
 
-all: $(BUILDDIR)/cosim_run
+LIB  := $(BUILDDIR)/libcv32e40p_rvvi.so
+OBJS := $(BUILDDIR)/rvvi_api.o $(BUILDDIR)/cosim_client.o
+
+all: $(LIB) $(BUILDDIR)/cosim_run
+
+$(LIB): $(OBJS)
+	$(CXX) -shared -o $@ $^ $(LDLIBS)
 
 $(BUILDDIR)/cosim_run: $(BUILDDIR)/cosim_run.o $(BUILDDIR)/cosim_client.o
 	$(CXX) -o $@ $^ $(LDLIBS)
