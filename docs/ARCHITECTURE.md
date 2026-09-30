@@ -244,11 +244,11 @@ The bridge implements the RVVI-API of the RVVI submodule and the extension on th
 the architectural state: the DUT shadow, which the testbench writes with `rvviDut*Set` after every retired
 instruction, and the reference shadow, written only by the commit records of the model.
 
-**Start.** `rvviRefInit()` reads `GVSOC_CONFIG`, the path of `gvsoc_config.json` (required), and opens the
-client. Then it reads the reset state of the model: the GPRs, the FPRs when the core has F registers (no FPU, or
-Zfinx, means none), and the CSRs. This is the only direct read of the model state: from here on the reference
-shadow follows the commit records. It declares to the model the volatile CSRs set before, and sends the pin levels
-set before the model existed.
+**Start.** `rvviRefInit()` reads `GVSOC_CONFIG`, the path of `gvsoc_config.json` (required), and
+`GVSOC_RVVI_TRACE` (optional), and opens the client. Then it reads the reset state of the model: the GPRs, the
+FPRs when the core has F registers (no FPU, or Zfinx, means none), and the CSRs. This is the only direct read of
+the model state: from here on the reference shadow follows the commit records. It declares to the model the
+volatile CSRs set before, and sends the pin levels set before the model existed.
 
 **Every retire.** For each instruction that the DUT retires, the testbench passes the registers and CSRs that the
 instruction wrote (`rvviDutGprSet`, `rvviDutFprSet`, `rvviDutCsrSet`), then calls `rvviDutRetire`, or `rvviDutTrap`
@@ -330,5 +330,7 @@ The parameter `NETS` says who passes the interrupt and debug nets to the model:
 
 ## Debugging
 
+- `GVSOC_RVVI_TRACE=first:last` prints the commit records and boundary events of the model for those retires,
+  with their register writes and memory accesses, and the CSR changes the DUT reports.
 - `rvviErrorGet()` returns the last error, with the message of the model when the model failed.
 - `cosim_run` runs the model of a target alone, to check it without the RTL.
