@@ -1,0 +1,3 @@
+[submodule "RVVI"]
+	path = RVVI
+	url = https://github.com/riscv-verification/RVVI.git
