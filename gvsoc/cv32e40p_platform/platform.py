@@ -51,6 +51,10 @@ class Cv32e40pCosimConfig(Config):
         "RTL COREV_PULP parameter"
     ))
 
+    num_mhpmcounters: int = cfg_field(default=1, dump=True, desc=(
+        "RTL NUM_MHPMCOUNTERS parameter"
+    ))
+
     core: Cv32e40pConfig = cfg_field(init=False, desc=(
         "CV32E40P core configuration"
     ))
@@ -115,6 +119,7 @@ class Cv32e40pCosimConfig(Config):
         # file); the core recipe disables the FP loads, stores and moves.
         isa = 'rv32imfc' if (self.fpu or self.zfinx) else 'rv32imc'
         self.core = Cv32e40pConfig(isa=isa, zfinx=self.zfinx, corev_pulp=self.corev_pulp,
+                                   num_mhpmcounters=self.num_mhpmcounters,
                                    boot_addr=self.boot_addr)
         # init=False: never-written bytes read 0, like the testbench memory.
         self.mem       = MemoryV3Config('mem', size=0x0040_0000, atomics=False,
@@ -190,7 +195,7 @@ class Cv32e40pCosimSoc(gvsoc.systree.Component):
 class Cv32e40pCosim(gvsoc.systree.Component):
 
     def __init__(self, parent, name=None, fpu: bool=False, zfinx: bool=False,
-                 corev_pulp: bool=False):
+                 corev_pulp: bool=False, num_mhpmcounters: int=1):
         super().__init__(parent, name)
 
         binary = TargetParameter(
@@ -213,6 +218,7 @@ class Cv32e40pCosim(gvsoc.systree.Component):
         ).get_value()
 
         config = Cv32e40pCosimConfig('soc', fpu=fpu, zfinx=zfinx, corev_pulp=corev_pulp,
+                                     num_mhpmcounters=num_mhpmcounters,
                                      ram_latency=ram_latency)
         config.exit.stop_on_exit = stop_on_exit
         config.straps.mtvec_addr = mtvec_addr
