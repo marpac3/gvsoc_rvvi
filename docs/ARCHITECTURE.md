@@ -334,6 +334,9 @@ The parameter `NETS` says who passes the interrupt and debug nets to the model:
 - `NETS` = 0, the default: the testbench passes the nets, their samples and the decision points itself
   (`rvviDecisionApiPkg`). core-v-verif does this, with `uvmt_cv32e40p_gvsoc_decision_monitor`.
 
+`sv/gvsoc_rvvi.f` lists the SystemVerilog files of RVVI and of the bridge, from `GVSOC_BRIDGE_HOME`, so that a testbench
+includes them with one `-f`. The `rvvi.f` of RVVI takes its files from an Imperas installation (`IMPERAS_HOME`).
+
 ## Debugging
 
 - `GVSOC_RVVI_TRACE=first:last` prints the commit records and boundary events of the model for those retires,

@@ -9,7 +9,7 @@ This repository compares a CV32E40P RTL simulation in lock step with the CV32E40
 |---|---|
 | `gvsoc/` | GVSOC module with the `cv32e40p_cosim*` targets. They instantiate the `cv32e40p_testbench` SoC of gvsoc-pulp, which has the memory map and virtual peripherals of the core-v-verif testbench, configured for co-simulation. |
 | `bridge/` | `libcv32e40p_rvvi.so`, the RVVI-API implemented on the co-simulation interface of the core model. |
-| `sv/` | `rvvi_trace2api.sv` turns an RVVI-TRACE interface into RVVI-API calls, with one step and compare per retire. `rvviDecisionApiPkg.sv` is the SystemVerilog package of the decision-point extension. |
+| `sv/` | `rvvi_trace2api.sv` turns an RVVI-TRACE interface into RVVI-API calls, with one step and compare per retire. `rvviDecisionApiPkg.sv` is the SystemVerilog package of the decision-point extension, and `gvsoc_rvvi.f` is the file list for the simulator, with `GVSOC_BRIDGE_HOME` set to this repository. |
 | `test/` | `cosim_run` runs a target through the interface alone and prints the commit records. |
 | `docs/` | `ARCHITECTURE.md`, the architecture of the bridge and how a co-simulation runs. |
 | `RVVI/` | RVVI headers and SystemVerilog packages (submodule) |
@@ -39,7 +39,7 @@ cd <this repository> && make GVSOC_HOME=<gvsoc> GVSOC_INSTALL=<install>
    with `<target>` one of `cv32e40p_cosim[_pulp[_cluster][_fpu[_zfinx]]]` or `cv32e40p_cosim_mhpm29`
    (NUM_MHPMCOUNTERS=29)
 2. Run the simulator with `GVSOC_CONFIG=<dir>/gvsoc_config.json`, `-sv_lib <this repository>/build/libcv32e40p_rvvi`,
-   the RVVI packages and `sv/rvvi_trace2api.sv` bound to the `rvviTrace` interface of the testbench.
+   the files of `sv/gvsoc_rvvi.f` and `rvvi_trace2api` bound to the `rvviTrace` interface of the testbench.
 
 ## Compare semantics
 
