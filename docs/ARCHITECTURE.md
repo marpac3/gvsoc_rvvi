@@ -289,6 +289,18 @@ from it takes the value of its destination register in the DUT, and the model ap
 extension. This is what volatile memory means in RVVI-API: a test that reads the random-number generator of the
 testbench, for example, needs it.
 
+**Stores.** Stores are compared on the data bus. The testbench reports each write accepted on the DUT data port with
+`rvviDutBusWrite` (byte enables relative to the address). The bridge cuts the DUT writes and the stores of the model
+into word beats, and compares the two sequences in program order: address, byte enables and enabled bytes. The DUT
+writes the bus before it retires the store, while the reference writes it when the store retires, so a beat waits on
+one side until the other side has it.
+
+At the end of the test, in `rvviRefShutdown()`, a store of the model without its DUT beats is a mismatch. DUT beats
+left over are logged with the retire they followed: they belong to a store the DUT had not retired when the
+simulation stopped, which the reference never stepped. A spurious DUT write in the middle of a run shifts the
+sequence and fails the compare of the next store; only a spurious write after the last store of the run is not a
+mismatch: it is logged as a store the DUT had not retired.
+
 **Shutdown.** `rvviRefShutdown()` runs at the end of the test, before the testbench reads the metrics. It logs the
 metrics and the compare-enabled CSRs that were never checked, because the model does not implement them or the
 DUT never reported them.
@@ -298,8 +310,6 @@ DUT never reported them.
 fail with "... is not supported by the GVSOC reference": the reference state is only written by its own
 execution. `rvviDutCycleCountSet` is accepted and ignored, since cycle-accurate comparison is not part of the
 functional compare.
-
-`rvviDutBusWrite` fails too, so stores are not compared.
 
 ## rvvi_trace2api (`sv/rvvi_trace2api.sv`)
 

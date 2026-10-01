@@ -49,6 +49,17 @@ GPRs, all FPRs, and every compare-enabled, non-volatile CSR that the model imple
 DUT state starts from the RTL reset state (all registers zero) and the reference state from the model reset
 state, so the first compare checks the reset state of the model.
 
+Stores are compared on the data bus. The testbench reports each write accepted on the DUT data port with
+`rvviDutBusWrite` (byte enables relative to the address). The bridge cuts the DUT writes and the stores of the
+model into word beats, and compares the two sequences in program order: address, byte enables and enabled
+bytes. The DUT writes the bus before it retires the store, so a beat waits on one side until the other side
+has it. The testbench shuts the reference down at the end of the test, before it reads the metrics. At that
+point a store of the model without its DUT beats is a mismatch. DUT beats left over are logged with the retire
+they followed, since they belong to a store the DUT had not retired when the simulation stopped, which the
+reference never stepped. A spurious DUT write in the middle of a run shifts the sequence and fails the compare
+of the next store; only a spurious write after the last store of the run is not a mismatch: it is logged as a
+store the DUT had not retired.
+
 The reference is never written from the DUT. The DUT only gives the model its inputs:
 - the interrupt lines and the debug request, with the instants the RTL samples them and the decision points
   where its controller evaluates them (`bridge/rvviDecisionApi.h`, an additive RVVI-API extension). The model

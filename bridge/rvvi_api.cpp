@@ -9,12 +9,15 @@
 //
 // After every retire, the DUT shadow written by rvviDut*Set is compared with
 // the reference shadow written by the commit records of the model.
+//
+// Stores are compared on the data bus, beat by beat, in program order.
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <array>
 #include <bitset>
+#include <deque>
 #include <string>
 #include <vector>
 #include "rvviApi.h"
@@ -41,6 +44,33 @@ static_assert((int)RVVI_DECISION_DISPATCH == (int)CV32E40P_COSIM_OPP_DISPATCH &&
     (int)RVVI_DECISION_FIRST_FETCH == (int)CV32E40P_COSIM_OPP_FIRST_FETCH &&
     (int)RVVI_DECISION_SLEEP == (int)CV32E40P_COSIM_OPP_SLEEP &&
     (int)RVVI_DECISION_BOOT == (int)CV32E40P_COSIM_OPP_BOOT, "decision kinds");
+
+// One beat of a bus write, with a word address, the enabled byte lanes and the
+// data on them. A reference beat keeps the retire and pc of its store, and a DUT
+// beat keeps the number of retires before it.
+struct BusWrite
+{
+    uint32_t word, byte_enable, data;
+    uint64_t retire;
+    uint32_t pc;
+};
+
+// Cuts the bytes [address, address + size) into word beats, in address order.
+static void push_beats(std::deque<BusWrite> &writes, uint64_t address, uint32_t size,
+    uint64_t data, uint64_t retire, uint32_t pc)
+{
+    for (uint32_t i = 0; i < size; i++)
+    {
+        uint64_t byte = address + i;
+        uint32_t word = (uint32_t)(byte >> 2), lane = byte & 3;
+        if (writes.empty() || i == 0 || writes.back().word != word)
+        {
+            writes.push_back({ word, 0, 0, retire, pc });
+        }
+        writes.back().byte_enable |= 1u << lane;
+        writes.back().data |= (uint32_t)((data >> (8 * i)) & 0xFF) << (8 * lane);
+    }
+}
 
 struct Shadow
 {
@@ -82,6 +112,8 @@ public:
     bool compare_fprs();
     bool compare_csr(uint32_t address, bool report);
     bool compare_csrs();
+    void dut_bus_write(uint64_t address, uint64_t value, uint64_t byte_enable);
+    void compare_writes();
 
     bool fail(const char *format, ...);
     bool unsupported(const char *function);
@@ -104,6 +136,9 @@ public:
     std::string error;
     std::array<uint64_t, RVVI_METRIC_FATALS + 1> metrics{};
     unsigned pc_reports = 0, insn_reports = 0, gpr_reports = 0, fpr_reports = 0, csr_reports = 0;
+    std::deque<BusWrite> dut_writes, ref_writes;
+    uint64_t store_comparisons = 0;
+    unsigned store_reports = 0;
     std::vector<std::string> unsupported_calls;
     // GVSOC_RVVI_TRACE=first:last prints the records of these retires.
     uint64_t trace_first = 1, trace_last = 0;
@@ -257,6 +292,20 @@ void Bridge::shutdown()
             never += name;
         }
     }
+    for (const BusWrite &w : this->ref_writes)
+    {
+        this->mismatch(this->store_reports, "store of retire %llu (pc 0x%08x) to 0x%08x "
+            "byte enable 0x%x data 0x%08x: no DUT bus write", (unsigned long long)w.retire, w.pc,
+            w.word << 2, w.byte_enable, w.data);
+    }
+    // DUT beats left at shutdown belong to stores the DUT had not retired yet.
+    for (const BusWrite &w : this->dut_writes)
+    {
+        log("DUT bus write to 0x%08x byte enable 0x%x data 0x%08x after retire %llu: store not "
+            "retired when the simulation stopped", w.word << 2, w.byte_enable, w.data,
+            (unsigned long long)w.retire);
+    }
+    log("store beats compared %llu", (unsigned long long)this->store_comparisons);
     log("retires %llu, traps %llu, mismatches %llu, errors %llu, reference %s",
         (unsigned long long)this->metrics[RVVI_METRIC_RETIRES],
         (unsigned long long)this->metrics[RVVI_METRIC_TRAPS],
@@ -389,6 +438,15 @@ bool Bridge::event_step()
         if (this->ref.csr_valid[address]) this->ref.set_csr(address, high);
     }
     this->metrics[RVVI_METRIC_RETIRES]++;
+    for (uint32_t i = 0; i < this->commit.n_mem; i++)
+    {
+        if (this->commit.mem[i].is_store)
+        {
+            push_beats(this->ref_writes, this->commit.mem[i].address, this->commit.mem[i].size,
+                this->commit.mem[i].data, this->metrics[RVVI_METRIC_RETIRES], this->commit.pc);
+        }
+    }
+    this->compare_writes();
     if (this->metrics[RVVI_METRIC_RETIRES] >= this->trace_first &&
         this->metrics[RVVI_METRIC_RETIRES] <= this->trace_last)
     {
@@ -579,6 +637,55 @@ bool Bridge::compare_csrs()
         }
     }
     return same;
+}
+
+void Bridge::dut_bus_write(uint64_t address, uint64_t value, uint64_t byte_enable)
+{
+    // Bit i of the mask enables the byte at address + i, held by byte i of the value.
+    bool first = true;
+    for (uint32_t i = 0; i < 8; i++)
+    {
+        if (!((byte_enable >> i) & 1))
+        {
+            continue;
+        }
+        uint64_t byte = address + i;
+        uint32_t word = (uint32_t)(byte >> 2), lane = byte & 3;
+        if (first || this->dut_writes.back().word != word)
+        {
+            this->dut_writes.push_back({ word, 0, 0, this->metrics[RVVI_METRIC_RETIRES], 0 });
+            first = false;
+        }
+        this->dut_writes.back().byte_enable |= 1u << lane;
+        this->dut_writes.back().data |= (uint32_t)((value >> (8 * i)) & 0xFF) << (8 * lane);
+    }
+    this->compare_writes();
+}
+
+// Compares the beats in program order, as soon as both sides have one.
+void Bridge::compare_writes()
+{
+    while (!this->dut_writes.empty() && !this->ref_writes.empty())
+    {
+        const BusWrite &dut = this->dut_writes.front(), &ref = this->ref_writes.front();
+        uint32_t lanes = 0;
+        for (uint32_t lane = 0; lane < 4; lane++)
+        {
+            if ((ref.byte_enable >> lane) & 1) lanes |= 0xFFu << (8 * lane);
+        }
+        this->store_comparisons++;
+        if (dut.word != ref.word || dut.byte_enable != ref.byte_enable ||
+            (dut.data & lanes) != (ref.data & lanes))
+        {
+            this->mismatch(this->store_reports, "store of retire %llu (pc 0x%08x): "
+                "DUT bus write 0x%08x byte enable 0x%x data 0x%08x, "
+                "REF 0x%08x byte enable 0x%x data 0x%08x",
+                (unsigned long long)ref.retire, ref.pc, dut.word << 2, dut.byte_enable,
+                dut.data & lanes, ref.word << 2, ref.byte_enable, ref.data & lanes);
+        }
+        this->dut_writes.pop_front();
+        this->ref_writes.pop_front();
+    }
 }
 
 const char *const GPR_NAMES[32] = {
@@ -957,7 +1064,7 @@ void rvviDutVrSet(uint32_t hartId, uint32_t vrIndex, uint32_t byteIndex, uint8_t
 
 void rvviDutBusWrite(uint32_t hartId, uint64_t address, uint64_t value, uint64_t byteEnableMask)
 {
-    bridge.unsupported("rvviDutBusWrite");
+    bridge.dut_bus_write(address, value, byteEnableMask);
 }
 
 void rvviRefMemoryWrite(uint32_t hartId, uint64_t address, uint64_t data, uint32_t size)
