@@ -12,6 +12,26 @@ This repository compares a CV32E40P RTL simulation in lock step with the CV32E40
 | `test/` | `cosim_run` runs a target through the interface alone and prints the commit records. |
 | `RVVI/` | RVVI headers and SystemVerilog packages (submodule) |
 
+## Requirements
+
+- [GVSOC](https://github.com/gvsoc/gvsoc) with the CV32E40P core of gvsoc-pulp (`pulp/cpu/iss/cv32e40p.py`), its
+  `cv32e40p_testbench` target (`pulp/cv32e40p/`) and the gvsoc-core fixes the core needs. They are proposed
+  upstream; until they are merged, use the commits below.
+- An RTL testbench that drives RVVI-TRACE from RVFI, such as the CV32E40P UVM testbench of
+  [core-v-verif](https://github.com/openhwfoundation/core-v-verif) with `ISS=GVSOC`, on a cv32e40p RTL with the
+  fixes of its RVFI tracer.
+- A SystemVerilog simulator with DPI (tested with Questa 2025.3).
+
+Tested with:
+
+| repository | branch | commit |
+|---|---|---|
+| gvsoc | main | 93cedc4cb2 |
+| gvsoc-core | mpaci/cv32e40p-core-fixes | e7b1033a8a |
+| gvsoc-pulp | mpaci/cv32e40p-testbench | e53629acc2 |
+| cv32e40p | mpaci/rvfi-fixes-dev | d47c04985b |
+| core-v-verif | mpaci/iss-gvsoc | 315a6d8acd |
+
 ## Build
 
 ```
