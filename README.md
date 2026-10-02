@@ -14,7 +14,7 @@ This repository compares a CV32E40P RTL simulation in lock step with the CV32E40
 
 ## Requirements
 
-- [GVSOC](https://github.com/gvsoc/gvsoc) with the CV32E40P core of gvsoc-pulp (`pulp/cpu/iss/cv32e40p.py`), its
+- [GVSOC](https://github.com/gvsoc/gvsoc) with the CV32E40P core of gvsoc-pulp (`pulp/cv32e40p/cv32e40p.py`), its
   `cv32e40p_testbench` target (`pulp/cv32e40p/`) and the gvsoc-core fixes the core needs. They are proposed
   upstream; until they are merged, use the commits below.
 - An RTL testbench that drives RVVI-TRACE from RVFI, such as the CV32E40P UVM testbench of
@@ -27,10 +27,10 @@ Tested with:
 | repository | branch | commit |
 |---|---|---|
 | gvsoc | main | 93cedc4cb2 |
-| gvsoc-core | mpaci/cv32e40p-core-fixes | e7b1033a8a |
-| gvsoc-pulp | mpaci/cv32e40p-testbench | e53629acc2 |
-| cv32e40p | mpaci/rvfi-fixes-dev | d47c04985b |
-| core-v-verif | mpaci/iss-gvsoc | 315a6d8acd |
+| gvsoc-core | mpaci/cv32e40p-core-fixes | 1642f71a2c |
+| gvsoc-pulp | mpaci/cv32e40p-testbench | 621fc25b98 |
+| cv32e40p | mpaci/rvfi-fixes | 06b4c45cf9 |
+| core-v-verif | mpaci/iss-gvsoc | 6ce6678589 |
 
 ## Build
 
