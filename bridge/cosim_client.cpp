@@ -8,6 +8,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <exception>
+#include <fstream>
+#include <iterator>
 #include "cosim_client.hpp"
 
 bool Cv32e40pCosimClient::fail(const std::string &message)
@@ -24,6 +26,23 @@ void Cv32e40pCosimClient::has_ended(int status)
 
 bool Cv32e40pCosimClient::open(const std::string &config_path)
 {
+    // Without a compiled platform tree, the engine builds the platform from the
+    // JSON configuration, which the model does not support. This happens when the
+    // target has no tree installed, or when a --parameter changed it after the
+    // build.
+    std::ifstream config_file(config_path);
+    if (!config_file)
+    {
+        return this->fail("cannot read " + config_path);
+    }
+    std::string config_text((std::istreambuf_iterator<char>(config_file)),
+        std::istreambuf_iterator<char>());
+    if (config_text.find("\"platform_tree\"") == std::string::npos)
+    {
+        return this->fail("no compiled platform tree in " + config_path + ": give gvrun the "
+            "target name of the build, parameters included (<target>:<name>=<value>)");
+    }
+
     this->conf.config_path = config_path;
     std::string dir = config_path.substr(0, config_path.find_last_of('/') + 1);
     std::string runtime_path = dir + "gvsoc_runtime_config.txt";
