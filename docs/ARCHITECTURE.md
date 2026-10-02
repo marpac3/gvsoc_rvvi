@@ -284,6 +284,14 @@ rejected, except a CSR set to the value the model already holds at reset.
 the DUT retires a CSR instruction that reads a volatile CSR into rd != x0, the value it wrote to rd goes to the
 model before the step.
 
+The testbench declares the HPM counters volatile (core-v-verif does), because they can count timing events (cycles,
+stalls, fetch misses), which the model does not count. The model does count the instruction events: retired, load,
+store, jump, branch, branch taken and compressed instructions (`hpm_events` in `cv32e40p_cs_registers.sv`). When the
+selector of a counter has only these events in the model, or none, the counter of the model counts as the one of the
+RTL. A read of it (mhpmcounter3..31, its upper half or a user alias) is then compared: the value the DUT read
+against the counter of the model, which has not executed the read yet. Then the model takes the DUT value, as for
+every volatile CSR.
+
 **Volatile memory.** A range set with `rvviRefMemorySetVolatile` becomes an external region of the model. A load
 from it takes the value of its destination register in the DUT, and the model applies the access width and the
 extension. This is what volatile memory means in RVVI-API: a test that reads the random-number generator of the
