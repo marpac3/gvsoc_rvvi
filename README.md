@@ -27,10 +27,10 @@ Tested with:
 | repository | branch | commit |
 |---|---|---|
 | gvsoc | main | 93cedc4cb2 |
-| gvsoc-core | mpaci/cv32e40p-core-fixes | e7b1033a8a |
-| gvsoc-pulp | mpaci/cv32e40p-testbench | e53629acc2 |
-| cv32e40p | mpaci/rvfi-fixes-dev | d47c04985b |
-| core-v-verif | mpaci/iss-gvsoc | 315a6d8acd |
+| gvsoc-core | mpaci/cv32e40p-core-fixes | 1642f71a2c |
+| gvsoc-pulp | mpaci/cv32e40p-testbench | 8f93ed80f0 |
+| cv32e40p | mpaci/rvfi-fixes | 06b4c45cf9 |
+| core-v-verif | mpaci/iss-gvsoc | 6ce6678589 |
 
 ## Build
 
