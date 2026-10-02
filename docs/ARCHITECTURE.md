@@ -94,6 +94,12 @@ and depends on nothing of the core layout.
 - `open()` opens `gvsoc_config.json`, and the runtime configuration next to it when present, and takes the
   `cv32e40p_cosim` interface of `soc/core`. The engine loads models with `RTLD_GLOBAL`, so the client finds the
   symbol of the CV32E40P model with `dlsym`.
+- Before that, `open()` checks that the configuration has a compiled platform tree. gvrun leaves it out when the
+  installed tree no longer matches the platform of the run, for example when a `--parameter` changed the platform
+  after the build (if no tree is installed, gvrun stops by itself). The engine would then build the platform from
+  the JSON configuration, which the CV32E40P model does not support, and fail with "cannot create std::vector larger
+  than max_size()". The client asks instead for the target name of the build, parameters included
+  (`<target>:<name>=<value>`).
 - `input()` sets the levels of the `irq_i[31:0]` and `debug_req_i` pins, `sample()` reports that the RTL sampled
   the pins of one domain, interrupts or debug, and `opportunity()` reports a decision point. The model applies them
   in call order, right before the instruction that the decision point names: see the decision-point extension
