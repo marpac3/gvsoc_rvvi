@@ -40,8 +40,22 @@ class Cv32e40pCosim(gvsoc.systree.Component):
             description='mtvec base at boot (RTL mtvec_addr_i)'
         ).get_value()
 
+        # The FPU latencies come in the target name, such as
+        # cv32e40p_cosim_pulp_fpu:fpu_addmul_lat=1:fpu_others_lat=1.
+        fpu_addmul_lat = TargetParameter(
+            self, name='fpu_addmul_lat', value=0, cast=int,
+            description='RTL FPU_ADDMUL_LAT parameter'
+        ).get_value()
+
+        fpu_others_lat = TargetParameter(
+            self, name='fpu_others_lat', value=0, cast=int,
+            description='RTL FPU_OTHERS_LAT parameter'
+        ).get_value()
+
         config = Cv32e40pTestbenchConfig('soc', fpu=fpu, zfinx=zfinx, corev_pulp=corev_pulp,
                                          corev_cluster=corev_cluster,
+                                         fpu_addmul_lat=fpu_addmul_lat,
+                                         fpu_others_lat=fpu_others_lat,
                                          num_mhpmcounters=num_mhpmcounters)
         config.tb_mem.stop_on_exit = stop_on_exit
         config.tb_mem.print_stdout = False

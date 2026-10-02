@@ -66,12 +66,14 @@ NUM_MHPMCOUNTERS, which is 1.
 | `cv32e40p_cosim_pulp_cluster_fpu_zfinx` | pulp_cluster_fpu_zfinx |
 | `cv32e40p_cosim_mhpm29` | num_mhpmcounter_29 |
 
-The `_1cyclat` and `_2cyclat` configurations of core-v-verif use the target of their configuration without the
-suffix: the FPU latency changes the timing of the RTL, not the model.
+The `_1cyclat` and `_2cyclat` configurations of core-v-verif set FPU_ADDMUL_LAT and FPU_OTHERS_LAT, the FPU
+latencies of the RTL, to 1 and 2. They use the target of their configuration without the suffix, with the latencies
+in the name, such as `cv32e40p_cosim_pulp_fpu:fpu_addmul_lat=1:fpu_others_lat=1` for `pulp_fpu_1cyclat`: the timing
+model of the core takes them. The build compiles such a name like a target of its own.
 
 The targets instantiate the `cv32e40p_testbench` SoC of gvsoc-pulp, which has the memory map and the virtual
 peripherals of the uvmt_cv32e40p testbench. They do not print the output of the test program: in co-simulation
-the UVM testbench prints it. They have three parameters:
+the UVM testbench prints it. They have five parameters:
 
 - `binary`, the ELF of the test program;
 - `stop_on_exit`, true by default. The test program reports its end by writing a register of the testbench (test
@@ -80,7 +82,8 @@ the UVM testbench prints it. They have three parameters:
   testbench ends the test. core-v-verif passes `stop_on_exit=false`, so that the model also executes the
   instructions that the RTL core retires after the write;
 - `mtvec_addr`, which drives the `mtvec_addr_i` input of the core, so that each test passes its plusarg without
-  rebuilding the platform.
+  rebuilding the platform;
+- `fpu_addmul_lat` and `fpu_others_lat`, the FPU_ADDMUL_LAT and FPU_OTHERS_LAT parameters of the RTL, 0 by default.
 
 `gvrun ... prepare` writes the platform configuration of a test program, `gvsoc_config.json`, which the client
 opens.

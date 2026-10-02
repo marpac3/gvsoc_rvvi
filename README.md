@@ -16,7 +16,8 @@ This repository compares a CV32E40P RTL simulation in lock step with the CV32E40
 
 ## Requirements
 
-- [GVSOC](https://github.com/gvsoc/gvsoc), with the CV32E40P core and the `cv32e40p_testbench` SoC of gvsoc-pulp.
+- [GVSOC](https://github.com/gvsoc/gvsoc), with the CV32E40P core, its timing model, and the `cv32e40p_testbench` SoC
+  of gvsoc-pulp, which takes the FPU latencies.
 - An RTL testbench that drives RVVI-TRACE from RVFI, such as the CV32E40P UVM testbench of
   [core-v-verif](https://github.com/openhwfoundation/core-v-verif) with `ISS=GVSOC`.
 - A SystemVerilog simulator with DPI (tested with Questa 2025.3).
@@ -39,12 +40,17 @@ cd <gvsoc> && make build MODULES=<this repository>/gvsoc INSTALLDIR=<install> \
 cd <this repository> && make GVSOC_HOME=<gvsoc> GVSOC_INSTALL=<install>
 ```
 
+The FPU latencies of the RTL (`FPU_ADDMUL_LAT`, `FPU_OTHERS_LAT`) are parameters of the targets, in the target name,
+such as `cv32e40p_cosim_pulp_fpu:fpu_addmul_lat=1:fpu_others_lat=1`. The build compiles each such name like a target
+of its own: add the ones in use to `TARGETS`. The `*_1cyclat` and `*_2cyclat` configurations of core-v-verif use 1
+and 2.
+
 ## Use
 
 1. For each test program, write the platform configuration:
    `<install>/bin/gvrun --target-dir=<this repository>/gvsoc --target=<target> --parameter binary=<elf> --work-dir=<dir> prepare`,
    with `<target>` one of `cv32e40p_cosim[_pulp[_cluster][_fpu[_zfinx]]]` or `cv32e40p_cosim_mhpm29`
-   (NUM_MHPMCOUNTERS=29)
+   (NUM_MHPMCOUNTERS=29), plus the FPU latencies if any (`:fpu_addmul_lat=<n>:fpu_others_lat=<n>`)
 2. Run the simulator with `GVSOC_CONFIG=<dir>/gvsoc_config.json`, `-sv_lib <this repository>/build/libcv32e40p_rvvi`,
    the files of `sv/gvsoc_rvvi.f` and `rvvi_trace2api` bound to the `rvviTrace` interface of the testbench.
 
