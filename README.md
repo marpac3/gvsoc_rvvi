@@ -70,9 +70,12 @@ of the next store; only a spurious write after the last store of the run goes un
 
 The reference is never written from the DUT. The DUT only gives the model its inputs:
 - the interrupt lines and the debug request, with the instants the RTL samples them and the decision points
-  where its controller evaluates them (`bridge/rvviDecisionApi.h`, an additive RVVI-API extension); the model
-  takes interrupts and debug entries by itself;
-- the value read from a volatile CSR (`rvviRefCsrSetVolatile`, e.g. the performance counters);
+  where its controller evaluates them (`bridge/rvviDecisionApi.h`, an additive RVVI-API extension). The model
+  takes interrupts and debug entries by itself.
+- the value read from a volatile CSR (`rvviRefCsrSetVolatile`, such as the performance counters). The model
+  counts the instruction events of the HPM counters (retired, load, store, jump, branch, branch taken,
+  compressed), not the timing ones: a read of a volatile HPM counter whose selector in the model has only
+  instruction events, or none, is compared with the counter of the model before the model takes the DUT value.
 - the data loaded from a volatile memory range (`rvviRefMemorySetVolatile`), an external region of the model.
 
 State setters (`rvviRefCsrSet`, `rvviRefGprSet`, ...) are rejected, except a CSR set to the value the model

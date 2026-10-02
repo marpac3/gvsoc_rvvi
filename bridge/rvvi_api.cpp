@@ -35,7 +35,12 @@ constexpr uint32_t NUM_CSRS = 4096;
 constexpr uint32_t CSR_FFLAGS = 0x001, CSR_FRM = 0x002, CSR_FCSR = 0x003;
 constexpr uint32_t CSR_INSTRET = 0xC02, CSR_INSTRETH = 0xC82;
 constexpr uint32_t CSR_MINSTRET = 0xB02, CSR_MINSTRETH = 0xB82;
+constexpr uint32_t CSR_MHPMEVENT = 0x320;
 constexpr unsigned MAX_REPORTS = 10;   // detailed messages per compare category
+
+// The model counts these HPM events: retired, load, store, jump, branch, branch
+// taken and compressed instructions (hpm_events in cv32e40p_cs_registers.sv).
+constexpr uint32_t HPM_INSTRUCTION_EVENTS = 0x7E2;
 
 // rvviRefNetIndexGet returns the irq_i bit for an interrupt net, and this index
 // for the debug request.
@@ -119,6 +124,7 @@ public:
     bool compare_fprs();
     bool compare_csr(uint32_t address, bool report);
     bool compare_csrs();
+    void compare_hpm_read(uint32_t address, uint32_t value);
     void dut_bus_write(uint64_t address, uint64_t value, uint64_t byte_enable);
     void compare_writes();
 
@@ -395,11 +401,14 @@ bool Bridge::event_step()
     uint32_t insn = (uint32_t)this->dut_insn, funct3 = (insn >> 12) & 7;
     uint32_t rd = (insn >> 7) & 31, address = insn >> 20;
     if (!this->dut_trap && (insn & 0x7F) == 0x73 && funct3 != 0 && funct3 != 4 && rd != 0 &&
-        this->csr_volatile[address] && ((this->dut.gpr_written >> rd) & 1) &&
-        !this->client.volatile_read(this->metrics[RVVI_METRIC_RETIRES] + 1, address,
-            this->dut.gpr[rd]))
+        this->csr_volatile[address] && ((this->dut.gpr_written >> rd) & 1))
     {
-        return this->fail("%s", this->client.error().c_str());
+        this->compare_hpm_read(address, this->dut.gpr[rd]);
+        if (!this->client.volatile_read(this->metrics[RVVI_METRIC_RETIRES] + 1, address,
+            this->dut.gpr[rd]))
+        {
+            return this->fail("%s", this->client.error().c_str());
+        }
     }
     std::vector<Cv32e40pCosimBoundary> boundaries;
     // A load from volatile memory takes the value of its destination register in
@@ -646,6 +655,30 @@ bool Bridge::compare_csrs()
         }
     }
     return same;
+}
+
+// A volatile HPM counter (mhpmcounter3..31, its upper half or a user alias)
+// whose selector in the model has only instruction events, or none, counts in
+// the model as in the RTL: the value the DUT read is compared with the counter
+// of the model, which has not executed the read yet.
+void Bridge::compare_hpm_read(uint32_t address, uint32_t value)
+{
+    uint32_t index = address & 0x1F, bank = address - index;
+    if (index < 3 || (bank != 0xB00 && bank != 0xB80 && bank != 0xC00 && bank != 0xC80))
+    {
+        return;
+    }
+    uint32_t selector, counter;
+    if (!this->client.read_csr(CSR_MHPMEVENT + index, selector) ||
+        (selector & ~HPM_INSTRUCTION_EVENTS) != 0 || !this->client.read_csr(address, counter))
+    {
+        return;
+    }
+    if (counter != value)
+    {
+        this->mismatch(this->csr_reports, "hpm counter read csr 0x%03x DUT 0x%08x REF 0x%08x "
+            "(mhpmevent%u 0x%04x)", address, value, counter, index, selector);
+    }
 }
 
 void Bridge::dut_bus_write(uint64_t address, uint64_t value, uint64_t byte_enable)
