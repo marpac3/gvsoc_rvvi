@@ -14,6 +14,13 @@ This repository compares a CV32E40P RTL simulation in lock step with the CV32E40
 | `docs/` | `ARCHITECTURE.md`, the architecture of the bridge and how a co-simulation runs. |
 | `RVVI/` | RVVI headers and SystemVerilog packages (submodule) |
 
+## Requirements
+
+- [GVSOC](https://github.com/gvsoc/gvsoc), with the CV32E40P core and the `cv32e40p_testbench` SoC of gvsoc-pulp.
+- An RTL testbench that drives RVVI-TRACE from RVFI, such as the CV32E40P UVM testbench of
+  [core-v-verif](https://github.com/openhwfoundation/core-v-verif) with `ISS=GVSOC`.
+- A SystemVerilog simulator with DPI (tested with Questa 2025.3).
+
 ## Build
 
 GVSOC is not part of this repository, and must be installed on the machine. Clone the
