@@ -28,9 +28,9 @@ Tested with:
 |---|---|---|
 | gvsoc | main | 93cedc4cb2 |
 | gvsoc-core | mpaci/cv32e40p-core-fixes | 1642f71a2c |
-| gvsoc-pulp | mpaci/cv32e40p-testbench | 8f93ed80f0 |
+| gvsoc-pulp | mpaci/cv32e40p-timing | 8d65606c64 |
 | cv32e40p | mpaci/rvfi-fixes | 06b4c45cf9 |
-| core-v-verif | mpaci/iss-gvsoc | 6ce6678589 |
+| core-v-verif | mpaci/iss-gvsoc-timing | 24ee64b889 |
 
 ## Build
 
@@ -41,14 +41,20 @@ cd <gvsoc> && make build MODULES=<this repository>/gvsoc INSTALLDIR=<install> \
 make GVSOC_HOME=<gvsoc> GVSOC_INSTALL=<install>
 ```
 
+The FPU latencies of the RTL (`FPU_ADDMUL_LAT`, `FPU_OTHERS_LAT`) are target parameters. They go in the target
+name, so that the build compiles the platform tree of each configuration. Add the ones in use to `TARGETS`, for
+example `cv32e40p_cosim_pulp_fpu:fpu_addmul_lat=1:fpu_others_lat=1`; the `*_1cyclat` and `*_2cyclat`
+configurations of core-v-verif use 1 and 2. With a `--parameter` that changes the platform tree after the
+build, `gvrun` falls back to the JSON configuration, which the model does not support.
+
 ## Use
 
 1. For each test program, write the platform configuration:
    `gvrun --target-dir=<this repository>/gvsoc --target=<target> --parameter binary=<elf> --work-dir=<dir> prepare`,
    with `<target>` one of `cv32e40p_cosim[_pulp[_cluster][_fpu[_zfinx]]]` or `cv32e40p_cosim_mhpm29`
-   (NUM_MHPMCOUNTERS=29)
-2. Run the simulator with `GVSOC_CONFIG=<dir>/gvsoc_config.json`, `-sv_lib <build>/libcv32e40p_rvvi`,
-   the files of `sv/gvsoc_rvvi.f` and `rvvi_trace2api` bound to the `rvviTrace` interface of the testbench.
+   (NUM_MHPMCOUNTERS=29), plus the FPU latencies if any (`:fpu_addmul_lat=<n>:fpu_others_lat=<n>`).
+2. Run the simulator with `GVSOC_CONFIG=<dir>/gvsoc_config.json` and `-sv_lib <build>/libcv32e40p_rvvi`, the
+   files of `sv/gvsoc_rvvi.f`, and `rvvi_trace2api` bound to the `rvviTrace` interface of the testbench.
 
 ## Compare semantics
 
