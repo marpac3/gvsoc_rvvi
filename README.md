@@ -17,6 +17,7 @@ This repository compares a CV32E40P RTL simulation in lock step with the CV32E40
 ## Requirements
 
 - [GVSOC](https://github.com/gvsoc/gvsoc), with the CV32E40P core and the `cv32e40p_testbench` SoC of gvsoc-pulp.
+  The CV32E40P model must register its co-simulation entry point as a service of the core.
 - An RTL testbench that drives RVVI-TRACE from RVFI, such as the CV32E40P UVM testbench of
   [core-v-verif](https://github.com/openhwfoundation/core-v-verif) with `ISS=GVSOC`.
 - A SystemVerilog simulator with DPI (tested with Questa 2025.3).

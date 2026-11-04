@@ -88,12 +88,13 @@ opens.
 ## Co-simulation client (`bridge/cosim_client.*`)
 
 `Cv32e40pCosimClient` runs GVSOC in the same process through the public engine API (`gv::Gvsoc`), in synchronous
-mode: the engine runs inside `step()`, in the caller thread. It uses only that API and `cosim.hpp` of gvsoc-pulp,
-and depends on nothing of the core layout.
+mode: the engine runs inside `step()`, in the caller thread. It uses that API, the service lookup of the engine
+(`vp::Block::get_service`) and `cosim.hpp` of gvsoc-pulp, and depends on nothing of the core layout.
 
 - `open()` opens `gvsoc_config.json`, and the runtime configuration next to it when present, and takes the
-  `cv32e40p_cosim` interface of `soc/core`. The engine loads models with `RTLD_GLOBAL`, so the client finds the
-  symbol of the CV32E40P model with `dlsym`.
+  `cv32e40p_cosim` interface of `soc/core`. The engine keeps the symbols of each model private, so the CV32E40P
+  model registers its entry point, `cv32e40p_cosim_acquire_v1`, as a service of `soc/core`, and the client reads it
+  with `get_service`.
 - Before that, `open()` checks that the configuration has a compiled platform tree. gvrun leaves it out when the
   installed tree no longer matches the platform of the run, for example when a `--parameter` changed the platform
   after the build (if no tree is installed, gvrun stops by itself). The engine would then build the platform from

@@ -4,12 +4,12 @@
 //
 // Authors: Marco Paci (marco.paci@chips.it)
 
-#include <dlfcn.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <exception>
 #include <fstream>
 #include <iterator>
+#include <vp/vp.hpp>
 #include "cosim_client.hpp"
 
 bool Cv32e40pCosimClient::fail(const std::string &message)
@@ -70,13 +70,13 @@ bool Cv32e40pCosimClient::open(const std::string &config_path)
         return this->fail("no component soc/core in " + config_path);
     }
 
-    // The engine loads models with RTLD_GLOBAL, so the symbol of the CV32E40P
-    // model is visible from here.
+    // The engine keeps model symbols private: the CV32E40P model gives its entry point as a
+    // service of soc/core.
     Cv32e40pCosimAcquire acquire =
-        (Cv32e40pCosimAcquire)dlsym(RTLD_DEFAULT, CV32E40P_COSIM_ACQUIRE);
+        (Cv32e40pCosimAcquire)((vp::Block *)core)->get_service(CV32E40P_COSIM_ACQUIRE);
     if (acquire == nullptr)
     {
-        return this->fail(std::string("the core model does not export ") + CV32E40P_COSIM_ACQUIRE);
+        return this->fail(std::string("soc/core has no service ") + CV32E40P_COSIM_ACQUIRE);
     }
     uint32_t minor = 0;
     this->cosim = acquire(core, CV32E40P_COSIM_MAJOR, &minor);

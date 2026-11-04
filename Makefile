@@ -19,7 +19,7 @@ CXXFLAGS += -std=c++17 -fPIC -Wall -Werror -MMD -MP \
             -IRVVI/include/host/rvvi \
             -I$(GVSOC_HOME)/engine/engine/include \
             -I$(GVSOC_HOME)/pulp
-LDLIBS   := -L$(GVSOC_INSTALL)/lib -lpulpvp -Wl,-rpath,$(GVSOC_INSTALL)/lib -ldl
+LDLIBS   := -L$(GVSOC_INSTALL)/lib -lpulpvp -Wl,-rpath,$(GVSOC_INSTALL)/lib
 
 LIB  := $(BUILDDIR)/libcv32e40p_rvvi.so
 OBJS := $(BUILDDIR)/rvvi_api.o $(BUILDDIR)/cosim_client.o
