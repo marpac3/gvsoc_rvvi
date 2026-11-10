@@ -16,38 +16,57 @@ This repository compares a CV32E40P RTL simulation in lock step with the CV32E40
 
 ## Requirements
 
-- [GVSOC](https://github.com/gvsoc/gvsoc), with the CV32E40P core and the `cv32e40p_testbench` SoC of gvsoc-pulp.
-  The CV32E40P model must register its co-simulation entry point as a service of the core.
-- An RTL testbench that drives RVVI-TRACE from RVFI, such as the CV32E40P UVM testbench of
-  [core-v-verif](https://github.com/openhwfoundation/core-v-verif) with `ISS=GVSOC`.
+- GVSOC from the `mpaci/cv32e40p` branch of
+  [FondazioneChipsIT/gvsoc](https://github.com/FondazioneChipsIT/gvsoc/tree/mpaci/cv32e40p). Its gvsoc-core has the
+  fixes for the CV32E40P, and its gvsoc-pulp the `cv32e40p_testbench` SoC and the CV32E40P model, which registers
+  its co-simulation entry point as a service of the core.
+- An RTL testbench that drives RVVI-TRACE from RVFI, such as the CV32E40P UVM testbench of core-v-verif with
+  `ISS=GVSOC`, on the `mpaci/cv32e40p` branch of
+  [FondazioneChipsIT/core-v-verif](https://github.com/FondazioneChipsIT/core-v-verif/tree/mpaci/cv32e40p).
 - A SystemVerilog simulator with DPI (tested with Questa 2025.3).
 
 ## Build
 
-GVSOC is not part of this repository, and must be installed on the machine. Clone the
-[GVSOC repository](https://github.com/gvsoc/gvsoc) and prepare it as its README says, with its submodules and
-Python requirements. Its gvsoc-pulp submodule must have the CV32E40P model (`pulp/cv32e40p/`).
+GVSOC is not part of this repository, and must be installed on the machine. In the commands below
+`<this repository>` is the path of this repository, `<gvsoc>` the path of the GVSOC clone and `<install>` the
+directory where GVSOC is installed.
 
-In the commands below `<this repository>` is the path of this repository, `<gvsoc>` the path of the GVSOC clone
-and `<install>` the directory where GVSOC is installed. The second command runs the build of GVSOC in its clone:
-it compiles GVSOC with the targets of `gvsoc/` and installs it in `<install>`. The third one builds the bridge
-(`libcv32e40p_rvvi.so`) and `cosim_run` in this repository, in `build/`.
-
-```
-cd <this repository> && git submodule update --init
-cd <gvsoc> && make build MODULES=<this repository>/gvsoc INSTALLDIR=<install> \
-    TARGETS="cv32e40p_cosim;cv32e40p_cosim_mhpm29;cv32e40p_cosim_pulp;cv32e40p_cosim_pulp_fpu;cv32e40p_cosim_pulp_fpu_zfinx;cv32e40p_cosim_pulp_cluster;cv32e40p_cosim_pulp_cluster_fpu;cv32e40p_cosim_pulp_cluster_fpu_zfinx"
-cd <this repository> && make GVSOC_HOME=<gvsoc> GVSOC_INSTALL=<install>
-```
+1. Clone GVSOC with its submodules, then prepare it as its README says, with its Python requirements:
+   ```
+   git clone --recursive -b mpaci/cv32e40p https://github.com/FondazioneChipsIT/gvsoc.git <gvsoc>
+   ```
+2. Get the RVVI submodule of this repository:
+   ```
+   cd <this repository> && git submodule update --init
+   ```
+3. Build GVSOC in its clone, with the targets of `gvsoc/`, and install it in `<install>`:
+   ```
+   cd <gvsoc> && make build MODULES=<this repository>/gvsoc INSTALLDIR=<install> \
+       TARGETS="cv32e40p_cosim;cv32e40p_cosim_mhpm29;cv32e40p_cosim_pulp;cv32e40p_cosim_pulp_fpu;cv32e40p_cosim_pulp_fpu_zfinx;cv32e40p_cosim_pulp_cluster;cv32e40p_cosim_pulp_cluster_fpu;cv32e40p_cosim_pulp_cluster_fpu_zfinx"
+   ```
+4. Build the bridge (`libcv32e40p_rvvi.so`) and `cosim_run` in this repository, in `build/`:
+   ```
+   cd <this repository> && make GVSOC_HOME=<gvsoc> GVSOC_INSTALL=<install>
+   ```
 
 ## Use
 
-1. For each test program, write the platform configuration:
-   `<install>/bin/gvrun --target-dir=<this repository>/gvsoc --target=<target> --parameter binary=<elf> --work-dir=<dir> prepare`,
-   with `<target>` one of `cv32e40p_cosim[_pulp[_cluster][_fpu[_zfinx]]]` or `cv32e40p_cosim_mhpm29`
-   (NUM_MHPMCOUNTERS=29)
+1. For each test program, write the platform configuration, with `<target>` one of
+   `cv32e40p_cosim[_pulp[_cluster][_fpu[_zfinx]]]` or `cv32e40p_cosim_mhpm29` (NUM_MHPMCOUNTERS=29):
+   ```
+   <install>/bin/gvrun --target-dir=<this repository>/gvsoc --target=<target> --parameter binary=<elf> \
+       --work-dir=<dir> prepare
+   ```
 2. Run the simulator with `GVSOC_CONFIG=<dir>/gvsoc_config.json`, `-sv_lib <this repository>/build/libcv32e40p_rvvi`,
    the files of `sv/gvsoc_rvvi.f` and `rvvi_trace2api` bound to the `rvviTrace` interface of the testbench.
+
+The CV32E40P testbench of core-v-verif does both steps with `ISS=GVSOC`, as its `mk/README.md` says. From
+`cv32e40p/sim/uvmt`:
+
+```
+make test TEST=hello-world SIMULATOR=vsim USE_ISS=YES ISS=GVSOC \
+    GVSOC_INSTALL=<install> GVSOC_BRIDGE_HOME=<this repository>
+```
 
 ## Compare semantics
 
